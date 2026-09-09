@@ -11,10 +11,14 @@
 //!     changes no counts (AC #4), while a later priced cost fills a NULL (the
 //!     `ON CONFLICT DO UPDATE ... COALESCE` correction path);
 //!   * a later report CORRECTS a wrong non-NULL cost and token count (the upsert updates the
-//!     mutable fields, not just NULLs);
+//!     mutable fields, not just NULLs) -- and the same correction applies to
+//!     `usage_model_calls.model` and to `usage_tool_calls.tool_name`/`duration_ms`, which are
+//!     NOT NULL but not immutable either;
 //!   * child-before-parent -- OTLP exports children before their parent, so ingest mints a
 //!     stub `usage_executions` row (NULL `duration_ms`/`raw_schema_version`) on first sight of
-//!     a child; the real execution span later fills the stub via the upsert;
+//!     a child; the real execution span later fills the stub via the upsert. While still a
+//!     stub, multiple children arriving out of processing order converge the stub's
+//!     `observed_at` on the EARLIEST child observation (`LEAST`), never a later one;
 //!   * the id is globally unique -- the same `span_id` across different traces, and the same
 //!     `(trace_id, span_id)` across different `source` values, both insert distinct rows;
 //!   * NULL-cost round-trip -- a NULL money column survives a write/read as NULL, and a
@@ -46,11 +50,17 @@ async fn insert_execution(
             (id, observed_at, source, provider, trace_id, span_id, identity_id, duration_ms, raw_schema_version, estimated_cost_micro_usd)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         ON CONFLICT (source, trace_id, span_id) DO UPDATE SET
-            -- observed_at is last-write-wins ONLY when filling a stub (existing duration is
-            -- NULL); a pure replay of a completed execution keeps the first observed_at so an
-            -- idempotent redelivery is a true no-op on the time column.
+            -- observed_at only moves EARLIER while filling a stub (existing duration is NULL),
+            -- via LEAST -- never later. Children of one execution can arrive out of processing
+            -- order (network jitter), so a plain last-write-wins here would let observed_at
+            -- drift non-monotonically (even backward) depending on arrival order; LEAST makes
+            -- the stub converge on the earliest-known observation, which is the closest proxy
+            -- for the execution's true start time. A pure replay of a completed execution keeps
+            -- the first observed_at so an idempotent redelivery is a true no-op on the time
+            -- column.
             observed_at = CASE
-                WHEN usage_executions.duration_ms IS NULL THEN EXCLUDED.observed_at
+                WHEN usage_executions.duration_ms IS NULL
+                    THEN LEAST(usage_executions.observed_at, EXCLUDED.observed_at)
                 ELSE usage_executions.observed_at
             END,
             -- provider is nullable (for the tool-call-first stub path), so it gets the same
@@ -101,6 +111,12 @@ async fn insert_model_call(
             (id, observed_at, source, execution_id, trace_id, span_id, model, input_tokens, output_tokens, cost_micro_usd)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         ON CONFLICT (source, trace_id, span_id) DO UPDATE SET
+            -- model is NOT NULL, so COALESCE always takes EXCLUDED's value here -- this is a
+            -- corrigible field like input_tokens/output_tokens/cost_micro_usd below, not an
+            -- omission: a later report that resolves a more specific model id (e.g. after an
+            -- alias/snapshot is finalized) must correct it, matching every other mutable column
+            -- on this row.
+            model = COALESCE(EXCLUDED.model, usage_model_calls.model),
             input_tokens = COALESCE(EXCLUDED.input_tokens, usage_model_calls.input_tokens),
             output_tokens = COALESCE(EXCLUDED.output_tokens, usage_model_calls.output_tokens),
             cost_micro_usd = COALESCE(EXCLUDED.cost_micro_usd, usage_model_calls.cost_micro_usd),
@@ -129,13 +145,21 @@ async fn insert_tool_call(
     child_span_id: &str,
     execution_id: &str,
     tool_name: &str,
+    duration_ms: i64,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
         INSERT INTO usage_tool_calls
             (id, observed_at, source, execution_id, trace_id, span_id, tool_name, duration_ms)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-        ON CONFLICT (source, trace_id, span_id) DO NOTHING
+        ON CONFLICT (source, trace_id, span_id) DO UPDATE SET
+            -- tool_name/duration_ms are NOT NULL, so a redelivery always carries a real value --
+            -- unconditional overwrite (not COALESCE) matches the donor and lets a later,
+            -- corrected report replace an interim/estimated value instead of freezing the row
+            -- at whatever arrived first.
+            tool_name = EXCLUDED.tool_name,
+            duration_ms = EXCLUDED.duration_ms,
+            updated_at = now()
         "#,
     )
     .bind(format!("{SOURCE}_{trace_id}_{child_span_id}:tc"))
@@ -145,7 +169,7 @@ async fn insert_tool_call(
     .bind(trace_id)
     .bind(child_span_id)
     .bind(tool_name)
-    .bind(90i64)
+    .bind(duration_ms)
     .execute(pool)
     .await?;
     Ok(())
@@ -220,12 +244,28 @@ async fn one_execution_can_carry_multiple_model_and_tool_calls(pool: PgPool) {
     .expect("insert model call 2");
 
     // Two tool calls, each its own span.
-    insert_tool_call(&pool, observed_at, trace_id, "span-tc-1", &exec_id, "bash")
-        .await
-        .expect("insert tool call 1");
-    insert_tool_call(&pool, observed_at, trace_id, "span-tc-2", &exec_id, "grep")
-        .await
-        .expect("insert tool call 2");
+    insert_tool_call(
+        &pool,
+        observed_at,
+        trace_id,
+        "span-tc-1",
+        &exec_id,
+        "bash",
+        90,
+    )
+    .await
+    .expect("insert tool call 1");
+    insert_tool_call(
+        &pool,
+        observed_at,
+        trace_id,
+        "span-tc-2",
+        &exec_id,
+        "grep",
+        90,
+    )
+    .await
+    .expect("insert tool call 2");
 
     assert_eq!(count_executions(&pool).await, 1);
     assert_eq!(count_model_calls(&pool).await, 2);
@@ -270,6 +310,7 @@ async fn replaying_the_same_batch_twice_changes_no_counts(pool: PgPool) {
         "span-replay-1-tc",
         &exec_id,
         "bash",
+        90,
     )
     .await
     .expect("first tool call");
@@ -311,6 +352,7 @@ async fn replaying_the_same_batch_twice_changes_no_counts(pool: PgPool) {
         "span-replay-1-tc",
         &exec_id,
         "bash",
+        90,
     )
     .await
     .expect("replay tool call");
@@ -883,6 +925,228 @@ async fn later_report_corrects_a_non_null_cost_and_tokens(pool: PgPool) {
         mc_out,
         Some(100),
         "a later report must correct the output token count"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn later_report_corrects_the_model_call_s_model(pool: PgPool) {
+    // model is NOT NULL on usage_model_calls, but that does not mean it is immutable: a later
+    // report that resolves a more specific model id (e.g. a snapshot alias finalized after the
+    // interim report) must correct the stored value, matching every other mutable column on
+    // this row (input_tokens/output_tokens/cost_micro_usd already prove this pattern).
+    let observed_at = Utc::now() - Duration::minutes(5);
+    let trace_id = "trace-correct-model";
+    let exec_span = "span-correct-model-exec";
+    let exec_id = format!("exec_{SOURCE}_{trace_id}_{exec_span}");
+
+    insert_execution(
+        &pool,
+        observed_at,
+        trace_id,
+        exec_span,
+        None,
+        Some("anthropic"),
+        Some(1000),
+    )
+    .await
+    .expect("execution report");
+
+    insert_model_call(
+        &pool,
+        observed_at,
+        trace_id,
+        "span-correct-model-mc",
+        &exec_id,
+        "claude-sonnet-4-5-interim",
+        Some(100),
+        Some(50),
+        Some(500),
+    )
+    .await
+    .expect("first model-call report with an interim model id");
+
+    insert_model_call(
+        &pool,
+        observed_at,
+        trace_id,
+        "span-correct-model-mc",
+        &exec_id,
+        "claude-sonnet-4-5-20260901",
+        Some(100),
+        Some(50),
+        Some(500),
+    )
+    .await
+    .expect("corrected model-call report with the finalized model id");
+
+    let model: String =
+        sqlx::query_scalar("SELECT model FROM usage_model_calls WHERE trace_id = $1")
+            .bind(trace_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read corrected model");
+    assert_eq!(
+        model, "claude-sonnet-4-5-20260901",
+        "a later report must correct the model id, not freeze it at the first-seen value"
+    );
+    assert_eq!(
+        count_model_calls(&pool).await,
+        1,
+        "correcting the model must not create a second row"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn later_report_corrects_tool_call_fields(pool: PgPool) {
+    // tool_name/duration_ms are NOT NULL on usage_tool_calls, so unlike the money/token columns
+    // there is no NULL to fill -- but a later, more accurate report must still be able to
+    // CORRECT them, not be silently dropped. This is the tool-call analogue of
+    // `later_report_corrects_a_non_null_cost_and_tokens` above.
+    let observed_at = Utc::now() - Duration::minutes(5);
+    let trace_id = "trace-correct-tool-call";
+    let exec_span = "span-correct-tool-call-exec";
+    let child_span = "span-correct-tool-call-tc";
+    let exec_id = format!("exec_{SOURCE}_{trace_id}_{exec_span}");
+
+    insert_execution(
+        &pool,
+        observed_at,
+        trace_id,
+        exec_span,
+        None,
+        Some("anthropic"),
+        Some(1000),
+    )
+    .await
+    .expect("execution report");
+
+    // First report: an interim tool name and an estimated (too-low) duration.
+    insert_tool_call(
+        &pool,
+        observed_at,
+        trace_id,
+        child_span,
+        &exec_id,
+        "bash-interim",
+        10,
+    )
+    .await
+    .expect("first tool-call report");
+
+    // Later report: the corrected tool name and final duration arrive.
+    insert_tool_call(
+        &pool,
+        observed_at,
+        trace_id,
+        child_span,
+        &exec_id,
+        "bash",
+        250,
+    )
+    .await
+    .expect("corrected tool-call report");
+
+    let (tool_name, duration_ms): (String, i64) =
+        sqlx::query_as("SELECT tool_name, duration_ms FROM usage_tool_calls WHERE trace_id = $1")
+            .bind(trace_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read corrected tool call");
+    assert_eq!(
+        tool_name, "bash",
+        "a later report must correct tool_name, not freeze it at the first-seen value"
+    );
+    assert_eq!(
+        duration_ms, 250,
+        "a later report must correct duration_ms, not freeze it at the first-seen (estimated) value"
+    );
+    assert_eq!(
+        count_tool_calls(&pool).await,
+        1,
+        "correcting the tool call must not create a second row"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn a_stub_execution_s_observed_at_converges_on_the_earliest_child(pool: PgPool) {
+    // Multiple children of one still-open execution can arrive out of processing order (network
+    // jitter). While the execution is still a stub (duration_ms IS NULL), observed_at must move
+    // only EARLIER (LEAST), never later -- a plain last-write-wins would let a late-processed
+    // but early-observed child regress the stub's observed_at backward, or let a
+    // later-observed-but-earlier-processed child overwrite a truly-earlier timestamp with a
+    // later one.
+    let earliest = Utc::now() - Duration::minutes(10);
+    let middle = Utc::now() - Duration::minutes(7);
+    let latest = Utc::now() - Duration::minutes(5);
+    let trace_id = "trace-stub-observed-at";
+    let exec_span = "span-stub-observed-at-exec";
+    let exec_id = format!("exec_{SOURCE}_{trace_id}_{exec_span}");
+
+    // A stub-minting upsert, matching the shape ingest uses when a child arrives before its
+    // parent execution span (see `child_can_be_inserted_before_its_parent_execution`):
+    // duration_ms stays NULL, so the row remains a stub across every call in this test -- unlike
+    // `insert_execution`, which always writes a non-NULL duration_ms and would "complete" the
+    // stub on the very first call.
+    async fn upsert_stub(pool: &PgPool, id: &str, observed_at: chrono::DateTime<Utc>) {
+        sqlx::query(
+            r#"
+            INSERT INTO usage_executions (id, observed_at, source, trace_id, span_id)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (source, trace_id, span_id) DO UPDATE SET
+                observed_at = CASE
+                    WHEN usage_executions.duration_ms IS NULL
+                        THEN LEAST(usage_executions.observed_at, EXCLUDED.observed_at)
+                    ELSE usage_executions.observed_at
+                END
+            "#,
+        )
+        .bind(id)
+        .bind(observed_at)
+        .bind(SOURCE)
+        .bind("trace-stub-observed-at")
+        .bind("span-stub-observed-at-exec")
+        .execute(pool)
+        .await
+        .expect("stub upsert");
+    }
+
+    // First child observed at the LATEST time processed FIRST.
+    upsert_stub(&pool, &exec_id, latest).await;
+
+    // A second child, observed EARLIER, processed SECOND -- must pull observed_at backward.
+    upsert_stub(&pool, &exec_id, earliest).await;
+
+    // A third child, observed in the MIDDLE, processed THIRD -- must not push observed_at
+    // forward past the earliest already recorded.
+    upsert_stub(&pool, &exec_id, middle).await;
+
+    let stub_duration: Option<i64> =
+        sqlx::query_scalar("SELECT duration_ms FROM usage_executions WHERE trace_id = $1")
+            .bind(trace_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read stub duration");
+    assert_eq!(
+        stub_duration, None,
+        "sanity check: the row must still be a stub for this test to be exercising the LEAST() \
+         branch at all"
+    );
+
+    let stored: chrono::DateTime<Utc> =
+        sqlx::query_scalar("SELECT observed_at FROM usage_executions WHERE trace_id = $1")
+            .bind(trace_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read stub observed_at");
+    assert!(
+        (stored - earliest).num_milliseconds().abs() < 1000,
+        "a still-open stub's observed_at must converge on the earliest-known child observation \
+         (stored {stored}, earliest {earliest})"
+    );
+    assert_eq!(
+        count_executions(&pool).await,
+        1,
+        "children of one execution must be absorbed into one stub row"
     );
 }
 
