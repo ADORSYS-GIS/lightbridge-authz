@@ -39,7 +39,7 @@
   "crates/lightbridge-authz-usage/src/handlers/ingest.rs": 2730,
   "crates/lightbridge-authz-usage/src/handlers/query.rs": 242,
   "crates/lightbridge-authz-usage/src/lib.rs": 560,
-  "crates/lightbridge-authz-usage/src/models/mod.rs": 381,
+  "crates/lightbridge-authz-usage/src/models/mod.rs": 383,
   "crates/lightbridge-authz-usage/src/repo.rs": 645,
   "crates/lightbridge-authz-usage/src/scope_authority.rs": 373
 }

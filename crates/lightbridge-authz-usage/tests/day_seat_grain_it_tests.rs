@@ -18,7 +18,7 @@
 //!    is absorbed by the PK conflict — still exactly one row, never a duplicate.
 
 use chrono::NaiveDate;
-use lightbridge_authz_usage_rest::models::SubjectKind;
+use lightbridge_authz_usage_rest::models::day_seat::SubjectKind;
 use sqlx::PgPool;
 
 fn copilot_day() -> NaiveDate {
