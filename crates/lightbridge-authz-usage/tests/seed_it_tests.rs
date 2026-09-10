@@ -103,6 +103,10 @@ fn build_payload(spans: Vec<serde_json::Value>) -> serde_json::Value {
 }
 
 /// POST an OTLP trace payload through the real ingest handler and assert it returns 202.
+///
+/// `x-source` is required by `resolve_source` (lightbridge-authz#584) -- every ingest request is
+/// rejected with 400 without it. `eaig` matches this payload's attribute shape
+/// (`io.envoy.ai_gateway.llm_custom_total_cost`), same as `usage_tests.rs`/`repo_it_tests.rs`.
 async fn post_traces(app: &axum::Router, payload: serde_json::Value) {
     let response = app
         .clone()
@@ -111,6 +115,7 @@ async fn post_traces(app: &axum::Router, payload: serde_json::Value) {
                 .method("POST")
                 .uri("/v1/otel/traces")
                 .header("content-type", "application/json")
+                .header("x-source", "eaig")
                 .body(Body::from(payload.to_string()))
                 .expect("request must build"),
         )
@@ -169,7 +174,10 @@ async fn seed_then_query_returns_totals_equal_to_what_was_seeded(pool: PgPool) {
                     index,
                 ));
                 index += 1;
-                expected_total_cost += cost;
+                // `cost` above is micro-USD, the wire unit; merge_norm_tokens_and_cost (ingest.rs)
+                // divides by 1e6 before storing/returning total_cost in dollars -- match that here,
+                // or this reproduces the exact "F1" 10^6 unit bug the comment above warns about.
+                expected_total_cost += cost / 1_000_000.0;
                 expected_total_tokens += prompt + completion;
                 expected_requests += 1;
             }

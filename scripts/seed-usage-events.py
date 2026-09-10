@@ -195,7 +195,12 @@ def build_payload(spans: list[dict]) -> dict:
 
 
 def post_payload(ingest_url: str, payload: dict) -> None:
-    """POST one OTLP trace payload to the ingest endpoint."""
+    """POST one OTLP trace payload to the ingest endpoint.
+
+    `X-Source` is required by `resolve_source` (lightbridge-authz#584) -- every ingest
+    request is rejected with 400 without it. `eaig` matches this payload's attribute shape
+    (`io.envoy.ai_gateway.llm_custom_total_cost`).
+    """
     body = json.dumps(payload).encode("utf-8")
     url = f"{ingest_url.rstrip('/')}/v1/otel/traces"
     ctx = ssl.create_default_context()
@@ -204,7 +209,7 @@ def post_payload(ingest_url: str, payload: dict) -> None:
     req = urllib.request.Request(
         url,
         data=body,
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", "X-Source": "eaig"},
         method="POST",
     )
     try:
