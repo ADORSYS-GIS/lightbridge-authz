@@ -3626,6 +3626,89 @@ async fn revoke_subject_sessions_does_not_touch_a_different_subjects_sessions_of
 }
 
 // ---------------------------------------------------------------------------------------------
+// Section: admin account provisioning (#720) -- the offboarding kill switch's mirror image at
+// onboarding time. Unlike the self-provisioning section below, `provisionAccount` mints an
+// account for an OPERATOR-SUPPLIED subject, not the caller -- see
+// `StoreRepo::provision_account`'s doc comment for the full incident/design rationale.
+// ---------------------------------------------------------------------------------------------
+
+/// A caller lacking `account:provision` gets 403 from `provisionAccount` -- proves the permission
+/// gate is actually wired, not merely present in `rpc_authorize`'s map with nothing enforcing it.
+/// Mirrors `revoke_own_sessions_without_permission_is_forbidden`'s shape.
+#[tokio::test]
+async fn provision_account_without_permission_is_forbidden() {
+    let caller = format!("provision-denied-{}", cuid2());
+    let target = format!("provision-target-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> =
+        Arc::new(MapBearer::new().with("caller", token_info(&caller, viewer_perms())));
+    let ctx = setup(bearer).await;
+    let r = &ctx.router;
+
+    let (status, _) = rpc_call(
+        r.clone(),
+        "procedure.provisionAccount",
+        Wire::Cbor,
+        &json!({ "args": { "subject": target, "email": "denied@example.test" } }),
+        Some("caller"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "viewer_perms holds no account:provision"
+    );
+
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM accounts WHERE id = $1)")
+        .bind(&target)
+        .fetch_one(&ctx.verify)
+        .await
+        .unwrap();
+    assert!(
+        !exists,
+        "the forbidden call above must not have created anything"
+    );
+}
+
+/// The admin procedure creates an account for an arbitrary, operator-supplied target subject --
+/// the exact incident (#720) this procedure exists to close: a Keycloak-authenticated subject
+/// with no self-service path to its first account.
+#[tokio::test]
+async fn provision_account_admin_creates_account_for_target_subject() {
+    let admin_subject = format!("provision-admin-{}", cuid2());
+    let target = format!("provision-newcomer-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> =
+        Arc::new(MapBearer::new().with("admin", token_info(&admin_subject, admin_perms())));
+    let ctx = setup(bearer).await;
+    let r = &ctx.router;
+
+    let (status, body) = rpc_call(
+        r.clone(),
+        "procedure.provisionAccount",
+        Wire::Cbor,
+        &json!({
+            "args": {
+                "subject": target,
+                "email": format!("{target}@example.test"),
+                "name": "Provisioned Newcomer",
+            }
+        }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "body: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let parsed = as_json(Wire::Cbor, &body);
+    assert_eq!(
+        parsed["id"], target,
+        "provisionAccount must mint the target subject's ANCHOR account (id == subject): {parsed}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
 // Section: self-provisioning -- lightbridge-viewer/lightbridge-editor must be able to create their
 // own account (#219: the account row must exist before `project_members.account_id`'s FK to
 // `accounts` can be satisfied, so a low-privilege first-time caller who lacks `account:create`

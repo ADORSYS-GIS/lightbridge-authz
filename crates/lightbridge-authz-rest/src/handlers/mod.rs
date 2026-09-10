@@ -466,6 +466,40 @@ impl AuthzStoreImpl {
         Ok(account)
     }
 
+    /// The admin-targets-an-arbitrary-subject account bootstrap (#720). Backs `provisionAccount` --
+    /// see `StoreRepo::provision_account`'s doc comment for the full incident/design rationale.
+    /// `email` is required (unlike `create_account`'s optional fields) because it becomes the
+    /// mandatory, `NOT NULL` `billing_identity` on the default project this also creates; validated
+    /// here rather than left to surface as a raw DB not-null violation, same "friendly error before
+    /// the write" precedent as `create_account`'s `default_quota` catalogue check above. `name`
+    /// gets the same blank-to-`None` normalization as `create_account`'s.
+    pub async fn provision_account(
+        &self,
+        subject: &str,
+        email: &str,
+        name: Option<&str>,
+    ) -> Result<Account> {
+        let email = email.trim();
+        if email.is_empty() {
+            return Err(Error::BadRequest(
+                "email must not be blank -- it becomes the default project's billing identity"
+                    .to_string(),
+            ));
+        }
+        let name = Self::normalize_account_name(name);
+        let account = self
+            .repo
+            .provision_account(&AccountId::assert_already_resolved(subject), email, name)
+            .await?;
+        tracing::info!(
+            operation = "provision_account",
+            subject = %subject,
+            account_id = %account.id,
+            "account provisioned by admin"
+        );
+        Ok(account)
+    }
+
     /// Updates `Account.defaultQuota` post-creation. Backs `updateAccountDefaultQuota` (#379,
     /// completing #177/#375): `Account.defaultQuota` is now `@readonly` on the generic
     /// `model.Account.update` verb (which has no hook for a runtime-configured catalogue check),

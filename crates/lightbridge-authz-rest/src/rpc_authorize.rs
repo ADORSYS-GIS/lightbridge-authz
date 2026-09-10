@@ -134,6 +134,10 @@ pub(crate) fn required_permission(op_id: &str) -> Option<Permission> {
     use Permission::*;
     Some(match op_id {
         "procedure.createAccount" => AccountCreate,
+        // Admin-targets-a-different-subject account bootstrap (#720). Same self/admin split as
+        // `createAccount`/`revokeSubjectSessions` -- see the schema doc comment on
+        // `provisionAccount` and `Permission::AccountProvision`.
+        "procedure.provisionAccount" => AccountProvision,
         "model.Account.list" => AccountRead,
         "model.Account.get" => AccountRead,
         // model.Account.update is intentionally absent (#398, completing #379): #379 marked
@@ -294,6 +298,7 @@ pub(crate) fn required_permission(op_id: &str) -> Option<Permission> {
 /// looking/defensive exactly as the view entry itself already is.
 pub const MAPPED_OP_ID_PERMISSIONS: &[(&str, Permission)] = &[
     ("procedure.createAccount", Permission::AccountCreate),
+    ("procedure.provisionAccount", Permission::AccountProvision),
     ("model.Account.list", Permission::AccountRead),
     ("model.Account.get", Permission::AccountRead),
     (
@@ -696,6 +701,7 @@ mod tests {
             .copied()
             .chain([
                 "procedure.createAccount",
+                "procedure.provisionAccount",
                 "model.Account.list",
                 "model.Account.get",
                 "procedure.updateAccountDefaultQuota",
