@@ -33,6 +33,7 @@ All but the usage service share one Postgres database (`authz`); usage has its o
 
 | Want to… | Open |
 | --- | --- |
+| Know what is done, missing, broken, flaky or waiting on a decision | [`ROADMAP.md`](./ROADMAP.md) |
 | Understand the whole system's shape and callers | [`architecture/README.md`](./architecture/README.md) |
 | Run the full platform locally and test end to end | [`local-testing.md`](./local-testing.md) |
 | Get build/test commands, conventions, and house rules | [`../AGENTS.md`](../AGENTS.md) |
@@ -55,15 +56,21 @@ All but the usage service share one Postgres database (`authz`); usage has its o
 
 | Want to… | Open |
 | --- | --- |
-| RBAC — JWT claim → permission mapping | [`rbac.md`](./rbac.md) |
+| RBAC — JWT claim → permission mapping, platform role grants (ADR-0033) and the `rbac` CLI bootstrap runbook | [`rbac.md`](./rbac.md) |
 | Governance model — how quotas/allowlists are enforced at the gateway (introspection, Authorino) | [`governance-model-and-enforcement.md`](./governance-model-and-enforcement.md) |
 | Authorino endpoint usage + integration test | [`authorino-usage.md`](./authorino-usage.md) |
 | Usage ingest/query API | [`usage-api.md`](./usage-api.md) |
 | Lightbridge query API | [`lightbridge-query-api.md`](./lightbridge-query-api.md) |
+| Why a usage query is slow, what the covering index and `metrics` buy, how to re-measure on the replica | [`usage-performance.md`](./usage-performance.md) |
+| Which build a service is running (`GET /version`, `getBuildInfo`, `--version`) | [`build-info.md`](./build-info.md) |
+| One `sharedConfig` object instead of five copies of `config.yaml` (chart contract) | [`single-source-config.md`](./single-source-config.md) |
+| Book a budget grant, or author a reset schedule, from a Job or an exec — `budget grant` / `budget schedule` flags, idempotency, the $8-vs-$15 rule, why never raw SQL | [`budget-cli.md`](./budget-cli.md) |
 | Budget refill decision contract (`Facts`/`Decision`/`PolicyEngine`) | [`budget-decision-contract.md`](./budget-decision-contract.md) |
 | Budget refill UI contract (RPC shapes, for the frontend team) | [`budget-refill-ui-contract.md`](./budget-refill-ui-contract.md) |
 | Manual end-to-end protocol (OAuth2 + OPA) | [`test-protocol.md`](./test-protocol.md) |
 | API key approaching-expiry visibility | [`api-key-expiry-visibility.md`](./api-key-expiry-visibility.md) |
+| Admin identity resolution (`user:read`) | [`admin-identity-resolution.md`](./admin-identity-resolution.md) |
+| Sessions API (`querySessions`, `revokeSession`) | [`sessions-api.md`](./sessions-api.md) |
 | Auth reference (identity vs. location, OIDC details) | [`auth-reference.md`](./auth-reference.md) |
 | OAuth/OIDC standards roadmap | [`oauth-oidc-standards-roadmap.md`](./oauth-oidc-standards-roadmap.md) |
 | OIDC token-exchange integration | [`token-exchange-integration.md`](./token-exchange-integration.md) |
@@ -72,11 +79,21 @@ All but the usage service share one Postgres database (`authz`); usage has its o
 
 | Want to… | Open |
 | --- | --- |
-| Architecture Decision Records (30) — why the system is shaped this way | [`adr/`](./adr/) |
+| Architecture Decision Records (33) — why the system is shaped this way | [`adr/`](./adr/) |
 | Budget refill RFC (the original design proposal) | [`rfc/`](./rfc/) |
-| Operational runbooks (tier re-key, stuck refill, policy rollback) | [`runbooks/`](./runbooks/) |
+| Operational runbooks (**release & rollout**, tier re-key, stuck refill, policy rollback, signing keys) | [`runbooks/`](./runbooks/) |
+| Release narratives — why a batch of PRs was one thing, and what is live | [`releases/`](./releases/) |
 | Work/analysis plans | [`plans/`](./plans/), [`research/`](./research/) |
 | Migration plans: authkestra `=0.6.3 → 0.7.0`, cratestack `=0.9.4 → 0.10.0` | [`plans/`](./plans/) (`authkestra-0.7.0-migration.md`, `cratestack-0.10.0-migration.md`) |
+| The 200-LoC gate, its grandfather baseline, and the behaviour-preserving split rules | [`code-size-baseline.md`](./code-size-baseline.md) |
+| Per-platform Helm install/config/deploy commands | [`platform-guides.md`](./platform-guides.md) |
+
+### Working on this repo with an AI coding agent
+
+| Want to… | Open |
+| --- | --- |
+| Know which skills and agents exist, and how a non-Claude harness (VS Code Copilot, OpenCode, Antigravity, Cursor) picks them up | [`agent-harnesses.md`](./agent-harnesses.md) |
+| Add a cratestack procedure, write a migration, verify a change, ship a release, open a governance PR, measure a usage query | `.claude/skills/*/SKILL.md` — indexed in [`../AGENTS.md`](../AGENTS.md#skills-and-agents) |
 
 ---
 

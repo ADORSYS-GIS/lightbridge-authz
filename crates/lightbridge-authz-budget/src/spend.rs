@@ -24,11 +24,12 @@
 //! unreachable usage service, a timeout, a non-2xx status, or a response body that doesn't parse
 //! are all "we don't know", exactly like a `NULL` sum -- see `UsageServiceSpendReader` below.
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::error::BudgetError;
 use crate::period::Period;
+use crate::spend_units::{period_bounds_utc, validate_total_cost_micros};
 
 /// The result of summing `total_cost` for a scope/period.
 ///
@@ -72,6 +73,42 @@ pub enum Spend {
     Unavailable,
 }
 
+/// A spend reading that keeps the two halves of [`Spend::Unavailable`] apart: "the spend source
+/// answered, and it has no rows for this account/period" versus "the spend source could not be
+/// asked at all".
+///
+/// [`Spend`] deliberately collapses those two, and that is the correct, conservative reading for
+/// a **refill decision** — handing out budget on unverified spend is exactly the mistake that
+/// enum exists to prevent, and a broken ingest pipeline is indistinguishable from a quiet account
+/// when all you have is an empty `SUM`.
+///
+/// It is the wrong reading for the **gateway's remaining-budget read** (ADR-0034,
+/// lightbridge-authz#658), which is on the critical path of every model request. There, "no rows"
+/// is the normal state of every account at the start of every period: collapsing it to "unknown"
+/// would fail-close the entire fleet at 00:00 UTC on the 1st of each month, every month, until
+/// each account's first request happened to complete. So that one caller — and only that one —
+/// reads spend through [`SpendReader::observe_spend_for_account`] instead.
+///
+/// The distinction is only *recoverable* at the transport boundary: a `200` carrying
+/// `{"total_cost": null}` is an answer, a timeout or a `503` is not. Every reader that cannot see
+/// that boundary keeps the conservative collapse via the default method below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpendObservation {
+    /// The spend source answered with a `SUM` over at least one matching row. `Answered(0)` is a
+    /// real zero -- an account whose logged events happened to cost nothing -- and is NOT the
+    /// same thing as [`Self::Empty`].
+    Answered(i64),
+    /// The spend source answered, and it holds no matching rows at all (SQL `NULL` sum). For a
+    /// refill decision this is indistinguishable from a broken ingest pipeline and must fail
+    /// closed; for the gateway's remaining-budget read it is the ordinary state of every account
+    /// at the start of every period and counts as zero spend. Keeping it as its own variant is
+    /// what lets each caller make that choice explicitly instead of inheriting the other's.
+    Empty,
+    /// The spend source could not be asked, or answered something unusable. Every caller must
+    /// route this to its strictest branch; it is never zero.
+    Unreachable,
+}
+
 /// Reads summed spend for an account over a budget period. Implementations must preserve the
 /// `Known`/`Unavailable` distinction described on [`Spend`] -- never collapse "no rows" or "the
 /// spend source could not be reached" into `Known(0)`.
@@ -82,88 +119,25 @@ pub trait SpendReader: Send + Sync + std::fmt::Debug {
         account_id: &str,
         period: &Period,
     ) -> Result<Spend, BudgetError>;
-}
 
-/// Validates and losslessly narrows a `total_cost` value -- **already micro-USD**, as stored in
-/// `usage_events.total_cost` -- into `i64`.
-///
-/// ## Unit contract (#488)
-///
-/// `usage_events.total_cost` is micro-USD, not US dollars. The gateway's `llm_custom_total_cost`
-/// CEL is the only production writer of this column (via
-/// `crates/lightbridge-authz-usage/src/handlers/ingest.rs`'s `COST_KEYS` extraction, landed
-/// verbatim, no scaling applied on the way in) and it emits micro-USD -- see the ai-helm
-/// cost-tracking doc (`docs/models-chart-docs/cost-tracking.md`, *"Micro-USD ... the chart stores
-/// request cost in this unit"*) in the `ADORSYS-GIS/ai-helm` repo. This function used to multiply
-/// by `1_000_000.0` here, which was correct only if the stored value were US dollars -- it is
-/// not, so that multiplication inflated every reported spend figure by roughly 10^6 and drove
-/// self-service refill decisions to the fail-closed floor. See
-/// https://github.com/ADORSYS-GIS/lightbridge-authz/issues/488.
-///
-/// This function therefore does not scale its input at all -- it only validates. The value still
-/// arrives as `f64` over the wire (`SpendQueryResponse::total_cost`, a SQL `double precision`
-/// `SUM`), so it must still be checked for the same three failure modes as before: non-finite
-/// (`NaN`/`±inf`), negative (a cost can never be negative), and too large to round-trip into
-/// `i64` exactly. All three are treated as an unusable response from the usage service by
-/// `UsageServiceSpendReader` (see its doc comment), which routes them to `Spend::Unavailable`
-/// rather than propagating an error.
-///
-/// Rounding: `f64` cannot represent every integer micro-USD value exactly (float summation drift
-/// from `SUM(total_cost)` over many rows), so this rounds to the nearest whole micro-USD using
-/// `f64::round` -- ties round away from zero (e.g. `1234.5` -> `1235`), not round-half-even. This
-/// is the same rounding semantics the pre-#488 code already used for its (wrong-unit) conversion;
-/// only the scaling factor changed, not the rounding rule.
-fn validate_total_cost_micros(total_cost: f64) -> Result<i64, BudgetError> {
-    if !total_cost.is_finite() {
-        return Err(BudgetError::StorageFailed(format!(
-            "usage_events.total_cost is not finite: {total_cost}"
-        )));
+    /// The same reading, with "answered but empty" separated from "could not ask" -- see
+    /// [`SpendObservation`] for which caller needs that and why.
+    ///
+    /// The default implementation derives it from [`Self::spend_for_account`], which means it
+    /// reports `Unreachable` for both cases: an implementation that cannot see the transport
+    /// boundary genuinely cannot tell them apart, and guessing in the permissive direction here
+    /// would silently turn a broken spend source into "spent nothing, go ahead". Only
+    /// [`UsageServiceSpendReader`], which does see the boundary, overrides this.
+    async fn observe_spend_for_account(
+        &self,
+        account_id: &str,
+        period: &Period,
+    ) -> Result<SpendObservation, BudgetError> {
+        Ok(match self.spend_for_account(account_id, period).await? {
+            Spend::Known(micros) => SpendObservation::Answered(micros),
+            Spend::Unavailable => SpendObservation::Unreachable,
+        })
     }
-    if total_cost < 0.0 {
-        return Err(BudgetError::StorageFailed(format!(
-            "usage_events.total_cost is negative: {total_cost}"
-        )));
-    }
-
-    let micros = total_cost.round();
-    if micros > i64::MAX as f64 {
-        return Err(BudgetError::StorageFailed(format!(
-            "usage_events.total_cost overflows i64 micro-USD: {total_cost}"
-        )));
-    }
-
-    Ok(micros as i64)
-}
-
-/// Computes `[start of calendar month, start of next calendar month)` in UTC for `period`.
-fn period_bounds_utc(period: &Period) -> (DateTime<Utc>, DateTime<Utc>) {
-    let year = period.year();
-    let month = period.month();
-
-    // Safe: `Period` only ever holds a string that already passed `Period::parse`'s validation
-    // (4-digit year, 2-digit month in 1..=12), so `year`/`month` here always form a valid
-    // calendar date on the 1st of the month.
-    let start_date = NaiveDate::from_ymd_opt(year as i32, u32::from(month), 1)
-        .expect("Period invariant: year/month always form a valid calendar date");
-
-    let (next_year, next_month) = if month == 12 {
-        (year + 1, 1)
-    } else {
-        (year, month + 1)
-    };
-    let end_date = NaiveDate::from_ymd_opt(next_year as i32, u32::from(next_month), 1)
-        .expect("Period invariant: year/month always form a valid calendar date");
-
-    let start = start_date
-        .and_hms_opt(0, 0, 0)
-        .expect("midnight is always a valid time")
-        .and_utc();
-    let end = end_date
-        .and_hms_opt(0, 0, 0)
-        .expect("midnight is always a valid time")
-        .and_utc();
-
-    (start, end)
 }
 
 /// Wire request body for `POST {base_url}/usage/v1/spend/query`, matching
@@ -368,13 +342,16 @@ fn load_client_identity(
     Ok(Some(identity))
 }
 
-#[lightbridge_authz_core::async_trait]
-impl SpendReader for UsageServiceSpendReader {
-    async fn spend_for_account(
+impl UsageServiceSpendReader {
+    /// The single HTTP round-trip behind both [`SpendReader`] methods, returning the finer-
+    /// grained [`SpendObservation`]. `spend_for_account` collapses `Answered(0)`-from-no-rows
+    /// back into `Spend::Unavailable` so its documented contract is bit-for-bit unchanged; only
+    /// `observe_spend_for_account` sees the distinction.
+    async fn observe(
         &self,
         account_id: &str,
         period: &Period,
-    ) -> Result<Spend, BudgetError> {
+    ) -> Result<SpendObservation, BudgetError> {
         let (start, end) = period_bounds_utc(period);
         let url = format!("{}/usage/v1/spend/query", self.base_url);
         let request = SpendQueryRequest {
@@ -390,7 +367,7 @@ impl SpendReader for UsageServiceSpendReader {
                     error = %err,
                     "usage-service spend query request failed; treating spend as unavailable"
                 );
-                return Ok(Spend::Unavailable);
+                return Ok(SpendObservation::Unreachable);
             }
         };
 
@@ -399,7 +376,7 @@ impl SpendReader for UsageServiceSpendReader {
                 status = %response.status(),
                 "usage-service spend query returned a non-success status; treating spend as unavailable"
             );
-            return Ok(Spend::Unavailable);
+            return Ok(SpendObservation::Unreachable);
         }
 
         let body: SpendQueryResponse = match response.json().await {
@@ -409,23 +386,54 @@ impl SpendReader for UsageServiceSpendReader {
                     error = %err,
                     "usage-service spend query returned a body that did not parse; treating spend as unavailable"
                 );
-                return Ok(Spend::Unavailable);
+                return Ok(SpendObservation::Unreachable);
             }
         };
 
         match body.total_cost {
-            None => Ok(Spend::Unavailable),
+            // A `200` carrying a SQL `NULL` sum: the usage service ANSWERED, and it holds no rows
+            // for this account/period. `spend_for_account` below still collapses this into
+            // `Spend::Unavailable` -- a refill must never be decided on an unverified zero -- but
+            // the gateway's remaining-budget read needs the distinction (see `SpendObservation`).
+            None => Ok(SpendObservation::Empty),
             Some(total_cost) => match validate_total_cost_micros(total_cost) {
-                Ok(micros) => Ok(Spend::Known(micros)),
+                Ok(micros) => Ok(SpendObservation::Answered(micros)),
                 Err(err) => {
                     tracing::warn!(
                         error = %err,
                         "usage-service spend query returned an unusable total_cost value; treating spend as unavailable"
                     );
-                    Ok(Spend::Unavailable)
+                    Ok(SpendObservation::Unreachable)
                 }
             },
         }
+    }
+}
+
+#[lightbridge_authz_core::async_trait]
+impl SpendReader for UsageServiceSpendReader {
+    /// Unchanged contract: an empty `SUM` and an unreachable usage service are BOTH
+    /// `Spend::Unavailable` here, exactly as before `observe` was split out -- see this type's
+    /// "Fail-closed contract" section, which still describes this method exactly.
+    async fn spend_for_account(
+        &self,
+        account_id: &str,
+        period: &Period,
+    ) -> Result<Spend, BudgetError> {
+        Ok(match self.observe(account_id, period).await? {
+            SpendObservation::Answered(micros) => Spend::Known(micros),
+            // The two halves collapse here, and only here: this method's documented contract is
+            // "no rows and no answer are both `Unavailable`", and it is unchanged by the split.
+            SpendObservation::Empty | SpendObservation::Unreachable => Spend::Unavailable,
+        })
+    }
+
+    async fn observe_spend_for_account(
+        &self,
+        account_id: &str,
+        period: &Period,
+    ) -> Result<SpendObservation, BudgetError> {
+        self.observe(account_id, period).await
     }
 }
 
@@ -470,63 +478,6 @@ mod tests {
             .await
             .expect("unavailable reader never errors");
         assert_eq!(spend, Spend::Unavailable);
-    }
-
-    #[test]
-    fn validate_total_cost_micros_zero_is_zero() {
-        assert_eq!(validate_total_cost_micros(0.0).unwrap(), 0);
-    }
-
-    /// #488 prove-fail (test 1): a realistic gateway payload figure -- a request costing 1,234
-    /// micro-USD (~$0.001234) -- passes through unchanged as 1,234 micro-USD. Break the fix by
-    /// reintroducing `* 1_000_000.0` in `validate_total_cost_micros` and this fails with
-    /// `1_234_000_000` instead.
-    #[test]
-    fn validate_total_cost_micros_passes_gateway_micro_usd_through_unscaled() {
-        assert_eq!(validate_total_cost_micros(1234.0).unwrap(), 1_234);
-    }
-
-    /// #488 prove-fail (test 3): fractional micro-USD (float summation drift from `SUM` over many
-    /// rows) rounds to the nearest whole micro-USD, ties away from zero -- `f64::round`'s
-    /// semantics, documented on `validate_total_cost_micros` and unchanged by this fix (only the
-    /// scaling factor was removed, not the rounding rule).
-    #[test]
-    fn validate_total_cost_micros_rounds_fractional_micro_usd_half_away_from_zero() {
-        assert_eq!(validate_total_cost_micros(1234.6).unwrap(), 1_235);
-        assert_eq!(validate_total_cost_micros(0.5).unwrap(), 1);
-    }
-
-    #[test]
-    fn validate_total_cost_micros_rejects_negative() {
-        assert!(validate_total_cost_micros(-0.01).is_err());
-    }
-
-    #[test]
-    fn validate_total_cost_micros_rejects_nan_and_infinite() {
-        assert!(validate_total_cost_micros(f64::NAN).is_err());
-        assert!(validate_total_cost_micros(f64::INFINITY).is_err());
-        assert!(validate_total_cost_micros(f64::NEG_INFINITY).is_err());
-    }
-
-    #[test]
-    fn validate_total_cost_micros_rejects_i64_overflow() {
-        assert!(validate_total_cost_micros(1e19).is_err());
-    }
-
-    #[test]
-    fn period_bounds_utc_covers_a_calendar_month() {
-        let period = Period::parse("2026-08").expect("valid period");
-        let (start, end) = period_bounds_utc(&period);
-        assert_eq!(start.to_rfc3339(), "2026-08-01T00:00:00+00:00");
-        assert_eq!(end.to_rfc3339(), "2026-09-01T00:00:00+00:00");
-    }
-
-    #[test]
-    fn period_bounds_utc_rolls_over_december_into_january() {
-        let period = Period::parse("2026-12").expect("valid period");
-        let (start, end) = period_bounds_utc(&period);
-        assert_eq!(start.to_rfc3339(), "2026-12-01T00:00:00+00:00");
-        assert_eq!(end.to_rfc3339(), "2027-01-01T00:00:00+00:00");
     }
 
     #[test]

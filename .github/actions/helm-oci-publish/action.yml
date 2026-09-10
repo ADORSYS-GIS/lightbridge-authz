@@ -19,8 +19,15 @@ inputs:
 runs:
   using: composite
   steps:
+    # Pinned to the same Helm as the `helm-charts` job in .github/workflows/ci.yml (ArgoCD
+    # v3.5.1's bundled Helm) so a chart is packaged by the Helm that tested it. An unpinned
+    # setup-helm tracks `latest` and silently changes the packaging toolchain mid-release; the
+    # same floating pin is what broke the helm-charts job when Helm 4 shipped. Keep the two in
+    # lockstep.
     - name: Install Helm
       uses: azure/setup-helm@v4.3.1
+      with:
+        version: v4.2.1
       env:
         GITHUB_TOKEN: "${{ inputs.github-token }}"
 

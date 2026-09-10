@@ -1,0 +1,1 @@
+../../.claude/skills/authz-verify/SKILL.md

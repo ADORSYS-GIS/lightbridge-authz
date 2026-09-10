@@ -1,0 +1,35 @@
+-- A3 (ADORSYS-GIS/lightbridge-authz#648): the usage dimensions bridge -- step 1 of 3, the columns.
+--
+-- `azp` (the OAuth client / channel a request came in on), `operation` (which API surface was
+-- called) and `billing_plan` are all ALREADY emitted by the AI gateway's access log
+-- (`ai-helm`, `charts/core-gateway/templates/envoy-proxy.yaml`: `azp` at :257 from Authorino's
+-- `x-oidc-azp`, `billing_plan` at :240, `x-envoy-origin-path` at :211) and ingest already stores
+-- them -- inside the `attributes` JSONB blob, where they are neither groupable nor filterable.
+-- This promotes the three to real columns so `/usage/v1/usage/query` can answer "cost by channel",
+-- "how many chat completions" and "cost by plan" without the console issuing one query per value.
+--
+-- DELIBERATELY DISPOSABLE. #581 (`docs/plans/0581-multi-source-usage-plan-of-work.md`) replaces
+-- this whole table with the `usage_request_events` hypertable and ends with `DROP TABLE
+-- usage_events`; PR-1b there carries these same three columns and this same `operation`
+-- vocabulary forward (see the plan's PR-1b row and the interim note beside it). The owner ruled on
+-- 2026-09-02 to bridge now rather than wait, because zero of #581 has landed and the console
+-- dashboards need the columns today. Total surface: three columns, one backfill, the query-schema
+-- additions -- nothing else gets built on the doomed table.
+--
+-- PHASING, and why it is three files rather than one: columns are added nullable FIRST (this
+-- file -- a catalog-only change on Postgres 11+, no table rewrite, no long lock), the backfill is
+-- a SEPARATE step that commits per batch (`20260902000002`), and the indexes are created LAST,
+-- once, over final data (`20260902000003`). sqlx applies one migration file as one multi-statement
+-- simple query, which Postgres wraps in an implicit transaction block -- so a `COMMIT` inside a
+-- procedural loop is only reachable from a `-- no-transaction` file holding exactly ONE statement.
+-- That constraint is what splits these steps apart, and it is worth the three files: a
+-- single-transaction backfill of this table would hold every updated row's dead tuple
+-- unvacuumable until the end, on the table whose unbounded growth already exhausted a production
+-- volume once (#549).
+--
+-- NULL means "this signal never carried the dimension", never "zero"/"unknown plan" -- the same
+-- honesty rule `total_cost` and `latency_ms` follow. No `EXCEPTION WHEN OTHERS` anywhere in this
+-- sequence: a migration that cannot do its job must fail loudly.
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS azp TEXT;
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS operation TEXT;
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS billing_plan TEXT;

@@ -1,57 +1,92 @@
-use axum::{Json, Router, http::StatusCode, routing::get};
+use axum::{Router, routing::get};
 use lightbridge_authz_core::{
     Account, AccountId, ApiKey, ApiKeySecret, CreateAccount, CreateApiKey, Project, ProjectMember,
     RotateApiKey, async_trait,
     config::{
-        ApiKeyExpiry, ApiServer, BasicAuth, Billing, BudgetServer, Federation, IdpServer,
-        JwtSigning, ModelCatalog, Oauth2, OauthClient, OauthClientType, OpaServer, QuotaTiers,
-        Redis, UsageServiceClient,
+        ApiKeyExpiry, ApiServer, BasicAuth, Billing, BudgetInternalServer, BudgetServer,
+        Federation, IdpServer, JwtSigning, ModelCatalog, Oauth2, OauthClient, OauthClientType,
+        OpaServer, QuotaTiers, Redis, UsageServiceClient,
     },
-    db::{DbPoolTrait, is_database_ready},
+    db::DbPoolTrait,
     error::{Error, Result},
     server::{dev_cors_enabled, serve_tls},
 };
 
+pub mod actor_api_key_labels;
 pub mod auth_provider;
 pub mod authorize;
+pub mod authorize_session_state;
+pub mod budget_convert;
+pub mod budget_remaining;
+pub mod budget_remaining_auth;
+pub mod budget_remaining_router;
+pub mod budget_remaining_wire;
+pub mod budget_services;
+pub mod budget_snapshot_refresher;
+mod health_handlers;
+pub mod introspect_budget;
+mod opa_doc;
+use health_handlers::{
+    health_handler, readiness_handler, root_handler, startup_handler, version_handler,
+};
+use opa_doc::OpaDoc;
 pub mod claim_redeem;
 pub mod codec;
 pub mod end_session;
+pub mod error_convert;
 pub mod handlers;
 pub mod html_page;
+pub mod identity_directory;
+pub mod loopback;
 pub mod middleware;
 pub mod models;
+pub mod my_access;
 pub mod oauth2_op;
+pub mod platform_roles_directory;
 pub mod post_logout;
 pub mod ratelimit_redis;
 pub mod redis_tls;
 pub mod relying_party;
+pub mod reset_schedule_convert;
 pub mod routers;
 pub mod rpc_authorize;
+pub mod rpc_permission_map;
 pub mod secret_claim;
 pub mod session_cookie;
+pub mod session_directory;
 pub mod session_management;
+pub mod session_query;
 pub mod signing;
 pub mod static_assets;
 pub mod token_exchange;
 pub mod userinfo;
 
+use crate::budget_remaining::BUDGET_REMAINING_PATH;
+
 use auth_provider::{ACCESS_TOKEN_CONTEXT_KEY, CratestackAuthProvider};
+use budget_convert::{
+    resolve_augmentation_requests_page_size, to_schema_augmentation_request,
+    to_schema_augmentation_request_page, to_schema_decision,
+};
 use codec::LenientCborCodec;
 use handlers::AuthzStoreImpl;
+use lightbridge_authz_core::platform_role::known_platform_roles;
 use ratelimit_redis::build_redis_rate_limit_store;
+use reset_schedule_convert::{
+    parse_amount_micros, parse_run_at_or_default, parse_schedule_anchor,
+    to_schema_budget_reset_schedule, to_schema_reset_schedule_run_result,
+};
 use routers::opa_router;
 use rpc_authorize::{RpcAuthorizeState, RpcScope};
 
 use cratestack::idempotency::IdempotencyLayer;
-use cratestack::ratelimit::{RateLimitConfig, RateLimitLayer, RateLimitStore};
+use cratestack::ratelimit::{RateLimitConfig, RateLimitLayer, RateLimitStore, StoreErrorPolicy};
 use cratestack::{
     CratestackContext, CratestackError, DEFAULT_BODY_LIMIT_BYTES, SqlxIdempotencyStore, Value,
 };
 use lightbridge_authz_api::schema;
 use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_bearer::{BearerTokenService, BearerTokenServiceTrait};
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 use tower_http::cors::CorsLayer;
@@ -64,20 +99,61 @@ const IDEMPOTENCY_TTL: Duration = Duration::from_secs(24 * 3600);
 /// limiting (Redis-backed)"). Generous burst with steady refill; tune via deployment as needed.
 const RATE_LIMIT_BURST: u32 = 120;
 const RATE_LIMIT_REFILL_PER_SECOND: f64 = 60.0;
-/// The node-count evaluation budget passed to the [`lightbridge_authz_budget::RuleDataEngine`]
-/// this server's [`lightbridge_authz_budget::PolicyStore`] wraps. See
-/// [`lightbridge_authz_budget::RuleDataEngine`]'s own doc comment for why this is a deterministic
-/// node-count budget rather than a wall-clock request timeout.
-const BUDGET_POLICY_EVALUATION_BUDGET: usize = 10_000;
-/// The one budget policy set this epic needs (ADR-0007; `PolicyStore` is bound to it once at
-/// server startup). See `migrations/20260804000001_budget_policy_sets_and_revisions.sql`.
-const BUDGET_POLICY_SET_ID: &str = "budget-refill";
+/// Store-failure policy for every `RateLimitLayer` this crate builds.
+///
+/// cratestack 0.11.0 (cratestack/cratestack#869, closing cratestack#846) changed the DEFAULT from
+/// "any store error is a 500" to `StoreErrorPolicy::Allow` -- serve the request *unthrottled* when
+/// the store failure is transport-class (`CratestackError::Unavailable`: socket broken, Redis
+/// unreachable, or the new 500ms `with_store_timeout` budget elapsed). Upstream's argument is a
+/// capacity-control one: an unreachable limiter should degrade to unlimited rather than take every
+/// rate-limited route down with it.
+///
+/// **This repo rejects that default.** Here the limiter is a security control, not a capacity
+/// control: it is the brute-force guard in front of the OAuth/OIDC token, device-verification and
+/// CRUD surfaces, and it sits in a service whose whole reason to exist is authorization. The rule
+/// this repo states everywhere else -- "an unavailable dependency must never become the permissive
+/// branch" -- is already applied by hand at the one direct `RateLimitStore::consume` call site
+/// (`oauth2_op::device_store::get_by_user_code_rate_limited`, which returns `Err` fail-closed on
+/// any limiter error). `Deny` is the same decision, restored for the two tower layers so all three
+/// call sites agree.
+///
+/// Consequence, stated plainly: a Redis outage now refuses rate-limited requests with the store's
+/// own error status (503 for transport-class) instead of serving them unthrottled. That is the
+/// pre-0.11.0 behaviour this repo already shipped, minus the opaque body -- 0.11.0 renders the
+/// refusal through the codec-negotiated error envelope, so generated clients decode a typed code.
+/// `DEFAULT_STORE_TIMEOUT` (500ms) is deliberately left at upstream's default: under `Deny` it
+/// only bounds how long a request waits before being refused, which is a strict improvement over
+/// the unbounded `ConnectionManager` reconnect it replaces.
+const RATE_LIMIT_STORE_ERROR_POLICY: StoreErrorPolicy = StoreErrorPolicy::Deny;
+// The evaluation budget and the one policy set id both moved to `budget_services`, beside the
+// `PolicyStore::load_active_from_db` call that is their only real consumer -- `lightbridge-mcp`
+// needs the same two values now that it builds the same service graph (lightbridge-authz#645).
+use crate::budget_services::{BUDGET_POLICY_EVALUATION_BUDGET, BUDGET_POLICY_SET_ID};
 
-#[derive(Serialize, Deserialize)]
-struct RootResponse {
-    status: String,
-    message: String,
-}
+/// How often `authz-budget` wakes to claim due budget reset schedules (ADR-0032). 60 seconds is
+/// comfortably fine-grained for a domain whose finest cadence is daily, and coarse enough that an
+/// idle deployment's scheduler costs one indexed `SELECT` a minute.
+const RESET_SCHEDULER_TICK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Service names reported by `GET /version` and the `service.build` startup log line (#573).
+///
+/// One binary (`lightbridge-authz`) serves all four of these routers, so "which service am I
+/// talking to?" cannot be answered by the process name or the crate version — only by which router
+/// handled the request. These constants are that answer, and they are the SAME strings the servers
+/// already use for their `server = ...` tracing field, so a log line and a `/version` response name
+/// the same thing.
+pub const SERVICE_API: &str = "authz-api";
+/// See [`SERVICE_API`].
+pub const SERVICE_OPA: &str = "authz-opa";
+/// See [`SERVICE_API`].
+pub const SERVICE_IDP: &str = "authz-idp";
+/// See [`SERVICE_API`].
+pub const SERVICE_BUDGET: &str = "authz-budget";
+/// See [`SERVICE_API`]. `authz-budget`'s second, mTLS-only listener (ADR-0034) reports as its own
+/// service for the same reason `lightbridge-authz-usage` splits `authz-usage`/`authz-usage-query`
+/// (#347): the two ports have different auth postures, and "which one am I hitting?" must have an
+/// answer.
+pub const SERVICE_BUDGET_INTERNAL: &str = "authz-budget-internal";
 
 /// Shared state for the OPA server.
 pub struct OpaState {
@@ -102,6 +178,10 @@ pub struct OpaState {
     /// `oauth2.federation.issuer` -- the default `handlers::idp::resolve_context` uses when the
     /// request body omits `issuer` (the legacy `lightbridge-keycloak-spi` adapter's shape).
     pub federation_issuer: String,
+    /// ADR-0034 §15: the budget half of the introspection response. `authz-opa` reads
+    /// `budget_remaining_snapshots` by primary key so the gateway needs ONE metadata call per
+    /// request instead of two — see [`crate::introspect_budget`] for what is and is not reported.
+    pub budget: introspect_budget::BudgetIntrospection,
 }
 
 #[async_trait]
@@ -137,6 +217,25 @@ pub trait OpaRepoTrait: Send + Sync {
     /// full `Ok(None)` vs `Err` distinction. Used by introspection to resolve the `quota_tier`
     /// field for a native RFC 8693 exchange session the same way `owner_quota_tier` already does
     /// for the API-key plane.
+    /// ADR-0034 §15: this account's precomputed remaining balance, or `None` when there is no row.
+    ///
+    /// Defaulted to `Ok(None)` — "this repository serves no budget snapshots" — so the mock repos
+    /// in this crate's and `lightbridge-mcp`'s tests stay honest without restating it. `StoreRepo`
+    /// overrides it with the real primary-key read, and `StoreRepo` is the only implementation any
+    /// server runs.
+    async fn budget_remaining_snapshot(
+        &self,
+        _budget_account_id: &str,
+    ) -> Result<Option<lightbridge_authz_budget::BudgetSnapshot>> {
+        Ok(None)
+    }
+
+    /// Records that the request path just asked about this account, so `authz-budget`'s refresher
+    /// keeps its reading warm. Called write-behind, never awaited on the hot path.
+    async fn touch_budget_remaining_snapshot(&self, _budget_account_id: &str) -> Result<()> {
+        Ok(())
+    }
+
     async fn project_member_quota_tier(
         &self,
         project_id: &str,
@@ -176,6 +275,27 @@ pub struct SessionStatusRow {
 
 #[async_trait]
 impl OpaRepoTrait for StoreRepo {
+    /// One primary-key probe of `budget_remaining_snapshots`, on the connection pool this repo
+    /// already holds — ADR-0034 §15's whole reason for existing (see `crate::introspect_budget`).
+    async fn budget_remaining_snapshot(
+        &self,
+        budget_account_id: &str,
+    ) -> Result<Option<lightbridge_authz_budget::BudgetSnapshot>> {
+        use lightbridge_authz_budget::BudgetSnapshotReader;
+        lightbridge_authz_budget::SnapshotStore::new(self.pool.clone())
+            .read(budget_account_id)
+            .await
+            .map_err(|err| Error::Server(err.to_string()))
+    }
+
+    async fn touch_budget_remaining_snapshot(&self, budget_account_id: &str) -> Result<()> {
+        use lightbridge_authz_budget::BudgetSnapshotReader;
+        lightbridge_authz_budget::SnapshotStore::new(self.pool.clone())
+            .touch(budget_account_id)
+            .await
+            .map_err(|err| Error::Server(err.to_string()))
+    }
+
     async fn record_api_key_usage(
         &self,
         key_id: &str,
@@ -292,153 +412,9 @@ impl OpaRepoTrait for StoreRepo {
     }
 }
 
-/// Maps a core repository `Error` (reused hand-written sqlx) into cratestack's `CratestackError` so an RPC
-/// procedure failure surfaces with the right HTTP status through the RPC error envelope.
-fn to_cratestack_error(err: Error) -> CratestackError {
-    match err {
-        Error::NotFound => CratestackError::NotFound("not found".to_owned()),
-        Error::Forbidden(m) => CratestackError::Forbidden(m),
-        Error::Conflict(m) => CratestackError::Conflict(m),
-        Error::BadRequest(m) => CratestackError::BadRequest(m),
-        other => CratestackError::Internal(other.to_string()),
-    }
-}
-
-/// Maps a [`lightbridge_authz_budget::BudgetError`] into cratestack's `CratestackError`, mirroring
-/// [`to_cratestack_error`] above for the (unrelated) core `Error` type. Exhaustive match, no wildcard
-/// arm, so a new `BudgetError` variant fails this crate's build until it is triaged here rather
-/// than silently falling into some default status.
-fn budget_error_to_cratestack_error(err: lightbridge_authz_budget::BudgetError) -> CratestackError {
-    use lightbridge_authz_budget::BudgetError;
-    match err {
-        BudgetError::InvalidRuleData(m) => CratestackError::BadRequest(m),
-        BudgetError::InvalidAmount(_)
-        | BudgetError::InvalidPeriod(_)
-        | BudgetError::UnknownSource(_)
-        | BudgetError::UnknownTier(_)
-        | BudgetError::UnknownStatus(_)
-        | BudgetError::InvalidReviewOutcome(_)
-        | BudgetError::MissingRejectionReason
-        | BudgetError::AmountNotOffered(_) => CratestackError::BadRequest(err.to_string()),
-        BudgetError::AlreadyGranted | BudgetError::AlreadyReviewed(_) => {
-            CratestackError::Conflict(err.to_string())
-        }
-        BudgetError::PolicyDenied(_) => CratestackError::Forbidden(err.to_string()),
-        BudgetError::NotFound(m) => CratestackError::NotFound(m),
-        BudgetError::StorageFailed(m) => CratestackError::Internal(m),
-    }
-}
-
-/// Renders a [`lightbridge_authz_budget::Effect`] as the exact snake_case wire value its own
-/// `Serialize` impl (`#[serde(rename_all = "snake_case")]`) produces, e.g. `"auto_approve"` /
-/// `"manual_review"`. Used to fill the schema `Decision.effect` `String` field (see the schema's
-/// doc comment on `type Decision` for why that field is a `String` rather than a schema-level
-/// enum) without a second, hand-maintained mapping that could drift from `Effect`'s own derive.
-fn effect_to_wire_string(effect: lightbridge_authz_budget::Effect) -> String {
-    serde_json::to_string(&effect)
-        .expect("Effect always serializes to a JSON string")
-        .trim_matches('"')
-        .to_owned()
-}
-
-/// Maps a domain [`lightbridge_authz_budget::Decision`] into the schema's wire `Decision` shape
-/// (ADR-0007's decision contract, mirrored field-for-field in `authz.cstack`'s `type Decision`).
-/// The two `i64` micro-USD amounts are stringified per that type's documented 64-bit-safety
-/// rationale (matching `ruleDataJson`'s existing string-encoding precedent).
-fn to_schema_decision(
-    decision: lightbridge_authz_budget::Decision,
-) -> schema::procedures::simulate_budget_policy::Output {
-    schema::procedures::simulate_budget_policy::Output {
-        effect: effect_to_wire_string(decision.effect),
-        approvedAmountMicros: decision.approved_amount_micros.to_string(),
-        maximumAmountMicros: decision.maximum_amount_micros.to_string(),
-        reasonCodes: decision.reason_codes,
-        matchedRuleIds: decision.matched_rule_ids,
-        policyRevision: decision.policy_revision,
-        obligations: schema::Obligations {
-            requiredApproverRole: decision.obligations.required_approver_role,
-        },
-    }
-}
-
-/// Maps a domain [`lightbridge_authz_budget::AugmentationRequest`] into the schema's wire
-/// `AugmentationRequest` shape (see `authz.cstack`'s `type AugmentationRequest` doc comment for
-/// the field-by-field reasoning, in particular why `policyReasonCodes`/`matchedRuleIds` are
-/// required `String[]` rather than the `Option<Vec<String>>` the domain type carries -- both
-/// `unwrap_or_default()` calls below are the "never actually `None` by the time a procedure
-/// returns a value" case that comment documents, not a silent-loss compromise).
-fn to_schema_augmentation_request(
-    request: lightbridge_authz_budget::AugmentationRequest,
-) -> schema::AugmentationRequest {
-    schema::AugmentationRequest {
-        id: request.id,
-        budgetAccountId: request.budget_account_id,
-        accountId: request.account_id,
-        projectId: request.project_id,
-        period: request.period.to_string(),
-        requestedTier: request.requested_tier.to_string(),
-        requestedAmountMicros: request.requested_amount_micros.to_string(),
-        status: request.status.to_string(),
-        policyEffect: request.policy_effect.map(effect_to_wire_string),
-        policyReasonCodes: request.policy_reason_codes.unwrap_or_default(),
-        matchedRuleIds: request.matched_rule_ids.unwrap_or_default(),
-        policyRevision: request.policy_revision,
-        approvedAmountMicros: request.approved_amount_micros.map(|a| a.to_string()),
-        grantId: request.grant_id,
-        idempotencyKey: request.idempotency_key,
-        reviewedBy: request.reviewed_by,
-        rejectionReason: request.rejection_reason,
-        createdAt: request.created_at,
-        reviewedAt: request.reviewed_at,
-    }
-}
-
-/// Default/max page size for `listPendingAugmentationRequests`/`listMyAugmentationRequests`
-/// (#296/#295). Mirrors [`DEFAULT_BUDGET_GRANTS_PAGE_SIZE`]/[`MAX_BUDGET_GRANTS_PAGE_SIZE`]
-/// exactly -- same reasoning: this procedure layer's own default when a caller omits `limit`,
-/// and its own tighter ceiling when a caller supplies one, independent of whatever
-/// `AugmentationRepo` additionally clamps to.
-const DEFAULT_AUGMENTATION_REQUESTS_PAGE_SIZE: i64 = 20;
-const MAX_AUGMENTATION_REQUESTS_PAGE_SIZE: i64 = 50;
-
-/// Resolves a caller-supplied, optional `limit` into a page size clamped to
-/// `[1, MAX_AUGMENTATION_REQUESTS_PAGE_SIZE]`, defaulting to
-/// [`DEFAULT_AUGMENTATION_REQUESTS_PAGE_SIZE`] when omitted. Shared by
-/// `listPendingAugmentationRequests` and `listMyAugmentationRequests` -- both page the same
-/// `AugmentationRequest` entity, just in opposite directions (see each procedure's own doc
-/// comment).
-fn resolve_augmentation_requests_page_size(limit: Option<i64>) -> i64 {
-    match limit {
-        Some(requested) => requested.clamp(1, MAX_AUGMENTATION_REQUESTS_PAGE_SIZE),
-        None => DEFAULT_AUGMENTATION_REQUESTS_PAGE_SIZE,
-    }
-}
-
-/// Maps one page of domain [`lightbridge_authz_budget::AugmentationRequest`] rows into the
-/// schema's `AugmentationRequestPage` (#296/#295), mirroring `list_budget_grants_page`'s own
-/// `nextCursor` rule: the last entry's `createdAt` when the page came back exactly `page_size`
-/// long (there may be more), `None` when it came back short (nothing further). This works
-/// identically regardless of which direction the underlying query walked (ASC for
-/// `listPendingAugmentationRequests`, DESC for `listMyAugmentationRequests`) -- "the last entry
-/// in this page" is always the correct cursor to continue that same walk, whichever way it goes.
-fn to_schema_augmentation_request_page(
-    requests: Vec<lightbridge_authz_budget::AugmentationRequest>,
-    page_size: i64,
-) -> schema::AugmentationRequestPage {
-    let next_cursor = if requests.len() == usize::try_from(page_size).unwrap_or(usize::MAX) {
-        requests.last().map(|r| r.created_at)
-    } else {
-        None
-    };
-
-    schema::AugmentationRequestPage {
-        entries: requests
-            .into_iter()
-            .map(to_schema_augmentation_request)
-            .collect(),
-        nextCursor: next_cursor,
-    }
-}
+/// Re-exported from [`crate::error_convert`], which holds both converters. Split out only to keep
+/// this file inside its LoC-gate baseline; see that module's own doc comment.
+pub(crate) use crate::error_convert::{budget_error_to_cratestack_error, to_cratestack_error};
 
 /// Maps a domain [`lightbridge_authz_budget::repo::BalanceSnapshot`] into the schema's wire
 /// `BudgetBalance` shape (see `authz.cstack`'s `type BudgetBalance` doc comment for the
@@ -560,6 +536,19 @@ fn subject_from_ctx(ctx: &CratestackContext) -> Option<String> {
         Some(Value::String(s)) => Some(s.clone()),
         _ => None,
     }
+}
+
+/// Whether the caller holds a given permission, read back out of the auth context
+/// `CratestackAuthProvider` populated once at authentication time (one boolean per
+/// `Permission::ALL` variant -- see `auth_provider.rs`). Absent or non-boolean reads as `false`:
+/// unknown is not a default, it routes to the strictest branch.
+///
+/// One copy, not one per module: it is a security predicate, and a second hand-written copy that
+/// forgot the `Bool(true)` match (or matched `Some(_)`) would fail OPEN. `field` is the
+/// `auth().perm*` name, which callers derive from [`rpc_permission_map::permission_field_name`]
+/// rather than typing.
+pub(crate) fn has_permission(ctx: &CratestackContext, field: &str) -> bool {
+    matches!(ctx.auth_field(field), Some(Value::Bool(true)))
 }
 
 /// The caller's raw access token, stashed into the context by [`CratestackAuthProvider`] so the
@@ -800,6 +789,12 @@ fn to_schema_session_revocation_result(revoked_count: u64) -> schema::SessionRev
 /// `start_api_server`.
 #[derive(Clone)]
 pub struct Procedures {
+    /// Which listener this registry is mounted behind (`SERVICE_API` or `SERVICE_BUDGET`), for
+    /// `getBuildInfo` (#573). One registry type serves both routers, so the router that built it
+    /// is the only thing that knows which service the caller actually reached -- deriving it at
+    /// call time is impossible, and defaulting it would let `authz-budget` report itself as
+    /// `authz-api` in the one screen built to detect exactly that class of mismatch.
+    service: &'static str,
     issuer: Arc<AuthzStoreImpl>,
     policy_store: Arc<lightbridge_authz_budget::PolicyStore>,
     refill_service: Arc<lightbridge_authz_budget::RefillService>,
@@ -812,22 +807,43 @@ pub struct Procedures {
     /// independent handle against the SAME underlying database (constructed once at server
     /// startup, see `start_api_server`).
     budget_repo: Arc<lightbridge_authz_budget::repo::BudgetRepo>,
+    /// The budget reset scheduler (ADR-0032). The SAME instance the `authz-budget` interval task
+    /// drives (see `start_budget_server`), not a second one built for the RPC surface: a dry run
+    /// and a real tick must be the same code over the same state, or a preview could disagree with
+    /// what the scheduler goes on to do. It owns its own `ResetScheduleRepo`, so the four CRUD
+    /// procedures reach schedules through `reset_scheduler.schedules()` rather than a separate
+    /// field.
+    reset_scheduler: Arc<lightbridge_authz_budget::ResetScheduler>,
+    /// This deployment's configured platform-role catalogue (ADR-0033) --
+    /// `oauth2.rbac.role_permissions`' keys, or the built-in defaults when it is unset. The ONLY
+    /// consumer is `grantPlatformRole`, which refuses a role absent from it: an unvalidated typo
+    /// writes a row that confers nothing while looking exactly like a successful grant. Threaded
+    /// in from config rather than read from a global, so a test can drive a deployment whose roles
+    /// are not the built-in three.
+    rbac_roles: Arc<Vec<String>>,
 }
 
 impl Procedures {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
+        service: &'static str,
         issuer: Arc<AuthzStoreImpl>,
         policy_store: Arc<lightbridge_authz_budget::PolicyStore>,
         refill_service: Arc<lightbridge_authz_budget::RefillService>,
         review_service: Arc<lightbridge_authz_budget::ReviewService>,
         budget_repo: Arc<lightbridge_authz_budget::repo::BudgetRepo>,
+        reset_scheduler: Arc<lightbridge_authz_budget::ResetScheduler>,
+        rbac_roles: Arc<Vec<String>>,
     ) -> Self {
         Self {
+            service,
             issuer,
             policy_store,
             refill_service,
             review_service,
             budget_repo,
+            reset_scheduler,
+            rbac_roles,
         }
     }
 }
@@ -1679,6 +1695,15 @@ impl schema::procedures::ProcedureRegistry for Procedures {
     /// request handling (not a pure, unit-testable domain function -- `RefillRequest.as_of` is a
     /// caller-supplied parameter for exactly this reason, per that struct's own doc comment).
     ///
+    /// ## The requester is persisted (#646)
+    ///
+    /// The authenticated subject is written to `budget_augmentation_requests.requested_by_user_id`
+    /// and surfaced as `AugmentationRequest.requestedByUserId`, so the admin review queue can name
+    /// who asked instead of only which account and which reviewer. There is no "request on behalf
+    /// of" input and there must not be one: the recorded requester is always the caller, which is
+    /// the only claim this field is allowed to make. It is an audit field -- nothing here or
+    /// downstream makes an authorization decision from it.
+    ///
     /// ## Authorization is `budget:self-refill` alone (#419)
     ///
     /// This procedure used to *additionally* refuse any caller whose validated token carried
@@ -1718,7 +1743,13 @@ impl schema::procedures::ProcedureRegistry for Procedures {
         let subject = subject_from_ctx(ctx);
         let input = args.args;
         async move {
-            let _subject = subject
+            // #646: the caller's subject is no longer merely proof that someone is authenticated
+            // -- it is persisted onto the request row as `requested_by_user_id` so a decided
+            // request stays attributable to a person. Still fail-closed and still never trusted
+            // as authorization: `rpc_authorize` has already gated this op-id on
+            // `budget:self-refill` before this procedure runs, and nothing below branches on the
+            // value.
+            let requested_by_user_id = subject
                 .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
 
             let period = lightbridge_authz_budget::Period::parse(&input.period)
@@ -1741,6 +1772,7 @@ impl schema::procedures::ProcedureRegistry for Procedures {
                 idempotency_key: input.idempotencyKey,
                 as_of: chrono::Utc::now(),
                 requested_amount_micros,
+                requested_by_user_id: Some(requested_by_user_id),
             };
 
             let created = refill_service
@@ -2293,6 +2325,485 @@ impl schema::procedures::ProcedureRegistry for Procedures {
             })
         }
     }
+
+    /// Every reset schedule, oldest first. Gated at `budget:schedule-manage`.
+    fn list_budget_reset_schedules(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CratestackContext,
+        _args: schema::procedures::list_budget_reset_schedules::Args,
+        _authorized: schema::procedures::list_budget_reset_schedules::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<
+            schema::procedures::list_budget_reset_schedules::Output,
+            CratestackError,
+        >,
+    > + Send {
+        let reset_scheduler = self.reset_scheduler.clone();
+        let subject = subject_from_ctx(ctx);
+        async move {
+            let _subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
+            let schedules = reset_scheduler
+                .schedules()
+                .list()
+                .await
+                .map_err(budget_error_to_cratestack_error)?;
+            Ok(schedules
+                .into_iter()
+                .map(to_schema_budget_reset_schedule)
+                .collect())
+        }
+    }
+
+    /// Authors a schedule, ALWAYS disabled (ADR-0032) -- there is no input field a caller could set
+    /// to create an already-live global schedule. An explicit `nextRunAt` forces the first window
+    /// onto a date the operator picks and must be in the future, so nobody can backdate one into
+    /// firing immediately. Gated at `budget:schedule-manage`.
+    fn create_budget_reset_schedule(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CratestackContext,
+        args: schema::procedures::create_budget_reset_schedule::Args,
+        _authorized: schema::procedures::create_budget_reset_schedule::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<
+            schema::procedures::create_budget_reset_schedule::Output,
+            CratestackError,
+        >,
+    > + Send {
+        let reset_scheduler = self.reset_scheduler.clone();
+        let subject = subject_from_ctx(ctx);
+        let input = args.args;
+        async move {
+            let subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
+
+            let run_at_utc = parse_run_at_or_default(input.runAtUtc.as_deref())?;
+
+            let schedule = reset_scheduler
+                .schedules()
+                .create(
+                    lightbridge_authz_budget::NewBudgetResetSchedule {
+                        name: input.name,
+                        scope_kind: input
+                            .scopeKind
+                            .parse()
+                            .map_err(budget_error_to_cratestack_error)?,
+                        scope_id: input.scopeId,
+                        cadence: input
+                            .cadence
+                            .parse()
+                            .map_err(budget_error_to_cratestack_error)?,
+                        anchor: parse_schedule_anchor(input.anchor)?,
+                        run_at_utc,
+                        amount_micros: parse_amount_micros(&input.amountMicros)?,
+                        mode: input
+                            .mode
+                            .parse()
+                            .map_err(budget_error_to_cratestack_error)?,
+                        next_run_at: input.nextRunAt,
+                    },
+                    Some(&subject),
+                    chrono::Utc::now(),
+                )
+                .await
+                .map_err(budget_error_to_cratestack_error)?;
+
+            Ok(to_schema_budget_reset_schedule(schedule))
+        }
+    }
+
+    /// A partial update; an omitted field leaves its column alone. This is also the only way to
+    /// flip `enabled`, which is what makes "create -> dry run -> enable" the enforced flow rather
+    /// than a convention. Gated at `budget:schedule-manage`.
+    fn update_budget_reset_schedule(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CratestackContext,
+        args: schema::procedures::update_budget_reset_schedule::Args,
+        _authorized: schema::procedures::update_budget_reset_schedule::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<
+            schema::procedures::update_budget_reset_schedule::Output,
+            CratestackError,
+        >,
+    > + Send {
+        let reset_scheduler = self.reset_scheduler.clone();
+        let subject = subject_from_ctx(ctx);
+        let input = args.args;
+        async move {
+            let _subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
+
+            // `scopeId` is read only alongside `scopeKind`: the two move together, since the DB
+            // CHECK requires `global` to carry no scopeId and every other kind to carry one.
+            let scope = input
+                .scopeKind
+                .map(|kind| {
+                    kind.parse::<lightbridge_authz_budget::ScheduleScopeKind>()
+                        .map(|kind| (kind, input.scopeId.clone()))
+                })
+                .transpose()
+                .map_err(budget_error_to_cratestack_error)?;
+
+            let update = lightbridge_authz_budget::BudgetResetScheduleUpdate {
+                name: input.name,
+                scope,
+                cadence: input
+                    .cadence
+                    .map(|c| c.parse())
+                    .transpose()
+                    .map_err(budget_error_to_cratestack_error)?,
+                // `Some(None)` (clear the anchor) is unreachable over this wire shape -- an absent
+                // `anchor` and an explicit null are the same value here -- so an omitted anchor
+                // keeps the stored one, EXCEPT when the cadence becomes daily, where the repo
+                // clears it (see `ResetScheduleRepo::update`).
+                anchor: parse_schedule_anchor(input.anchor)?.map(Some),
+                run_at_utc: input
+                    .runAtUtc
+                    .as_deref()
+                    .map(lightbridge_authz_budget::parse_run_at_utc)
+                    .transpose()
+                    .map_err(budget_error_to_cratestack_error)?,
+                amount_micros: input
+                    .amountMicros
+                    .as_deref()
+                    .map(parse_amount_micros)
+                    .transpose()?,
+                mode: input
+                    .mode
+                    .map(|m| m.parse())
+                    .transpose()
+                    .map_err(budget_error_to_cratestack_error)?,
+                enabled: input.enabled,
+                next_run_at: input.nextRunAt,
+            };
+
+            let schedule = reset_scheduler
+                .schedules()
+                .update(&input.id, update, chrono::Utc::now())
+                .await
+                .map_err(budget_error_to_cratestack_error)?;
+
+            Ok(to_schema_budget_reset_schedule(schedule))
+        }
+    }
+
+    /// Deletes a schedule. The grants it already wrote stay in the append-only ledger (ADR-0009);
+    /// this removes the future, never the past. Gated at `budget:schedule-manage`.
+    fn delete_budget_reset_schedule(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CratestackContext,
+        args: schema::procedures::delete_budget_reset_schedule::Args,
+        _authorized: schema::procedures::delete_budget_reset_schedule::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<
+            schema::procedures::delete_budget_reset_schedule::Output,
+            CratestackError,
+        >,
+    > + Send {
+        let reset_scheduler = self.reset_scheduler.clone();
+        let subject = subject_from_ctx(ctx);
+        let id = args.args.id;
+        async move {
+            let _subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
+            reset_scheduler
+                .schedules()
+                .delete(&id)
+                .await
+                .map_err(budget_error_to_cratestack_error)?;
+            Ok(schema::procedures::delete_budget_reset_schedule::Output { id, deleted: true })
+        }
+    }
+
+    /// Fires the schedule's pending window immediately, or (with `dryRun`) computes the plan and
+    /// writes nothing at all. Same code path either way -- see `ResetScheduler::run_now`. Gated at
+    /// `budget:schedule-manage` even for a dry run: the preview enumerates the estate's accounts
+    /// and their balances.
+    fn run_budget_reset_schedule_now(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CratestackContext,
+        args: schema::procedures::run_budget_reset_schedule_now::Args,
+        _authorized: schema::procedures::run_budget_reset_schedule_now::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<
+            schema::procedures::run_budget_reset_schedule_now::Output,
+            CratestackError,
+        >,
+    > + Send {
+        let reset_scheduler = self.reset_scheduler.clone();
+        let subject = subject_from_ctx(ctx);
+        let input = args.args;
+        async move {
+            let _subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
+
+            let schedule = reset_scheduler
+                .schedules()
+                .get(&input.id)
+                .await
+                .map_err(budget_error_to_cratestack_error)?;
+            let window_start = schedule.next_run_at;
+
+            let outcome = reset_scheduler
+                .run_now(&input.id, chrono::Utc::now(), input.dryRun)
+                .await
+                .map_err(budget_error_to_cratestack_error)?;
+
+            Ok(to_schema_reset_schedule_run_result(
+                input.id,
+                input.dryRun,
+                window_start,
+                outcome,
+            ))
+        }
+    }
+
+    /// The winning schedule for one budget account and when it next fires. Gated at `budget:read`,
+    /// NOT `budget:schedule-manage` -- see the schema doc comment on this procedure.
+    fn get_effective_reset_schedule(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CratestackContext,
+        args: schema::procedures::get_effective_reset_schedule::Args,
+        _authorized: schema::procedures::get_effective_reset_schedule::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<
+            schema::procedures::get_effective_reset_schedule::Output,
+            CratestackError,
+        >,
+    > + Send {
+        let reset_scheduler = self.reset_scheduler.clone();
+        let subject = subject_from_ctx(ctx);
+        let budget_account_id = args.args.budgetAccountId;
+        async move {
+            let _subject = subject
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
+
+            let effective = reset_scheduler
+                .effective_schedule(&budget_account_id)
+                .await
+                .map_err(budget_error_to_cratestack_error)?;
+
+            Ok(match effective {
+                Some(effective) => schema::procedures::get_effective_reset_schedule::Output {
+                    nextRunAt: Some(effective.next_run_at),
+                    schedule: Some(to_schema_budget_reset_schedule(effective.schedule)),
+                },
+                None => schema::procedures::get_effective_reset_schedule::Output {
+                    schedule: None,
+                    nextRunAt: None,
+                },
+            })
+        }
+    }
+
+    /// Admin identity resolution (#647). All three bodies live in
+    /// [`crate::identity_directory`] -- see that module's doc comment for the authorization story
+    /// (the `@allow` clause is the whole of it: no ownership filter, by design) and for why an
+    /// unknown id is absent from the result rather than a fabricated placeholder.
+    /// Sessions (#649). Both bodies live in [`crate::session_directory`] -- see that module's doc
+    /// comment for the asymmetric authorization story (the read is scoped by the `Session` model's
+    /// own `@@allow`; the revoke's own-vs-other check has to be in the handler).
+    fn query_sessions(
+        &self,
+        db: &schema::Cratestack,
+        ctx: &CratestackContext,
+        args: schema::procedures::query_sessions::Args,
+        _authorized: schema::procedures::query_sessions::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<schema::procedures::query_sessions::Output, CratestackError>,
+    > + Send {
+        let issuer = self.issuer.clone();
+        async move { session_directory::query_sessions(db, &issuer.repo, ctx, args.args).await }
+    }
+
+    fn revoke_session(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CratestackContext,
+        args: schema::procedures::revoke_session::Args,
+        _authorized: schema::procedures::revoke_session::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<schema::procedures::revoke_session::Output, CratestackError>,
+    > + Send {
+        let issuer = self.issuer.clone();
+        async move { session_directory::revoke_session(&issuer.repo, ctx, args.args).await }
+    }
+
+    fn resolve_user_profiles(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CratestackContext,
+        args: schema::procedures::resolve_user_profiles::Args,
+        _authorized: schema::procedures::resolve_user_profiles::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<
+            schema::procedures::resolve_user_profiles::Output,
+            CratestackError,
+        >,
+    > + Send {
+        let issuer = self.issuer.clone();
+        let ctx = ctx.clone();
+        async move {
+            identity_directory::resolve_user_profiles(&issuer.repo, &ctx, args.args.userIds).await
+        }
+    }
+
+    /// Unlike its two `user:read` siblings, this one DOES use `db`: its `apiKeyIds` kind is
+    /// row-scoped through the generated `db.api_key()` delegate rather than by a permission, the
+    /// same `listMyExpiringApiKeys` idiom and for the same reason (the model's own compiled
+    /// `@@allow("read", ...)` clause, not a second hand-written ownership join). See
+    /// `actor_api_key_labels.rs`.
+    fn resolve_actor_labels(
+        &self,
+        db: &schema::Cratestack,
+        ctx: &CratestackContext,
+        args: schema::procedures::resolve_actor_labels::Args,
+        _authorized: schema::procedures::resolve_actor_labels::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<
+            schema::procedures::resolve_actor_labels::Output,
+            CratestackError,
+        >,
+    > + Send {
+        // `db`/`ctx` are BORROWED into the future rather than cloned, exactly as
+        // `list_my_expiring_api_keys` above does -- the only other procedure in this impl that
+        // reaches the generated delegate.
+        let issuer = self.issuer.clone();
+        async move { identity_directory::resolve_actor_labels(db, &issuer.repo, ctx, args.args).await }
+    }
+
+    fn search_users(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CratestackContext,
+        args: schema::procedures::search_users::Args,
+        _authorized: schema::procedures::search_users::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<schema::procedures::search_users::Output, CratestackError>,
+    > + Send {
+        let issuer = self.issuer.clone();
+        let ctx = ctx.clone();
+        async move { identity_directory::search_users(&issuer.repo, &ctx, args.args).await }
+    }
+
+    /// Platform role grants (ADR-0033). The three `rbac:manage` bodies live in
+    /// [`crate::platform_roles_directory`] and `getMyAccess`'s in [`crate::my_access`] -- see
+    /// those modules for the authorization story, the revocation session fan-out, and why
+    /// `getMyAccess` reads its answer back out of the auth context instead of re-deriving it.
+    fn list_platform_role_grants(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CratestackContext,
+        args: schema::procedures::list_platform_role_grants::Args,
+        _authorized: schema::procedures::list_platform_role_grants::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<
+            schema::procedures::list_platform_role_grants::Output,
+            CratestackError,
+        >,
+    > + Send {
+        let issuer = self.issuer.clone();
+        let ctx = ctx.clone();
+        async move {
+            platform_roles_directory::list_platform_role_grants(&issuer.repo, &ctx, args.args).await
+        }
+    }
+
+    fn grant_platform_role(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CratestackContext,
+        args: schema::procedures::grant_platform_role::Args,
+        _authorized: schema::procedures::grant_platform_role::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<
+            schema::procedures::grant_platform_role::Output,
+            CratestackError,
+        >,
+    > + Send {
+        let issuer = self.issuer.clone();
+        let rbac_roles = self.rbac_roles.clone();
+        let ctx = ctx.clone();
+        async move {
+            platform_roles_directory::grant_platform_role(
+                &issuer.repo,
+                &ctx,
+                &rbac_roles,
+                args.args,
+            )
+            .await
+        }
+    }
+
+    fn revoke_platform_role(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CratestackContext,
+        args: schema::procedures::revoke_platform_role::Args,
+        _authorized: schema::procedures::revoke_platform_role::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<
+            schema::procedures::revoke_platform_role::Output,
+            CratestackError,
+        >,
+    > + Send {
+        let issuer = self.issuer.clone();
+        let ctx = ctx.clone();
+        async move { platform_roles_directory::revoke_platform_role(&issuer, &ctx, args.args).await }
+    }
+
+    fn get_my_access(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CratestackContext,
+        _args: schema::procedures::get_my_access::Args,
+        _authorized: schema::procedures::get_my_access::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<schema::procedures::get_my_access::Output, CratestackError>,
+    > + Send {
+        let issuer = self.issuer.clone();
+        let ctx = ctx.clone();
+        async move { my_access::get_my_access(&issuer.repo, &ctx).await }
+    }
+
+    /// `getBuildInfo` (#573): the build stamp of the service that answered.
+    ///
+    /// Reads the exact same `lightbridge_authz_core::build_info` value `GET /version` serves, so
+    /// the authenticated RPC answer and the unauthenticated HTTP answer can never disagree about
+    /// what is running. Touches neither the database nor the caller's identity -- `_db` and `ctx`
+    /// are both unused on purpose; the only per-call input is which router mounted this registry.
+    fn get_build_info(
+        &self,
+        _db: &schema::Cratestack,
+        _ctx: &CratestackContext,
+        _args: schema::procedures::get_build_info::Args,
+        _authorized: schema::procedures::get_build_info::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<schema::procedures::get_build_info::Output, CratestackError>,
+    > + Send {
+        let info = lightbridge_authz_core::build_info(self.service);
+        async move {
+            Ok(schema::ServerBuildInfo {
+                service: info.service,
+                version: info.version,
+                gitSha: info.git_sha,
+                gitShortSha: info.git_short_sha,
+                gitCommitDate: info.git_commit_date,
+                gitDirty: info.git_dirty,
+                rustcVersion: info.rustc_version,
+                buildTime: info.build_time,
+                imageBuildSha: info.image_build_sha,
+                imageTag: info.image_tag,
+                imageBuildTime: info.image_build_time,
+            })
+        }
+    }
 }
 
 /// Shared page-fetch for `listMyBudgetGrants`/`listBudgetGrants`: parses the optional `period`,
@@ -2333,12 +2844,24 @@ async fn list_budget_grants_page(
     })
 }
 
-/// Shared `/`, `/healthz`, `/healthz/startup`, `/healthz/ready` mount, reused by every server
-/// router (`build_api_router`/`build_opa_router`/`build_idp_router`) so the probe surface — and
-/// its DB-readiness semantics (`readiness_handler`/`is_database_ready`) — can never drift between
-/// them. Generic over `S` the same way `well_known_router`/`token_exchange_router` are, so it
-/// merges into any router regardless of that router's own state type.
-fn probe_router<S>(readiness_pool: Arc<dyn DbPoolTrait>) -> Router<S>
+/// Shared `/`, `/healthz`, `/healthz/startup`, `/healthz/ready`, `/version` mount, reused by every
+/// server router (`build_api_router`/`build_opa_router`/`build_idp_router`/`build_budget_router`)
+/// so the probe surface — and its DB-readiness semantics (`readiness_handler`/`is_database_ready`)
+/// — can never drift between them. Generic over `S` the same way
+/// `well_known_router`/`token_exchange_router` are, so it merges into any router regardless of that
+/// router's own state type.
+///
+/// `service` names the listener in `GET /version`'s answer (#573). It is a `&'static str` rather
+/// than configuration on purpose: one binary serves four of these routers, and which one a request
+/// reached is a fact of the code path, not something an operator should be able to mislabel.
+///
+/// `/version` sits here, beside the probes, because it is the same KIND of surface: unauthenticated,
+/// side-effect free, and answering "what is this process?" for an operator or a support engineer
+/// who does not hold a credential. It discloses a crate version, a commit id and a toolchain name —
+/// no configuration, no topology, no data. The authenticated equivalent for the console is the
+/// `getBuildInfo` RPC procedure, which returns this same struct over the same client the console
+/// already holds.
+fn probe_router<S>(readiness_pool: Arc<dyn DbPoolTrait>, service: &'static str) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
@@ -2346,6 +2869,7 @@ where
         .route("/", get(root_handler))
         .route("/healthz", get(health_handler))
         .route("/healthz/startup", get(startup_handler))
+        .route("/version", get(move || version_handler(service)))
         .route(
             "/healthz/ready",
             get(move || {
@@ -2397,6 +2921,10 @@ pub fn build_api_router(
     refill_service: Arc<lightbridge_authz_budget::RefillService>,
     review_service: Arc<lightbridge_authz_budget::ReviewService>,
     budget_repo: Arc<lightbridge_authz_budget::repo::BudgetRepo>,
+    reset_scheduler: Arc<lightbridge_authz_budget::ResetScheduler>,
+    // ADR-0033: the configured platform-role catalogue `grantPlatformRole` validates against.
+    // Build it with `lightbridge_authz_core::platform_role::known_platform_roles`.
+    rbac_roles: Arc<Vec<String>>,
     cratestack_db: schema::Cratestack,
     readiness_pool: Arc<dyn DbPoolTrait>,
     idempotency_store: Arc<SqlxIdempotencyStore>,
@@ -2404,7 +2932,7 @@ pub fn build_api_router(
     dev_cors: bool,
     rpc_base_path: Option<&str>,
 ) -> Router {
-    let public = probe_router(readiness_pool);
+    let public = probe_router(readiness_pool, SERVICE_API);
 
     // Generated RPC CRUD surface. Codec: CBOR is the ONLY wire format this router serves — no JSON
     // fallback (ADR-0013, "CBOR is the only transport codec", reversing ADR-0003's "CBOR in
@@ -2424,11 +2952,14 @@ pub fn build_api_router(
     let rpc = schema::axum::rpc_router(
         cratestack_db,
         Procedures::new(
+            SERVICE_API,
             issuer,
             policy_store,
             refill_service,
             review_service,
             budget_repo,
+            reset_scheduler,
+            rbac_roles,
         ),
         // cratestack 0.8.11 (@computed) added this parameter to every generated router fn.
         // `authz.cstack` declares no `@computed` field, so `()` (the generated
@@ -2444,10 +2975,14 @@ pub fn build_api_router(
         DEFAULT_BODY_LIMIT_BYTES,
     )
     .layer(IdempotencyLayer::new(idempotency_store, IDEMPOTENCY_TTL))
-    .layer(RateLimitLayer::new(
-        rate_limit_store,
-        RateLimitConfig::new(RATE_LIMIT_BURST, RATE_LIMIT_REFILL_PER_SECOND),
-    ))
+    .layer(
+        RateLimitLayer::new(
+            rate_limit_store,
+            RateLimitConfig::new(RATE_LIMIT_BURST, RATE_LIMIT_REFILL_PER_SECOND),
+        )
+        // Opt out of cratestack 0.11.0's fail-open default -- see `RATE_LIMIT_STORE_ERROR_POLICY`.
+        .with_store_error_policy(RATE_LIMIT_STORE_ERROR_POLICY),
+    )
     .layer(axum::middleware::from_fn_with_state(
         RpcAuthorizeState {
             bearer,
@@ -2513,11 +3048,12 @@ const CLIENT_ASSERTION_JTI_KEY_PREFIX: &str = "authz-api:client-assertion-jti:";
 /// `TokenExchangeOpStore::resolve_budget_tier`'s fail-closed fallback reads the live, admin-
 /// configured `fail_closed_floor_micros` instead of a hard-coded rung.
 ///
-/// `TokenExchangeOpStore::new` also takes `repo` a second time as its own `quota_repo` parameter
-/// (ADR-0017): production always passes the same `Arc<StoreRepo>` clone for both, since
-/// `project_members` lives on this exact pool with no operational separation from tenant-context
-/// resolution -- the duplicate parameter exists purely as an independent test-injection seam, see
-/// `TokenExchangeOpStore`'s own `quota_repo` field doc comment for why.
+/// `TokenExchangeOpStore::new` also takes `repo` twice more, as its own `quota_repo` (ADR-0017)
+/// and `platform_repo` (ADR-0033) parameters: production always passes the same `Arc<StoreRepo>`
+/// clone for all three, since `project_members` and `platform_role_grants` live on this exact
+/// pool with no operational separation from tenant-context resolution -- the duplicate parameters
+/// exist purely as independent test-injection seams, see `TokenExchangeOpStore`'s own field doc
+/// comments for why.
 fn build_token_exchange_state(
     oauth2: &Oauth2,
     repo: Arc<StoreRepo>,
@@ -2613,6 +3149,7 @@ fn build_token_exchange_state(
     let op_store = Arc::new(oauth2_op::store::TokenExchangeOpStore::new(
         client_store,
         assertions,
+        repo.clone(),
         repo.clone(),
         repo,
         budget_repo,
@@ -2864,84 +3401,23 @@ pub async fn start_api_server(
     oauth2.rbac.validate()?;
     let federation = require_federation(oauth2, "authz-api")?;
 
-    // ADR-0007: load whatever is genuinely active in the DB right now, so a fresh startup always
-    // agrees with the last successful activation -- this is what proves "no restart needed to see
-    // a policy change AND still correct if you do restart" holds for the real running server, not
-    // just at the `PolicyStore` unit level.
-    let policy_store = Arc::new(
-        lightbridge_authz_budget::PolicyStore::load_active_from_db(
-            pool.clone(),
-            BUDGET_POLICY_SET_ID,
-            BUDGET_POLICY_EVALUATION_BUDGET,
-        )
-        .await
-        .map_err(|e| Error::Server(format!("failed to load active budget policy: {e}")))?,
-    );
-
-    // Self-service refill and the admin review queue (#191, PR 3.4). `budget_repo`/
-    // `augmentation_repo` are fresh handles against the same `pool` every other hand-written
-    // repository on this server uses; `policy_store.engine()` is the SAME live, hot-swappable
-    // engine `activateBudgetPolicy`/`getBudgetPolicyStatus` above read/write, so a policy
-    // activated at runtime takes effect for refills immediately, with no restart, exactly as it
-    // already does for `simulateBudgetPolicy`'s sibling procedures.
-    //
-    // `usage_service` (`Config.usage_service`) is optional -- see that field's own doc comment.
-    // When it is not configured, this degrades to `UnavailableSpendReader` rather than failing
-    // server startup: every spend-dependent policy fact then reads `Spend::Unavailable`, which
-    // the rule-data evaluator already treats as a fail-closed signal (routes to `manual_review`,
-    // never `auto_approve` -- see `UnavailableSpendReader`'s own doc comment for the full
-    // reasoning). Choosing to degrade rather than hard-fail (unlike `policy_store` above, which
-    // DOES fail startup loudly on a bad load) is deliberate: a missing `usage_service` narrows
-    // what self-service refill can decide automatically, it does not make the RPC surface
-    // unsafe to serve -- so a deployment that has not wired up the usage service yet can still
-    // start, just with every refill routing to manual review until it does. When it IS
-    // configured, `UsageServiceSpendReader` calls the usage service's `/usage/v1/spend/query`
-    // over HTTP instead of opening a second database connection (see
-    // `crates/lightbridge-authz-budget/src/spend.rs`'s module doc comment for why); every way
-    // that HTTP call can fail -- unreachable, timeout, non-2xx, unparseable body -- also resolves
-    // to `Spend::Unavailable`, never a hard error, so a flaky or down usage service degrades
-    // refill decisions the same way a missing config does, rather than failing this server's own
-    // requests.
-    let budget_repo = Arc::new(lightbridge_authz_budget::repo::BudgetRepo::new(
-        pool.clone(),
-    ));
-    let augmentation_repo = Arc::new(lightbridge_authz_budget::AugmentationRepo::new(
-        pool.clone(),
-    ));
-    let policy_engine: Arc<dyn lightbridge_authz_budget::PolicyEngine> = policy_store.engine();
-    let spend_reader: Arc<dyn lightbridge_authz_budget::SpendReader> = match usage_service {
-        Some(usage_service) => Arc::new(
-            lightbridge_authz_budget::UsageServiceSpendReader::new(
-                usage_service.base_url.clone(),
-                usage_service.insecure_skip_verify,
-                usage_service.ca_bundle_path.as_deref(),
-                usage_service.client_cert_path.as_deref(),
-                usage_service.client_key_path.as_deref(),
-                std::time::Duration::from_millis(usage_service.timeout_ms),
-            )
-            .map_err(|e| {
-                Error::Server(format!("failed to build usage-service spend reader: {e}"))
-            })?,
-        ),
-        None => {
-            tracing::warn!(
-                "usage_service is not configured -- budget refill spend facts will report \
-                 Unavailable, and self-service refill decisions that depend on them will fail \
-                 closed to manual review"
-            );
-            Arc::new(lightbridge_authz_budget::UnavailableSpendReader)
-        }
-    };
-    let refill_service = Arc::new(lightbridge_authz_budget::RefillService::new(
-        budget_repo.clone(),
-        augmentation_repo.clone(),
-        policy_engine,
-        spend_reader,
-    ));
-    let review_service = Arc::new(lightbridge_authz_budget::ReviewService::new(
-        budget_repo.clone(),
-        augmentation_repo,
-    ));
+    // ADR-0007 / ADR-0032, one shared builder (`budget_services`) rather than a copy per server:
+    // `authz-api`, `authz-budget` and `lightbridge-mcp` all need the identical graph, including
+    // the fail-closed spend-reader degrade. `authz-api` holds an inert `reset_scheduler` -- only
+    // `start_budget_server` spawns the interval task that drives it, and `RpcScope::Crud` refuses
+    // every `budget:*` op-id here before dispatch.
+    let budget_services::BudgetServices {
+        policy_store,
+        refill_service,
+        review_service,
+        budget_repo,
+        reset_scheduler,
+        // ADR-0034's remaining reader is assembled and mounted only by `start_budget_server`, on
+        // its own internal listener; §15's snapshot refresher runs only there too. `authz-api`
+        // shares the graph and drops both handles.
+        spend_reader: _,
+        snapshots: _,
+    } = budget_services::build_budget_services(pool.clone(), usage_service).await?;
 
     let readiness_pool = pool.clone();
     // Bootstraps (or observes) the active self-signed-JWT signing key so `AuthzStoreImpl`'s own
@@ -2997,13 +3473,12 @@ pub async fn start_api_server(
         .map_err(|e| Error::Server(format!("failed to open cratestack Postgres pool: {e}")))?;
     let cratestack_db = schema::Cratestack::builder(cratestack_pool.clone()).build();
 
-    // Idempotency store (Postgres-backed, cratestack sqlx); create its table before serving
-    // (ADR-0003, "Idempotency").
+    // Idempotency store (Postgres-backed, cratestack sqlx). Its table is created by
+    // `migrations/20260904000002_cratestack_bootstrap_tables.sql`, NOT by `ensure_schema()` here:
+    // that call issued `CREATE TABLE IF NOT EXISTS`, which is not atomic across sessions, so two
+    // replicas starting together against a fresh database could fail to start on a `23505` against
+    // `pg_type_typname_nsp_index` (#684). One owner, and it is the migration.
     let idempotency_store = Arc::new(SqlxIdempotencyStore::new(cratestack_pool.clone()));
-    idempotency_store
-        .ensure_schema()
-        .await
-        .map_err(|e| Error::Server(format!("failed to ensure idempotency schema: {e}")))?;
 
     // Redis-backed rate-limit store for multi-replica correctness (ADR-0003, "Rate limiting
     // (Redis-backed)"). `redis::Client::open` is lazy, so this does not block on a live Redis here.
@@ -3022,6 +3497,8 @@ pub async fn start_api_server(
         refill_service,
         review_service,
         budget_repo,
+        reset_scheduler,
+        Arc::new(known_platform_roles(&oauth2.rbac)),
         cratestack_db,
         readiness_pool,
         idempotency_store,
@@ -3035,8 +3512,9 @@ pub async fn start_api_server(
     }
     let signing_enabled = oauth2.is_self_signed();
     let issuance_enabled = oauth2.is_external();
+    lightbridge_authz_core::log_build_info(SERVICE_API);
     tracing::info!(
-        server = "authz-api",
+        server = SERVICE_API,
         address = %api.address,
         port = api.port,
         oauth2_type = ?oauth2.oauth2_type,
@@ -3051,7 +3529,7 @@ pub async fn start_api_server(
 /// Assembles the OPA server router (public probes + Basic-auth introspection/resolve routes).
 /// Separated from `start_opa_server` for testability.
 pub fn build_opa_router(state: Arc<OpaState>, readiness_pool: Arc<dyn DbPoolTrait>) -> Router {
-    let public = probe_router(readiness_pool)
+    let public = probe_router(readiness_pool, SERVICE_OPA)
         .merge(SwaggerUi::new("/v1/opa/docs").url("/v1/opa/openapi.json", OpaDoc::openapi()));
 
     let protected = opa_router(state.clone()).with_state(state.clone());
@@ -3086,12 +3564,14 @@ pub async fn start_opa_server(
         api_key_audience,
         resolver,
         federation_issuer: federation.issuer.clone(),
+        budget: introspect_budget::BudgetIntrospection::default(),
     });
 
     let app = build_opa_router(state, readiness_pool);
 
+    lightbridge_authz_core::log_build_info(SERVICE_OPA);
     tracing::info!(
-        server = "authz-opa",
+        server = SERVICE_OPA,
         address = %opa.address,
         port = opa.port,
         "starting opa server"
@@ -3167,7 +3647,7 @@ pub fn build_idp_router(
     relying_party: Arc<relying_party::KeycloakRelyingParty>,
     claim_redeem: claim_redeem::ClaimRedeemState,
 ) -> Router {
-    let mut router = probe_router(readiness_pool);
+    let mut router = probe_router(readiness_pool, SERVICE_IDP);
     let claim_redeem_repo = Arc::clone(&claim_redeem.repo);
     // GHSA-9pc6-965v-2c44: mounted unconditionally, like every other authz-idp route (ADR-0023).
     // A deployment where this 404s while lightbridge-mcp still issues claim URLs would hand users
@@ -3427,8 +3907,9 @@ pub async fn start_idp_server(
         claim_redeem,
     );
 
+    lightbridge_authz_core::log_build_info(SERVICE_IDP);
     tracing::info!(
-        server = "authz-idp",
+        server = SERVICE_IDP,
         address = %idp.address,
         port = idp.port,
         "starting idp server"
@@ -3468,6 +3949,10 @@ pub fn build_budget_router(
     refill_service: Arc<lightbridge_authz_budget::RefillService>,
     review_service: Arc<lightbridge_authz_budget::ReviewService>,
     budget_repo: Arc<lightbridge_authz_budget::repo::BudgetRepo>,
+    reset_scheduler: Arc<lightbridge_authz_budget::ResetScheduler>,
+    // See `build_api_router`'s parameter of the same name. `authz-budget` serves none of the
+    // `rbac:manage` op-ids (they are `crud`-scoped), but it builds the same `Procedures`.
+    rbac_roles: Arc<Vec<String>>,
     cratestack_db: schema::Cratestack,
     readiness_pool: Arc<dyn DbPoolTrait>,
     bearer: Arc<dyn BearerTokenServiceTrait>,
@@ -3476,16 +3961,19 @@ pub fn build_budget_router(
     rate_limit_store: Arc<dyn RateLimitStore>,
     dev_cors: bool,
 ) -> Router {
-    let public = probe_router(readiness_pool);
+    let public = probe_router(readiness_pool, SERVICE_BUDGET);
 
     let rpc = schema::axum::rpc_router(
         cratestack_db,
         Procedures::new(
+            SERVICE_BUDGET,
             issuer,
             policy_store,
             refill_service,
             review_service,
             budget_repo,
+            reset_scheduler,
+            rbac_roles,
         ),
         // cratestack 0.8.11 (@computed) added this parameter to every generated router fn.
         // `authz.cstack` declares no `@computed` field, so `()` (the generated
@@ -3496,10 +3984,14 @@ pub fn build_budget_router(
         DEFAULT_BODY_LIMIT_BYTES,
     )
     .layer(IdempotencyLayer::new(idempotency_store, IDEMPOTENCY_TTL))
-    .layer(RateLimitLayer::new(
-        rate_limit_store,
-        RateLimitConfig::new(RATE_LIMIT_BURST, RATE_LIMIT_REFILL_PER_SECOND),
-    ))
+    .layer(
+        RateLimitLayer::new(
+            rate_limit_store,
+            RateLimitConfig::new(RATE_LIMIT_BURST, RATE_LIMIT_REFILL_PER_SECOND),
+        )
+        // Opt out of cratestack 0.11.0's fail-open default -- see `RATE_LIMIT_STORE_ERROR_POLICY`.
+        .with_store_error_policy(RATE_LIMIT_STORE_ERROR_POLICY),
+    )
     .layer(axum::middleware::from_fn_with_state(
         RpcAuthorizeState {
             bearer,
@@ -3533,6 +4025,7 @@ pub fn build_budget_router(
 )]
 pub async fn start_budget_server(
     budget: &BudgetServer,
+    budget_internal: Option<&BudgetInternalServer>,
     pool: Arc<dyn DbPoolTrait>,
     oauth2: &Oauth2,
     billing: &Billing,
@@ -3547,63 +4040,23 @@ pub async fn start_budget_server(
     oauth2.rbac.validate()?;
     let federation = require_federation(oauth2, "authz-budget")?;
 
-    // ADR-0007: load whatever is genuinely active in the DB right now, so a fresh startup always
-    // agrees with the last successful activation, exactly like `start_api_server`'s identical load
-    // did before the cutover.
-    let policy_store = Arc::new(
-        lightbridge_authz_budget::PolicyStore::load_active_from_db(
-            pool.clone(),
-            BUDGET_POLICY_SET_ID,
-            BUDGET_POLICY_EVALUATION_BUDGET,
-        )
-        .await
-        .map_err(|e| Error::Server(format!("failed to load active budget policy: {e}")))?,
-    );
-
-    // Self-service refill and the admin review queue (#191, PR 3.4) -- see `start_api_server`'s
-    // identical construction for the full spend-reader degrade-not-fail reasoning
-    // (`UnavailableSpendReader` on a missing/unreachable `usage_service`, never a hard startup
-    // failure or an auto-approve).
-    let budget_repo = Arc::new(lightbridge_authz_budget::repo::BudgetRepo::new(
-        pool.clone(),
-    ));
-    let augmentation_repo = Arc::new(lightbridge_authz_budget::AugmentationRepo::new(
-        pool.clone(),
-    ));
-    let policy_engine: Arc<dyn lightbridge_authz_budget::PolicyEngine> = policy_store.engine();
-    let spend_reader: Arc<dyn lightbridge_authz_budget::SpendReader> = match usage_service {
-        Some(usage_service) => Arc::new(
-            lightbridge_authz_budget::UsageServiceSpendReader::new(
-                usage_service.base_url.clone(),
-                usage_service.insecure_skip_verify,
-                usage_service.ca_bundle_path.as_deref(),
-                usage_service.client_cert_path.as_deref(),
-                usage_service.client_key_path.as_deref(),
-                std::time::Duration::from_millis(usage_service.timeout_ms),
-            )
-            .map_err(|e| {
-                Error::Server(format!("failed to build usage-service spend reader: {e}"))
-            })?,
-        ),
-        None => {
-            tracing::warn!(
-                "usage_service is not configured -- budget refill spend facts will report \
-                 Unavailable, and self-service refill decisions that depend on them will fail \
-                 closed to manual review"
-            );
-            Arc::new(lightbridge_authz_budget::UnavailableSpendReader)
-        }
-    };
-    let refill_service = Arc::new(lightbridge_authz_budget::RefillService::new(
-        budget_repo.clone(),
-        augmentation_repo.clone(),
-        policy_engine,
+    // The same shared `budget_services` graph `start_api_server` builds -- this server owns the
+    // half of it that is actually reachable (`RpcScope::Budget`) and is the only one that spawns
+    // the reset scheduler's interval task, below.
+    let services = budget_services::build_budget_services(pool.clone(), usage_service).await?;
+    // ADR-0034 §15, started HERE and only here: the loop that precomputes every active account's
+    // remaining balance, so `authz-opa`'s introspection can answer the gateway's budget question
+    // from one indexed read instead of a second metadata call.
+    budget_snapshot_refresher::spawn_snapshot_refresher(&services, budget)?;
+    let budget_services::BudgetServices {
+        policy_store,
+        refill_service,
+        review_service,
+        budget_repo,
+        reset_scheduler,
         spend_reader,
-    ));
-    let review_service = Arc::new(lightbridge_authz_budget::ReviewService::new(
-        budget_repo.clone(),
-        augmentation_repo,
-    ));
+        snapshots,
+    } = services;
 
     let readiness_pool = pool.clone();
     // Hand-written sqlx on the core `DbPool` (sqlx 0.9), same as `start_api_server` -- required to
@@ -3649,24 +4102,60 @@ pub async fn start_budget_server(
         .map_err(|e| Error::Server(format!("failed to open cratestack Postgres pool: {e}")))?;
     let cratestack_db = schema::Cratestack::builder(cratestack_pool.clone()).build();
 
+    // Same as `start_api_server`: the table is migration-owned (#684), never bootstrapped here.
     let idempotency_store = Arc::new(SqlxIdempotencyStore::new(cratestack_pool.clone()));
-    idempotency_store
-        .ensure_schema()
-        .await
-        .map_err(|e| Error::Server(format!("failed to ensure idempotency schema: {e}")))?;
 
     // Own key prefix ("authz-budget", not "authz-api") so the two services' token buckets never
     // share state, even though they may point at the same Redis instance.
     let rate_limit_store =
         build_redis_rate_limit_store(&redis.url, redis.ca_bundle_path.as_deref(), "authz-budget")?;
 
+    // ADR-0032: the budget reset scheduler's own tick loop, started HERE and only here -- one
+    // `tokio::interval` alongside the three existing listener tasks, on the process that owns the
+    // budget domain. Running several `authz-budget` replicas is safe by construction: each tick
+    // claims due rows with `FOR UPDATE SKIP LOCKED`, so a schedule another replica already holds
+    // is skipped rather than fired twice.
+    //
+    // `spawn`ed, not awaited: a scheduler failure must never stop the RPC surface from serving. A
+    // failing tick is logged and the next one retries 60 seconds later -- and because the tick's
+    // claim transaction only commits the `next_run_at` advance on success, a failed window stays
+    // due rather than being silently skipped.
+    let scheduler_task = reset_scheduler.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(RESET_SCHEDULER_TICK_INTERVAL);
+        // `Delay`, not the default `Burst`: a tick that overruns 60 seconds (a global schedule
+        // over a large estate) must not queue up a backlog of immediate catch-up ticks behind it.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            match scheduler_task.tick(chrono::Utc::now()).await {
+                Ok(report) if report.claimed_schedule_ids.is_empty() => {}
+                Ok(report) => tracing::info!(
+                    claimed = report.claimed_schedule_ids.len(),
+                    grants_written = report.grants_written,
+                    "budget reset scheduler tick"
+                ),
+                Err(err) => tracing::error!(
+                    error = %err,
+                    "budget reset scheduler tick failed; retrying on the next interval"
+                ),
+            }
+        }
+    });
+
     let dev_cors = dev_cors_enabled();
+    // Cloned before `build_budget_router` consumes them: ADR-0034's reader must be the SAME repo
+    // and the SAME scheduler the RPC surface serves from, not a second graph over the same pool.
+    let budget_repo_for_remaining = budget_repo.clone();
+    let reset_scheduler_for_remaining = reset_scheduler.clone();
     let app = build_budget_router(
         issuer,
         policy_store,
         refill_service,
         review_service,
         budget_repo,
+        reset_scheduler,
+        Arc::new(known_platform_roles(&oauth2.rbac)),
         cratestack_db,
         readiness_pool,
         bearer_service,
@@ -3679,70 +4168,95 @@ pub async fn start_budget_server(
     if dev_cors {
         tracing::warn!("AUTHZ_DEV_CORS is set — budget server allows any CORS origin (dev only)");
     }
+    lightbridge_authz_core::log_build_info(SERVICE_BUDGET);
     tracing::info!(
-        server = "authz-budget",
+        server = SERVICE_BUDGET,
         address = %budget.address,
         port = budget.port,
         rpc_base_path = BUDGET_RPC_BASE_PATH,
         "starting budget server"
     );
 
-    serve_tls("BUDGET", &budget.address, budget.port, &budget.tls, app).await
-}
+    let rpc_listener = serve_tls("BUDGET", &budget.address, budget.port, &budget.tls, app);
 
-async fn root_handler() -> (StatusCode, Json<RootResponse>) {
-    let response = RootResponse {
-        status: "ok".to_string(),
-        message: "Welcome to Lightbridge Authz API".to_string(),
+    // ADR-0034: the mTLS-only internal listener, when configured. `tokio::try_join!` runs the two
+    // concurrently rather than sequentially (the same shape `start_usage_server` uses for its own
+    // two listeners) so neither listener's lifetime blocks the other's, and either one failing
+    // fails this function.
+    let Some(internal) = budget_internal else {
+        tracing::info!(
+            server = SERVICE_BUDGET_INTERNAL,
+            "server.budget_internal is not configured; the gateway's budget-remaining read \
+             ({BUDGET_REMAINING_PATH}) is not served by this process"
+        );
+        return rpc_listener.await;
     };
-    (StatusCode::OK, Json(response))
-}
 
-async fn health_handler() -> StatusCode {
-    StatusCode::OK
-}
+    // Fail-closed, and loudly (ADR-0034 §3.2) -- see `budget_remaining_auth`.
+    let shared_secret_header =
+        budget_remaining_auth::validate_budget_internal(internal, BUDGET_REMAINING_PATH)
+            .map_err(Error::Server)?;
 
-async fn startup_handler() -> StatusCode {
-    StatusCode::OK
-}
+    // The grace window is this listener's own config, which is why `build_budget_services` hands
+    // back the shared `spend_reader` rather than a pre-assembled reader: `authz-api` and
+    // `lightbridge-mcp` share the graph but have no `budget_internal` block to read a grace from.
+    let grace = chrono::Duration::seconds(
+        i64::try_from(internal.remaining_grace_seconds).map_err(|_| {
+            Error::Server(format!(
+                "server.budget_internal.remaining_grace_seconds is out of range: {}",
+                internal.remaining_grace_seconds
+            ))
+        })?,
+    );
+    let live_remaining = Arc::new(lightbridge_authz_budget::RemainingService::with_grace(
+        budget_repo_for_remaining,
+        spend_reader,
+        reset_scheduler_for_remaining,
+        grace,
+    ));
+    // ADR-0034 §15: snapshot first, live read as the fallback. The endpoint's 404/503 semantics
+    // are unchanged — they still live in the inner reader, which this layer delegates to whenever
+    // there is no usable stored reading (and whenever `?fresh=true` asks it to).
+    let remaining_service = Arc::new(lightbridge_authz_budget::SnapshotRemainingService::new(
+        snapshots,
+        live_remaining,
+    ));
 
-async fn readiness_handler(pool: Arc<dyn DbPoolTrait>) -> StatusCode {
-    if is_database_ready(pool.as_ref()).await {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
-    }
-}
+    let internal_state = Arc::new(budget_remaining::BudgetInternalState {
+        remaining: remaining_service,
+        shared_secret: internal.shared_secret.clone(),
+        shared_secret_header,
+    });
+    let internal_app = budget_remaining::budget_remaining_router(internal_state.clone())
+        .with_state(internal_state);
 
-#[derive(OpenApi)]
-#[openapi(
-    paths(
-        crate::handlers::introspect::introspect_api_key,
-        crate::handlers::idp::resolve_context,
-        crate::handlers::idp::authorize_usage_scope
-    ),
-    components(
-        schemas(
-            crate::models::IntrospectRequest,
-            crate::models::IntrospectResponse,
-            lightbridge_authz_core::ApiKey,
-            lightbridge_authz_core::Project,
-            lightbridge_authz_core::Account,
-            lightbridge_authz_core::ResolveContextRequest,
-            lightbridge_authz_core::ResolvedContext,
-            lightbridge_authz_core::AuthorizeUsageScopeRequest
-        )
-    ),
-    tags(
-        (name = "authorino", description = "Authorino integration"),
-        (name = "idp", description = "Identity request resolution")
-    )
-)]
-struct OpaDoc;
+    lightbridge_authz_core::log_build_info(SERVICE_BUDGET_INTERNAL);
+    tracing::info!(
+        server = SERVICE_BUDGET_INTERNAL,
+        address = %internal.address,
+        port = internal.port,
+        path = BUDGET_REMAINING_PATH,
+        grace_seconds = internal.remaining_grace_seconds,
+        auth_header = %internal.shared_secret_header,
+        "starting budget internal (shared-secret) server"
+    );
+
+    let internal_listener = serve_tls(
+        "BUDGET_INTERNAL",
+        &internal.address,
+        internal.port,
+        &internal.tls,
+        internal_app,
+    );
+
+    tokio::try_join!(rpc_listener, internal_listener)?;
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::StatusCode;
     use lightbridge_authz_bearer::{BearerTokenServiceTrait, TokenInfo};
     use lightbridge_authz_core::config::{Oauth2TokenExchange, Oauth2Type};
     use serde_json::Value;

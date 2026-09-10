@@ -582,6 +582,31 @@ pub struct Server {
     /// `app/lightbridge-authz/src/main.rs`).
     #[serde(default)]
     pub budget: Option<BudgetServer>,
+    /// `authz-budget`'s **second**, mTLS-only listener (ADR-0034, lightbridge-authz#658): the
+    /// service-to-service read `GET /budget/v1/remaining` the gateway's Dynamic Budget Limiter
+    /// calls through Authorino. Shaped exactly like `lightbridge-authz-usage`'s
+    /// `UsageServerGroup::query` (#347) and for the identical reason — `axum-server`'s rustls
+    /// integration enforces client-certificate verification per **listener**, not per route, so
+    /// this cannot be a route on the bearer-JWT RPC listener above without locking out the
+    /// console.
+    ///
+    /// `Option`, like `idp`/`budget` above, and for the same operational reason recorded on
+    /// [`IdpServer::static_dir`]: prod's config is a wholesale override living in the separate
+    /// `ai-helm-values` repo, and prod tracks `main` HEAD via argocd-image-updater with no
+    /// release-tag gate — a hard-required field here would crash-loop `authz-budget` on the very
+    /// next promotion, taking the console's whole budget surface down. When it is absent the
+    /// listener is simply not bound and `startup` logs why; the gateway side of ADR-0034 is
+    /// values-gated off in the same state, so the two halves cannot be enabled independently by
+    /// accident.
+    ///
+    /// When it IS present, `shared_secret` is **mandatory** and startup fails without it. This
+    /// listener answers a cross-account balance question with no per-caller ownership check at
+    /// all; serving it without a credential is exactly the silent degrade this codebase's
+    /// fail-closed rule forbids. The credential is a shared secret in a custom header, **not**
+    /// mTLS -- Authorino v0.24.0 cannot present a client certificate, so the shape ADR-0034 first
+    /// specified is unreachable by its only caller. See [`BudgetInternalServer`].
+    #[serde(default)]
+    pub budget_internal: Option<BudgetInternalServer>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -652,20 +677,6 @@ pub struct IdpServer {
 /// is the right value.
 fn default_idp_static_dir() -> String {
     "/app/static".to_owned()
-}
-
-/// `authz-budget`'s server block. Shaped like [`IdpServer`] (address/port/TLS, no `basic_auth`):
-/// every route this server mounts is behind the same bearer-JWT `rpc_authorize` gate `authz-api`
-/// already uses, not Basic auth like [`OpaServer`]. Unlike `idp`, this server's RPC surface is
-/// mounted under a fixed `/budget` path prefix (`build_budget_router`) rather than at the
-/// configurable root `authz-api` uses — there is no `rpc_base_path` field here because the prefix
-/// is not optional, it is what makes the service reachable behind a shared gateway origin
-/// alongside `authz-api` (see `docs/architecture/budget.md`).
-#[derive(Debug, Clone, Deserialize)]
-pub struct BudgetServer {
-    pub address: String,
-    pub port: u16,
-    pub tls: Tls,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1151,40 +1162,15 @@ pub struct JwtSigning {
     pub claim_mappers: Vec<ClaimMapper>,
 }
 
-/// One declared claim, its source, and how source values become claim values.
-///
-/// Deliberately data, not code: adding a role tier or renaming the RBAC claim is a values-file
-/// edit, not a release. The evaluation is intentionally trivial -- lookup, map, emit -- because a
-/// claim that feeds an authorization decision is the wrong place for an expression language.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ClaimMapper {
-    /// The claim name to stamp, e.g. `lightbridge_api_roles` (whatever `rbac.roles_claim` names).
-    pub claim: String,
-    /// Where the value comes from. Server-side resolved data only.
-    pub source: ClaimSource,
-    /// Source value -> emitted claim values. A source value absent from this map falls through to
-    /// [`ClaimMapper::default_values`].
-    #[serde(default)]
-    pub map: std::collections::HashMap<String, Vec<String>>,
-    /// Emitted when the source resolves to a value `map` does not cover, or resolves to nothing.
-    ///
-    /// Defaults to EMPTY, which for the RBAC roles claim means "no permissions" -- the
-    /// default-deny direction. An operator wanting a baseline role must say so explicitly.
-    #[serde(default, rename = "default")]
-    pub default_values: Vec<String>,
-}
+pub mod budget_internal;
+pub mod budget_server;
+pub mod claim_mapper;
 
-/// The server-side facts a [`ClaimMapper`] may read. Closed on purpose: every variant must be
-/// something this service already resolves while minting, so a mapper can never introduce a new
-/// round-trip or read data the token subject does not own.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ClaimSource {
-    /// The subject's `project_members.role` on the token's project (`lead` / `member`), or
-    /// `owner` when they own the project's account and hold no roster row -- the same
-    /// owner-is-implicitly-authorized rule `authorize_project_lead` applies.
-    ProjectRole,
-}
+/// Re-exported from [`crate::config::claim_mapper`], which holds both types. Split out only to
+/// keep this file inside its LoC-gate baseline; see that module's own doc comment.
+pub use budget_internal::BudgetInternalServer;
+pub use budget_server::BudgetServer;
+pub use claim_mapper::{ClaimMapper, ClaimSource};
 
 fn default_signing_ttl_seconds() -> i64 {
     7_776_000

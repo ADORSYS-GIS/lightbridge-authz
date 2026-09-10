@@ -25,6 +25,7 @@ use sqlx::PgPool;
 
 use crate::error::BudgetError;
 use crate::period::Period;
+use crate::repo_grant_sql::{GRANT_INSERT_SQL, GRANT_SELECT_BY_IDEMPOTENCY_KEY_SQL};
 use crate::source::GrantSource;
 use crate::tier::BudgetTier;
 
@@ -330,22 +331,6 @@ fn validate_amount_sign(source: GrantSource, amount_micros: i64) -> Result<(), B
     }
 }
 
-const GRANT_INSERT_SQL: &str = "INSERT INTO budget_grants \
-    (id, budget_account_id, account_id, project_id, period, amount_micros, source, \
-     actor_id, reason, policy_revision, matched_rule_ids, idempotency_key, \
-     trigger_key, expires_at) \
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
-     ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING \
-     RETURNING id, budget_account_id, account_id, project_id, period, amount_micros, source, \
-     actor_id, reason, policy_revision, matched_rule_ids, idempotency_key, trigger_key, \
-     created_at, expires_at, revoked_at";
-
-const GRANT_SELECT_BY_IDEMPOTENCY_KEY_SQL: &str = "SELECT \
-     id, budget_account_id, account_id, project_id, period, amount_micros, source, \
-     actor_id, reason, policy_revision, matched_rule_ids, idempotency_key, trigger_key, \
-     created_at, expires_at, revoked_at \
-     FROM budget_grants WHERE idempotency_key = $1";
-
 impl BudgetRepo {
     pub fn new(pool: Arc<dyn DbPoolTrait>) -> Self {
         Self { pool }
@@ -439,6 +424,19 @@ impl BudgetRepo {
                 .execute(&mut *tx)
                 .await
                 .map_err(storage_failed)?;
+
+                // ADR-0034 section 15: move the gateway's precomputed snapshot by exactly this
+                // grant, in this transaction. A refill is then visible on the very next request
+                // instead of one refresh interval later, and no spend read is needed -- a grant
+                // moves the ceiling and never the spend. A no-op when the account has no reading
+                // yet or the periods differ; see `snapshot_store::APPLY_GRANT_DELTA_SQL`.
+                crate::snapshot_store::SnapshotStore::apply_grant_delta_tx(
+                    &mut tx,
+                    &request.budget_account_id,
+                    &period_str,
+                    request.amount_micros,
+                )
+                .await?;
 
                 row
             }

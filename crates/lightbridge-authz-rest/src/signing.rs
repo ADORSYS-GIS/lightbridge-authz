@@ -471,7 +471,6 @@ pub(crate) fn access_token_extra(
     api_key_id: &str,
     project_id: &str,
     account_id: &str,
-    allowed_models: Option<Vec<String>>,
     azp: Option<&str>,
 ) -> HashMap<String, Value> {
     let mut extra = HashMap::new();
@@ -513,12 +512,6 @@ pub(crate) fn access_token_extra(
         extra.insert(
             "preferred_username".to_string(),
             Value::String(preferred_username.to_string()),
-        );
-    }
-    if let Some(models) = allowed_models {
-        extra.insert(
-            "allowed_models".to_string(),
-            Value::Array(models.into_iter().map(Value::String).collect()),
         );
     }
     extra
@@ -673,7 +666,7 @@ impl ApiKeyJwtSigner {
     /// Signing itself goes through `authkestra_engine::token::TokenManager::issue_user_token_with_extra`
     /// (ADR-0011, Decision 2) rather than hand-rolled `jsonwebtoken::encode`. Every claim this
     /// service minted before (`typ`, `azp`, `lightbridge_caller_kind`, `sid`, `api_key_id`,
-    /// `project_id`, `account_id`, `email`, `email_verified`, `allowed_models`, and -- since the
+    /// `project_id`, `account_id`, `email`, `email_verified`, and -- since the
     /// authkestra 0.5.0 bump (PR #215) -- `jti` too) is preserved byte-for-byte via `extra`, with
     /// the same `skip_serializing_if`-style omission (simply not inserting the key when the value
     /// is absent). `TokenManager` itself unconditionally adds one claim this signer never emitted
@@ -695,7 +688,6 @@ impl ApiKeyJwtSigner {
         api_key_id: &str,
         project_id: &str,
         account_id: &str,
-        allowed_models: Option<Vec<String>>,
         now: DateTime<Utc>,
         requested_expires_at: Option<DateTime<Utc>>,
     ) -> Result<SignedApiKey> {
@@ -719,7 +711,6 @@ impl ApiKeyJwtSigner {
             api_key_id,
             project_id,
             account_id,
-            allowed_models,
             self.audience.as_deref(),
         );
 

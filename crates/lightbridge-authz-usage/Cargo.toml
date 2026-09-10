@@ -62,3 +62,18 @@ required-features = ["it-tests"]
 name = "scope_ownership_it_tests"
 path = "tests/scope_ownership_it_tests.rs"
 required-features = ["it-tests"]
+
+[[test]]
+name = "seed_it_tests"
+path = "tests/seed_it_tests.rs"
+required-features = ["it-tests"]
+
+[[test]]
+name = "day_seat_grain_it_tests"
+path = "tests/day_seat_grain_it_tests.rs"
+required-features = ["it-tests"]
+
+[[test]]
+name = "execution_grain_it_tests"
+path = "tests/execution_grain_it_tests.rs"
+required-features = ["it-tests"]

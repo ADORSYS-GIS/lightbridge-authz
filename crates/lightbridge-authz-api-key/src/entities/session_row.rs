@@ -13,9 +13,15 @@ pub struct SessionRow {
     pub id: String,
     pub account_id: String,
     pub project_id: String,
-    /// `NULL` for a `kind = 'browser'` row (ADR-0021 Decision 3) -- always set for `kind =
-    /// 'token'` (ADR-0020's original scope), enforced by the `sessions_kind_client_id_check` DB
-    /// constraint.
+    /// The OAuth client this session belongs to -- the `azp` `/admin/sessions` lists.
+    ///
+    /// Always set for `kind = 'token'` (ADR-0020's original scope), and enforced as such by the
+    /// `sessions_kind_client_id_check` DB constraint. For `kind = 'browser'` it is the client
+    /// whose `/authorize` request STARTED the login (provenance, not scope -- ADR-0021 Decision
+    /// 3's "a browser session is not scoped to any one client" still holds; nothing gates session
+    /// reuse or logout on this value). `None` on a browser row minted before
+    /// `migrations/20260903000001_sessions_browser_client_id.sql`, which no backfill can recover:
+    /// the authorization code that carried the client id is single-use and long consumed.
     pub client_id: Option<String>,
     /// `"token"` (ADR-0020) or `"browser"` (ADR-0021 Decision 3) -- plain `String`, this schema's
     /// established convention for closed-set values.
@@ -49,6 +55,9 @@ pub struct NewSession {
     pub id: String,
     pub account_id: String,
     pub project_id: String,
+    /// See [`SessionRow::client_id`]. `Some` for every path that mints a session today -- the
+    /// token-exchange and device grants pass the redeeming client, and the browser-SSO callback
+    /// passes the client that started the login (`BrowserLoginTarget::client_id`).
     pub client_id: Option<String>,
     pub kind: String,
     pub expires_at: DateTime<Utc>,
@@ -78,4 +87,37 @@ pub struct BrowserSessionContextRow {
     /// must treat `None` as unusable and fail closed (see `authorize.rs`), never fall back to
     /// `account_id` -- that fallback is exactly the identity-substitution bug this column fixes.
     pub subject: Option<String>,
+}
+
+/// The two facts a listed session needs that its own row cannot answer, keyed by session id
+/// (`StoreRepo::session_listing_facts`, #649).
+///
+/// Read in ONE batch query over the ids a page already returned, rather than per row: the page is
+/// capped at 100, and an N+1 here would be 100 round trips to render one table.
+#[derive(Debug, Clone, FromRow, PartialEq, Eq)]
+pub struct SessionFactsRow {
+    pub session_id: String,
+    /// `accounts.user_id` for the account named by `sessions.subject` -- the PERSON, not the
+    /// account (ADR-0026: one identity may own many accounts). `None` when `subject` is `None`, or
+    /// when it names no `accounts` row; both are "unknown", and the caller renders its own
+    /// sentinel rather than being handed a fabricated one (#647's contract, kept here).
+    pub subject_user_id: Option<String>,
+    /// Whether this session's refresh chain carries the `offline_access` scope -- the
+    /// owner-confirmed definition of an "offline" (CLI/device) session, as opposed to a browser
+    /// one. Never `NULL`: a session with no chain at all is `false`.
+    pub offline: bool,
+}
+
+/// The narrow slice `revokeSession` needs BEFORE it decides whether the caller may act
+/// (`StoreRepo::find_session_owner`, #649): who the session belongs to, and whether it is already
+/// revoked. Deliberately not the whole [`SessionRow`] -- the ownership decision reads two columns,
+/// and a caller who turns out not to own the session must never have had the rest in hand.
+#[derive(Debug, Clone, FromRow, PartialEq, Eq)]
+pub struct SessionOwnerRow {
+    /// See [`SessionRow::subject`]. `None` for a session minted before the subject column existed;
+    /// such a row is owned by nobody, so only a `session:revoke` holder can act on it.
+    pub subject: Option<String>,
+    /// The STORED status (`"active"` / `"revoked"`), not the computed one -- expiry is irrelevant
+    /// to whether a revoke is allowed, only to whether it changes anything.
+    pub status: String,
 }

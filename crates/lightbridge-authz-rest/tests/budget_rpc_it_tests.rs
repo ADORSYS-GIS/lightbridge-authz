@@ -99,11 +99,6 @@ struct Ctx {
     verify: sqlx::PgPool,
 }
 
-// Mirrors `rpc_it_tests.rs`'s identical guard: `SqlxIdempotencyStore::ensure_schema()` races under
-// `cargo test`'s default parallelism when every test in this binary calls it from `setup()`
-// against the same fresh database.
-static IDEMPOTENCY_SCHEMA_READY: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
-
 /// Build the full `build_budget_router` for `bearer`, connecting the cratestack CRUD client,
 /// Postgres-backed idempotency store, and Redis rate-limit store to the live backends -- the same
 /// shape `rpc_it_tests.rs::setup` builds for `build_api_router`, pointed at the budget-only router
@@ -121,15 +116,8 @@ async fn setup(
     let cpool = cratestack_pool().await;
     let cdb = schema::Cratestack::builder(cpool.clone()).build();
     let issuer = Arc::new(AuthzStoreImpl::with_pool(core.clone()).with_billing(billing()));
+    // Migration-owned since #684, same as `rpc_it_tests.rs::setup` -- nothing to bootstrap here.
     let idempotency = Arc::new(SqlxIdempotencyStore::new(cpool.clone()));
-    IDEMPOTENCY_SCHEMA_READY
-        .get_or_init(|| async {
-            idempotency
-                .ensure_schema()
-                .await
-                .expect("ensure idempotency schema");
-        })
-        .await;
     // Own namespace per `setup()` call, same reasoning as `rpc_it_tests.rs::setup`'s identical
     // comment: every test authenticates with a fixed literal bearer token, so a shared prefix
     // would put every concurrently-running test's calls into the same token bucket.
@@ -172,11 +160,19 @@ async fn setup(
         budget_repo.clone(),
         augmentation_repo.clone(),
         policy_engine,
-        spend_reader,
+        spend_reader.clone(),
     ));
     let review_service = Arc::new(lightbridge_authz_budget::ReviewService::new(
         budget_repo.clone(),
         augmentation_repo,
+    ));
+    // ADR-0032: the same scheduler the RPC schedule procedures reach, over this test's live pool
+    // and the same spend reader the refill path uses. The interval task is NOT started here -- it
+    // is spawned only by `start_budget_server` -- so nothing fires in the background during a test.
+    let reset_scheduler = Arc::new(lightbridge_authz_budget::ResetScheduler::new(
+        core.clone(),
+        budget_repo.clone(),
+        spend_reader,
     ));
 
     let router = lightbridge_authz_rest::build_budget_router(
@@ -185,6 +181,10 @@ async fn setup(
         refill_service,
         review_service,
         budget_repo,
+        reset_scheduler,
+        std::sync::Arc::new(lightbridge_authz_core::platform_role::known_platform_roles(
+            &lightbridge_authz_core::authz::Rbac::default(),
+        )),
         cdb,
         core.clone(),
         bearer,

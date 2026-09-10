@@ -79,10 +79,6 @@ fn billing() -> Billing {
 /// a small per-test cap keeps a fully parallel run under Postgres's `max_connections`.
 const TEST_POOL_MAX_CONNECTIONS: u32 = 2;
 
-/// See `rpc_it_tests.rs`: `SqlxIdempotencyStore::ensure_schema()`'s DDL is not concurrency-safe,
-/// and is process-wide idempotent, so it runs once per test binary.
-static IDEMPOTENCY_SCHEMA_READY: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
-
 /// The fully assembled `build_api_router` against live Postgres + Redis, plus the raw pool the
 /// ownership-column assertions read through (the `userId` invariant is a database fact, and a
 /// test that only ever asked the API about it could be satisfied by an API that lies).
@@ -107,15 +103,11 @@ async fn setup(bearer: Arc<dyn BearerTokenServiceTrait>) -> Ctx {
     let cdb = schema::Cratestack::builder(cpool.clone()).build();
 
     let issuer = Arc::new(AuthzStoreImpl::with_pool(core.clone()).with_billing(billing()));
+    // Migration-owned since #684. This file is why that migration exists: the `cratestack_audit`
+    // half of the same race made every `Project.create` here a coin flip, and unlike the
+    // idempotency half no test could guard it, because cratestack issues that DDL itself on the
+    // first audited write of each `SqlxRuntime` -- and each test builds its own.
     let idempotency = Arc::new(SqlxIdempotencyStore::new(cpool));
-    IDEMPOTENCY_SCHEMA_READY
-        .get_or_init(|| async {
-            idempotency
-                .ensure_schema()
-                .await
-                .expect("ensure idempotency schema");
-        })
-        .await;
 
     let rate_limit: Arc<dyn RateLimitStore> = build_redis_rate_limit_store(
         &redis_url(),
@@ -150,6 +142,15 @@ async fn setup(bearer: Arc<dyn BearerTokenServiceTrait>) -> Ctx {
         augmentation_repo,
     ));
 
+    // ADR-0032: `Procedures`/`build_*_router` take the reset scheduler unconditionally (see
+    // `Procedures`'s own field doc). The interval task is spawned only by `start_budget_server`,
+    // so this is an inert handle over the same pool.
+    let reset_scheduler = Arc::new(lightbridge_authz_budget::ResetScheduler::new(
+        core.clone(),
+        budget_repo.clone(),
+        Arc::new(lightbridge_authz_budget::UnavailableSpendReader),
+    ));
+
     let router = lightbridge_authz_rest::build_api_router(
         bearer,
         common::test_resolver(),
@@ -158,6 +159,10 @@ async fn setup(bearer: Arc<dyn BearerTokenServiceTrait>) -> Ctx {
         refill_service,
         review_service,
         budget_repo,
+        reset_scheduler,
+        std::sync::Arc::new(lightbridge_authz_core::platform_role::known_platform_roles(
+            &lightbridge_authz_core::authz::Rbac::default(),
+        )),
         cdb,
         core,
         idempotency,

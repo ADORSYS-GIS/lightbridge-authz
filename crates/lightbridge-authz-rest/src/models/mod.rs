@@ -74,6 +74,33 @@ pub struct IntrospectResponse {
     /// Expiry as a Unix timestamp, when the key has one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exp: Option<i64>,
+    /// ADR-0034 §15: this account's live ledger balance for the current period, `ceiling − spend`
+    /// in signed, unclamped micro-USD, read from `budget_remaining_snapshots`.
+    ///
+    /// **Absent means UNKNOWN, and the gateway must read it as such.** There is no snapshot yet,
+    /// or the stored one describes a period that has since rolled over, or the read failed. The
+    /// AuthConfig publishes `known: false` for an absent value and the Lua refuses with `503
+    /// budget_unavailable` — never `402 budget_exhausted`, which would bill a user for our own
+    /// latency. Serialising a `0` here instead of omitting the field would be exactly that bug.
+    ///
+    /// Carrying it on THIS response is what makes the gateway's budget check cost zero extra
+    /// calls: it rides on an introspection Authorino already makes, and it costs `authz-opa` one
+    /// primary-key probe on a connection it already holds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget_remaining_micros: Option<i64>,
+    /// When this account's budget next changes on its own — the winning ADR-0032 reset schedule's
+    /// `next_run_at`, else midnight UTC on the 1st of the next month. Present exactly when
+    /// `budget_remaining_micros` is; it is what the `402` body tells the user to wait for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget_next_reset_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// How old `budget_remaining_micros` is, in seconds.
+    ///
+    /// Reported rather than hidden: the single-call design trades freshness for a per-request cost
+    /// of one indexed read, and a consumer acting on the number is entitled to see the window it
+    /// is acting inside. It is a LOWER bound on staleness — the OTLP ingest lag sits on top of it
+    /// and nothing in this process can measure that.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget_snapshot_age_seconds: Option<u64>,
 }
 
 impl IntrospectResponse {
@@ -95,6 +122,9 @@ impl IntrospectResponse {
             role: None,
             quota_tier: None,
             exp: None,
+            budget_remaining_micros: None,
+            budget_next_reset_at: None,
+            budget_snapshot_age_seconds: None,
         }
     }
 }

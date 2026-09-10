@@ -668,7 +668,16 @@ def section_browser_flow() -> tuple["CookieJar", str, str, str]:
     # RBAC-gated procedure, with nothing in the token explaining why.
     assert claims.get("budget_tier"), f"browser token missing budget_tier (ADR-0014): {claims}"
     assert claims.get("sid"), f"browser login did not persist a revocable session: {claims}"
-    assert claims.get("model_policy"), f"browser token missing model_policy: {claims}"
+    # #430 (PR #454): `model_policy`/`allowed_models`/`quota_tier` are NO LONGER minted on any
+    # plane -- `authz-opa` introspection is their single live source since #429 taught
+    # `resolve_exchange_token_context` to resolve them for a native RFC 8693 session too. This
+    # assertion used to demand `model_policy` be present; it now pins the opposite, end-to-end,
+    # against a real browser grant. `budget_tier` above is the one deliberate survivor
+    # (ADR-0014, reaffirmed by ADR-0034 §12).
+    for removed in ("model_policy", "allowed_models", "quota_tier"):
+        assert removed not in claims, (
+            f"browser token must not carry {removed} -- #430 moved it to introspection: {claims}"
+        )
     # RFC 8693 §2.2.1 requires `issued_token_type` on a token-exchange response and ONLY there.
     assert "issued_token_type" not in token_body, (
         f"issued_token_type belongs to the token-exchange response only: {token_body}"

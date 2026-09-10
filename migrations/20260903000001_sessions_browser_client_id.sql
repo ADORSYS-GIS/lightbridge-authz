@@ -1,0 +1,61 @@
+-- Follow-up to #649/#657: a browser session now records the OAuth client that ESTABLISHED it.
+--
+-- Symptom (owner, 2026-09-03, on the live `/admin/sessions` screen): "doesn't expose azp". The
+-- console's Client column is bound to `SessionRow.clientId` and renders correctly -- the column
+-- was empty because every `kind = 'browser'` row genuinely stores `client_id = NULL`, and the
+-- `sessions_kind_client_id_check` constraint added by `20260823000002_sessions.sql` made any
+-- other value impossible. So the estate-wide session list could name the client behind a CLI or
+-- token grant but never the app behind a browser login, which is the majority of the rows an
+-- operator actually looks at.
+--
+-- WHY THE ORIGINAL `NULL` WAS RIGHT, AND WHY IT IS NO LONGER THE WHOLE STORY
+--
+-- ADR-0021 Decision 3 set `client_id` to `NULL` for a browser row with a real reason: "a browser
+-- session is not scoped to any one client; that is the entire point of SSO". That reasoning is
+-- about SCOPE, and it still holds exactly as written -- one `kind = 'browser'` row is still
+-- reused by every subsequent `/authorize` hit regardless of which client made it
+-- (`authorize.rs`'s session-reuse branch reads `BrowserSessionContextRow`, which does not and
+-- will not carry `client_id`). What this migration adds is PROVENANCE, a different fact: which
+-- client's `/authorize` request sent this browser to Keycloak in the first place. That is a
+-- property of the login event, it never changes, and it is precisely what an operator reading a
+-- session list wants in order to tell "signed into the console" apart from "signed into the
+-- docs portal".
+--
+-- Nothing reads `sessions.client_id` for a browser row as an authorization input, before or
+-- after this change:
+--   * `revoke_for_logout` (`session_revocation.rs`) matches
+--     `kind = 'browser' OR ($2 IS NOT NULL AND client_id = $2)`. A browser row already matched
+--     unconditionally on the left disjunct, so giving it a `client_id` cannot change which rows
+--     that statement revokes.
+--   * `find_active_browser_session` selects `account_id, project_id, subject` only.
+--   * `querySessions`' `clientId` filter is a read-side filter on a column the console displays.
+-- The column is therefore descriptive here, never a scope.
+--
+-- WHAT CHANGES
+--
+-- The constraint is relaxed from "browser => NULL" to "token => NOT NULL": a token session must
+-- still name its client (that has always been true and remains an invariant), and a browser
+-- session MAY name one. `NULL` on a browser row stays legal, deliberately -- it is the honest
+-- value for every row minted before this migration, and it stays reachable for any future
+-- browser-login path that genuinely has no initiating client.
+--
+-- NO BACKFILL IS POSSIBLE. The initiating `client_id` of an already-completed browser login is
+-- not recorded anywhere: the authorization code that carried it is single-use and consumed
+-- (`authorization_codes`, ADR-0019), and `exchange_refresh_tokens` chains hang off the
+-- `kind = 'token'` sessions minted at redemption, not off the browser row that preceded them --
+-- there is no join that recovers "which client sent this browser to Keycloak" after the fact.
+-- Guessing one from a downstream token session would be a fabrication, and the console already
+-- renders an absent `clientId` as an explicit "None recorded" sentinel rather than a blank. Old
+-- rows stay `NULL`, and they expire on their own within the browser session TTL
+-- (`oauth2.relying_party.browser_session_ttl_seconds`, hours, not days), so the gap is
+-- self-clearing.
+--
+-- Additive and constraint-only: no column, no data change, no lock beyond the brief ACCESS
+-- EXCLUSIVE the two `ALTER TABLE`s take. `ADD CONSTRAINT ... CHECK` re-validates existing rows,
+-- which is safe by construction -- every row that satisfied the old constraint satisfies the new
+-- one (the new predicate is strictly weaker).
+ALTER TABLE sessions DROP CONSTRAINT sessions_kind_client_id_check;
+
+ALTER TABLE sessions ADD CONSTRAINT sessions_kind_client_id_check CHECK (
+    kind <> 'token' OR client_id IS NOT NULL
+);

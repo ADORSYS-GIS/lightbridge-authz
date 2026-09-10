@@ -40,6 +40,7 @@ use cratestack::SqlxIdempotencyStore;
 use cratestack::ratelimit::RateLimitStore;
 use lightbridge_authz_api::schema;
 use lightbridge_authz_bearer::BearerTokenServiceTrait;
+use lightbridge_authz_core::authz::{Permission, PermissionSet};
 use lightbridge_authz_core::config::{Billing, ModelCatalog};
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 use lightbridge_authz_rest::handlers::AuthzStoreImpl;
@@ -112,11 +113,14 @@ fn lazy_refill_and_review_services(
     Arc<lightbridge_authz_budget::RefillService>,
     Arc<lightbridge_authz_budget::ReviewService>,
     Arc<lightbridge_authz_budget::repo::BudgetRepo>,
+    Arc<lightbridge_authz_budget::ResetScheduler>,
 ) {
     let budget_repo = Arc::new(lightbridge_authz_budget::repo::BudgetRepo::new(
         core.clone(),
     ));
-    let augmentation_repo = Arc::new(lightbridge_authz_budget::AugmentationRepo::new(core));
+    let augmentation_repo = Arc::new(lightbridge_authz_budget::AugmentationRepo::new(
+        core.clone(),
+    ));
     let refill_service = Arc::new(lightbridge_authz_budget::RefillService::new(
         budget_repo.clone(),
         augmentation_repo.clone(),
@@ -127,7 +131,15 @@ fn lazy_refill_and_review_services(
         budget_repo.clone(),
         augmentation_repo,
     ));
-    (refill_service, review_service, budget_repo)
+    // ADR-0032: `build_api_router` takes the reset scheduler unconditionally (see `Procedures`'s
+    // own field doc). Inert here -- the interval task is spawned only by `start_budget_server`,
+    // and `RpcScope::Crud` refuses every schedule op-id on this router anyway.
+    let reset_scheduler = Arc::new(lightbridge_authz_budget::ResetScheduler::new(
+        core,
+        budget_repo.clone(),
+        Arc::new(lightbridge_authz_budget::UnavailableSpendReader),
+    ));
+    (refill_service, review_service, budget_repo, reset_scheduler)
 }
 
 /// Assemble the full API router with a caller-supplied bearer, everything else lazily wired to
@@ -138,7 +150,7 @@ fn build_router(bearer: Arc<dyn BearerTokenServiceTrait>, dev_cors: bool) -> Rou
     let core = lazy_core_pool();
     let issuer = Arc::new(AuthzStoreImpl::with_pool(core.clone()));
     let policy_store = lazy_policy_store(core.clone());
-    let (refill_service, review_service, budget_repo) =
+    let (refill_service, review_service, budget_repo, reset_scheduler) =
         lazy_refill_and_review_services(core.clone(), &policy_store);
     lightbridge_authz_rest::build_api_router(
         bearer,
@@ -148,6 +160,10 @@ fn build_router(bearer: Arc<dyn BearerTokenServiceTrait>, dev_cors: bool) -> Rou
         refill_service,
         review_service,
         budget_repo,
+        reset_scheduler,
+        std::sync::Arc::new(lightbridge_authz_core::platform_role::known_platform_roles(
+            &lightbridge_authz_core::authz::Rbac::default(),
+        )),
         lazy_cratestack_db(),
         core,
         lazy_idempotency(),
@@ -166,7 +182,7 @@ fn build_router_with_billing(bearer: Arc<dyn BearerTokenServiceTrait>, billing: 
     let core = lazy_core_pool();
     let issuer = Arc::new(AuthzStoreImpl::with_pool(core.clone()).with_billing(billing));
     let policy_store = lazy_policy_store(core.clone());
-    let (refill_service, review_service, budget_repo) =
+    let (refill_service, review_service, budget_repo, reset_scheduler) =
         lazy_refill_and_review_services(core.clone(), &policy_store);
     lightbridge_authz_rest::build_api_router(
         bearer,
@@ -176,6 +192,10 @@ fn build_router_with_billing(bearer: Arc<dyn BearerTokenServiceTrait>, billing: 
         refill_service,
         review_service,
         budget_repo,
+        reset_scheduler,
+        std::sync::Arc::new(lightbridge_authz_core::platform_role::known_platform_roles(
+            &lightbridge_authz_core::authz::Rbac::default(),
+        )),
         lazy_cratestack_db(),
         core,
         lazy_idempotency(),
@@ -194,7 +214,7 @@ fn build_router_with_models(
     let core = lazy_core_pool();
     let issuer = Arc::new(AuthzStoreImpl::with_pool(core.clone()).with_model_catalog(models));
     let policy_store = lazy_policy_store(core.clone());
-    let (refill_service, review_service, budget_repo) =
+    let (refill_service, review_service, budget_repo, reset_scheduler) =
         lazy_refill_and_review_services(core.clone(), &policy_store);
     lightbridge_authz_rest::build_api_router(
         bearer,
@@ -204,6 +224,10 @@ fn build_router_with_models(
         refill_service,
         review_service,
         budget_repo,
+        reset_scheduler,
+        std::sync::Arc::new(lightbridge_authz_core::platform_role::known_platform_roles(
+            &lightbridge_authz_core::authz::Rbac::default(),
+        )),
         lazy_cratestack_db(),
         core,
         lazy_idempotency(),
@@ -222,7 +246,7 @@ fn build_router_at(
     let core = lazy_core_pool();
     let issuer = Arc::new(AuthzStoreImpl::with_pool(core.clone()));
     let policy_store = lazy_policy_store(core.clone());
-    let (refill_service, review_service, budget_repo) =
+    let (refill_service, review_service, budget_repo, reset_scheduler) =
         lazy_refill_and_review_services(core.clone(), &policy_store);
     lightbridge_authz_rest::build_api_router(
         bearer,
@@ -232,6 +256,10 @@ fn build_router_at(
         refill_service,
         review_service,
         budget_repo,
+        reset_scheduler,
+        std::sync::Arc::new(lightbridge_authz_core::platform_role::known_platform_roles(
+            &lightbridge_authz_core::authz::Rbac::default(),
+        )),
         lazy_cratestack_db(),
         core,
         lazy_idempotency(),
@@ -239,6 +267,125 @@ fn build_router_at(
         false,
         rpc_base_path,
     )
+}
+
+/// A [`RateLimitStore`] that always fails with the caller-supplied error -- the injectable half of
+/// the fail-closed guard below. Deterministic and network-free, unlike [`DEAD_REDIS`]: whether a
+/// literal `redis://127.0.0.1:6379` is actually dead depends on the developer's machine, and a
+/// security property must not be asserted through a premise that a stray local Redis can falsify.
+struct AlwaysFailingRateLimitStore {
+    error: fn() -> cratestack::CratestackError,
+}
+
+#[lightbridge_authz_core::async_trait]
+impl RateLimitStore for AlwaysFailingRateLimitStore {
+    async fn consume(
+        &self,
+        _key: &str,
+        _config: cratestack::ratelimit::RateLimitConfig,
+    ) -> Result<cratestack::ratelimit::RateLimitDecision, cratestack::CratestackError> {
+        Err((self.error)())
+    }
+}
+
+/// Like [`build_router`], but with a caller-supplied rate-limit store -- for the store-failure
+/// policy guard. Everything else stays lazily wired to unreachable backends, so any request that
+/// gets *past* the rate-limit layer necessarily fails afterwards with something that is NOT the
+/// store's own status; the assertions below key on that distinction.
+fn build_router_with_rate_limit_store(
+    bearer: Arc<dyn BearerTokenServiceTrait>,
+    rate_limit_store: Arc<dyn RateLimitStore>,
+) -> Router {
+    let core = lazy_core_pool();
+    let issuer = Arc::new(AuthzStoreImpl::with_pool(core.clone()));
+    let policy_store = lazy_policy_store(core.clone());
+    let (refill_service, review_service, budget_repo, reset_scheduler) =
+        lazy_refill_and_review_services(core.clone(), &policy_store);
+    lightbridge_authz_rest::build_api_router(
+        bearer,
+        common::test_resolver(),
+        issuer,
+        policy_store,
+        refill_service,
+        review_service,
+        budget_repo,
+        reset_scheduler,
+        std::sync::Arc::new(lightbridge_authz_core::platform_role::known_platform_roles(
+            &lightbridge_authz_core::authz::Rbac::default(),
+        )),
+        lazy_cratestack_db(),
+        core,
+        lazy_idempotency(),
+        rate_limit_store,
+        false,
+        None,
+    )
+}
+
+/// **The fail-closed guard for cratestack 0.11.0's flipped rate-limit default.**
+///
+/// cratestack/cratestack#869 (closing cratestack#846) changed `RateLimitLayer`'s behaviour on a
+/// *store* failure from "always a 500" to `StoreErrorPolicy::Allow` -- serve the request
+/// **unthrottled** whenever the failure is transport-class (`CratestackError::Unavailable`: the
+/// socket broke, Redis is unreachable, or the new 500ms store-timeout budget elapsed). Upstream's
+/// reasoning is a capacity-control one and is sound for a capacity limiter.
+///
+/// It is the wrong default *here*. This service's limiter is the brute-force guard in front of the
+/// OAuth/OIDC and CRUD surfaces, so `lightbridge-authz-rest` pins
+/// `RATE_LIMIT_STORE_ERROR_POLICY = StoreErrorPolicy::Deny` on every `RateLimitLayer` it builds
+/// (see its doc comment in `lib.rs`, and the identical hand-written decision at
+/// `oauth2_op::device_store::get_by_user_code_rate_limited`). This test is what keeps that opt-out
+/// from being silently dropped by a future bump: it injects a store that fails **transport-class**
+/// -- precisely the class upstream's default serves through -- and asserts the request is refused
+/// with the store's own `503`, never dispatched.
+#[tokio::test]
+async fn a_transport_class_rate_limit_store_failure_is_refused_not_served_unthrottled() {
+    let store = Arc::new(AlwaysFailingRateLimitStore {
+        error: || cratestack::CratestackError::Unavailable("simulated redis outage".to_owned()),
+    });
+    let router = build_router_with_rate_limit_store(admin_bearer(), store);
+    let (status, _) = rpc_call(
+        router,
+        "model.Account.list",
+        Wire::Cbor,
+        &json!({}),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "an unreachable rate-limit store must REFUSE (503, the store's own status), not serve the \
+         request through unthrottled -- cratestack 0.11.0's StoreErrorPolicy::Allow default is \
+         opted out of in lib.rs. A 200/500 here means the Deny opt-out was dropped and the \
+         limiter silently stopped limiting during a Redis outage."
+    );
+}
+
+/// The other half of the classification: a store that is *reachable and refusing* stays closed
+/// under every policy upstream ships, so this one would pass even without the `Deny` opt-out. It is
+/// here so a future reader can see both classes asserted side by side and not mistake the test
+/// above for a blanket "all store errors 503" claim -- the two differ only in which upstream
+/// default they survive.
+#[tokio::test]
+async fn a_logical_rate_limit_store_failure_is_refused_too() {
+    let store = Arc::new(AlwaysFailingRateLimitStore {
+        error: || cratestack::CratestackError::Internal("simulated redis OOM".to_owned()),
+    });
+    let router = build_router_with_rate_limit_store(admin_bearer(), store);
+    let (status, _) = rpc_call(
+        router,
+        "model.Account.list",
+        Wire::Cbor,
+        &json!({}),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a reachable-but-refusing rate-limit store must never open the gate"
+    );
 }
 
 /// A single-identity admin bearer, token string `"admin"`.
@@ -269,6 +416,69 @@ async fn health_probes_report_ok() {
         let router = build_router(admin_bearer(), false);
         assert_eq!(get(router, uri).await, StatusCode::OK, "probe {uri}");
     }
+}
+
+/// `GET /version` (#573) answers unauthenticated, names THIS listener, and carries every field the
+/// console's `/settings/info` screen renders.
+///
+/// Unauthenticated is the assertion that matters: this router is built with a bearer service, and
+/// the request below carries no token at all. `/version` sitting beside `/healthz` rather than
+/// behind the RBAC gate is a deliberate decision (see `probe_router`), so it needs a test that
+/// fails if someone later "tightens" it.
+#[tokio::test]
+async fn version_endpoint_is_unauthenticated_and_reports_the_api_service() {
+    let router = build_router(admin_bearer(), false);
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/version")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let info: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(
+        info["service"].as_str(),
+        Some("authz-api"),
+        "the api router must name itself, not the binary: {info}"
+    );
+    // Every compile-time field is present and non-empty. `build.rs` guarantees a value for each --
+    // the literal string "unknown" when neither git nor the environment could answer -- so an empty
+    // string here means the stamp did not make it into the binary at all.
+    for field in [
+        "version",
+        "gitSha",
+        "gitShortSha",
+        "gitCommitDate",
+        "rustcVersion",
+        "buildTime",
+    ] {
+        let value = info[field].as_str();
+        assert!(
+            value.is_some_and(|v| !v.is_empty()),
+            "`{field}` must be a non-empty string: {info}"
+        );
+    }
+    assert!(info["gitDirty"].is_boolean(), "gitDirty is a bool: {info}");
+    // The image fields are null OUTSIDE a container -- `cargo test` is exactly that case. Null, not
+    // an empty string and not a fabricated value: the console renders "unknown" from the absence.
+    for field in ["imageBuildSha", "imageTag", "imageBuildTime"] {
+        assert!(
+            info[field].is_null() || info[field].is_string(),
+            "`{field}` is nullable, never anything else: {info}"
+        );
+    }
+    assert_eq!(
+        info["gitShortSha"].as_str().unwrap().len().min(7),
+        info["gitShortSha"].as_str().unwrap().len(),
+        "the short sha is at most 7 characters: {info}"
+    );
 }
 
 #[tokio::test]
@@ -437,6 +647,232 @@ async fn rbac_gate_denies_viewer_on_every_mutating_op() {
     }
 }
 
+/// #647's negative half: the two estate-wide identity-resolution op-ids are refused for a caller
+/// holding EVERY other permission but not `user:read`. Stated as "admin minus one" rather than
+/// "viewer" deliberately — the interesting failure would be `user:read` being implied by some
+/// broader grant (`account:read`, say), and a viewer token could not tell that apart from an
+/// ordinary read-only denial. The gate runs before dispatch, so this needs no DB: nothing is
+/// returned, not even an empty result set.
+///
+/// `resolveActorLabels` is deliberately NOT in this list any more — see
+/// `resolve_actor_labels_passes_the_gate_for_anyone_and_refuses_admin_kinds_in_the_handler` below.
+#[tokio::test]
+async fn rbac_gate_denies_identity_resolution_without_user_read() {
+    let almost_admin: PermissionSet = Permission::ALL
+        .into_iter()
+        .filter(|p| *p != Permission::UserRead)
+        .collect();
+    for op in ["procedure.resolveUserProfiles", "procedure.searchUsers"] {
+        let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(
+            MapBearer::new().with("almost", token_info("almost-subject", almost_admin.clone())),
+        );
+        let router = build_router(bearer, false);
+        let (status, _) = rpc_call(router, op, Wire::Cbor, &json!({}), Some("almost")).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "`{op}` must require user:read, and no other permission may stand in for it"
+        );
+    }
+}
+
+/// `resolveActorLabels` moved from `user:read` to `AUTHENTICATED_ONLY_OP_IDS` (owner feedback
+/// 2026-09-03) so that an ordinary member's "Spend by API key" panel can name its rows. This pins
+/// the two halves of that move at the transport, without a database:
+///
+///  1. the coarse gate no longer refuses a caller who holds NOTHING — the `403` a permission-mapped
+///     op-id produces before dispatch is gone;
+///  2. the `user:read` requirement did not evaporate with it: a call that asks for the three
+///     estate-wide kinds is still refused, now by the handler, with a `403` that names the reason.
+///
+/// The positive half — an `apiKeyIds`-only call actually returning names, row-scoped — needs real
+/// rows and lives in `rpc_it_tests.rs`.
+#[tokio::test]
+async fn resolve_actor_labels_passes_the_gate_for_anyone_and_refuses_admin_kinds_in_the_handler() {
+    let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(
+        MapBearer::new().with("nobody", token_info("nobody-subject", PermissionSet::new())),
+    );
+    let router = build_router(bearer, false);
+
+    let (status, body) = rpc_call(
+        router.clone(),
+        "procedure.resolveActorLabels",
+        Wire::Cbor,
+        &json!({ "args": {
+            "userIds": ["some-user"],
+            "accountIds": [],
+            "projectIds": [],
+            "apiKeyIds": [],
+        } }),
+        Some("nobody"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "asking for the estate-wide kinds without user:read must still be refused: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let (status, _) = rpc_call(
+        router,
+        "procedure.resolveActorLabels",
+        Wire::Cbor,
+        &json!({ "args": {} }),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "`authenticated only` still means authenticated"
+    );
+}
+
+/// ADR-0033's negative half: the three `platform_role_grants` op-ids are refused for a caller
+/// holding EVERY other permission but not `rbac:manage`. Stated as "admin minus one" rather than
+/// "viewer" deliberately — the interesting failure would be `rbac:manage` being implied by some
+/// broader grant (`user:read`, `account:update`), and a viewer token could not tell that apart from
+/// an ordinary read-only denial. This is the single most important refusal in the schema: a caller
+/// who can write this table can make themselves `lightbridge-admin`.
+#[tokio::test]
+async fn rbac_gate_denies_platform_role_management_without_rbac_manage() {
+    let almost_admin: PermissionSet = Permission::ALL
+        .into_iter()
+        .filter(|p| *p != Permission::RbacManage)
+        .collect();
+    for op in [
+        "procedure.listPlatformRoleGrants",
+        "procedure.grantPlatformRole",
+        "procedure.revokePlatformRole",
+    ] {
+        let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(
+            MapBearer::new().with("almost", token_info("almost-subject", almost_admin.clone())),
+        );
+        let router = build_router(bearer, false);
+        let (status, _) = rpc_call(router, op, Wire::Cbor, &json!({}), Some("almost")).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "`{op}` must require rbac:manage, and no other permission may stand in for it"
+        );
+    }
+}
+
+/// #649's gate half: each new session op-id requires ITS OWN permission and no other, proved
+/// "admin minus one" so a broader grant standing in for it would show up as a pass here. Both are
+/// mapped to the SELF-SERVICE permission on purpose — that is the floor to call them at all; the
+/// widening to someone else's sessions is a per-row decision (the `Session` model's read policy
+/// for `querySessions`, an explicit check in `session_directory::revoke_session` for the revoke),
+/// which needs a database and lives in `rpc_it_tests.rs`.
+#[tokio::test]
+async fn rbac_gate_denies_session_ops_without_their_own_permission() {
+    for (op, required) in [
+        ("procedure.querySessions", Permission::SessionReadOwn),
+        ("procedure.revokeSession", Permission::SessionRevokeOwn),
+    ] {
+        let almost_admin: PermissionSet = Permission::ALL
+            .into_iter()
+            .filter(|p| *p != required)
+            .collect();
+        let bearer: Arc<dyn BearerTokenServiceTrait> =
+            Arc::new(MapBearer::new().with("almost", token_info("almost-subject", almost_admin)));
+        let router = build_router(bearer, false);
+        let (status, _) = rpc_call(router, op, Wire::Cbor, &json!({}), Some("almost")).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "`{op}` must require {}, and no other permission may stand in for it",
+            required.as_str()
+        );
+    }
+}
+
+/// The other side of the same coin: `getMyAccess` is the ONE op-id served to any authenticated
+/// caller, so it must NOT be refused for a caller holding zero permissions at all -- otherwise the
+/// console cannot ask what it may render. It reaches dispatch (which then fails on the lazy pool
+/// this router is built over), so the assertion is "not 401/403", not "200".
+///
+/// Still fail-closed for an UNAUTHENTICATED caller: no bearer is a clean 401, not an anonymous
+/// answer.
+#[tokio::test]
+async fn get_my_access_is_served_to_any_authenticated_caller_but_never_to_none() {
+    let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(
+        MapBearer::new().with("nobody", token_info("nobody-subject", PermissionSet::new())),
+    );
+    let router = build_router(bearer, false);
+    let (status, body) = rpc_call(
+        router.clone(),
+        "procedure.getMyAccess",
+        Wire::Cbor,
+        &json!({ "args": {} }),
+        Some("nobody"),
+    )
+    .await;
+    assert!(
+        status != StatusCode::FORBIDDEN && status != StatusCode::UNAUTHORIZED,
+        "a caller with zero permissions must still be able to ask what they may do; got {status}:          {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let (status, _) = rpc_call(
+        router,
+        "procedure.getMyAccess",
+        Wire::Cbor,
+        &json!({ "args": {} }),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "`authenticated only` still means authenticated"
+    );
+}
+
+/// `getBuildInfo` (#573) is the second member of `AUTHENTICATED_ONLY_OP_IDS`, and behaves exactly
+/// like `getMyAccess` above: a caller holding zero permissions gets past the gate, an
+/// unauthenticated caller does not.
+///
+/// The asymmetry with `GET /version` — same data, no token needed there — is intentional and NOT a
+/// hole: `/version` is the operator/probe surface, this is the console's, and tightening the RPC
+/// transport to "authenticated" costs the console nothing (it is always signed in) while keeping
+/// the RPC surface's uniform "no token, no dispatch" rule intact.
+#[tokio::test]
+async fn get_build_info_is_served_to_any_authenticated_caller_but_never_to_none() {
+    let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(
+        MapBearer::new().with("nobody", token_info("nobody-subject", PermissionSet::new())),
+    );
+    let router = build_router(bearer, false);
+    let (status, body) = rpc_call(
+        router.clone(),
+        "procedure.getBuildInfo",
+        Wire::Cbor,
+        &json!({ "args": {} }),
+        Some("nobody"),
+    )
+    .await;
+    assert!(
+        status != StatusCode::FORBIDDEN && status != StatusCode::UNAUTHORIZED,
+        "a caller with zero permissions must still be able to ask what build they are talking to; got {status}: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let (status, _) = rpc_call(
+        router,
+        "procedure.getBuildInfo",
+        Wire::Cbor,
+        &json!({ "args": {} }),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "`authenticated only` still means authenticated"
+    );
+}
+
 /// Deliberately-unmapped and defense-in-depth op-ids are denied unconditionally, even for an admin
 /// holding every permission (fail closed — the map, not the token, is the gate here).
 #[tokio::test]
@@ -452,6 +888,17 @@ async fn rbac_gate_denies_unmapped_and_locked_ops_even_for_admin() {
         "model.ApiKey.create",
         "model.ProjectMember.list",
         "model.ProjectMember.create",
+        // #649 gave `Session` its first `@@allow("read", ...)` clause. That clause exists for the
+        // hand-written `querySessions` procedure's `db.session()` read to be scoped by; it must
+        // NOT have made the generic model verbs reachable. `model.Session.*` stays absent from
+        // `MAPPED_OP_ID_PERMISSIONS`, so every one of them is still denied unconditionally —
+        // including `update`, which would otherwise be a way to flip a revoked session back to
+        // `active`, and `list`, which would bypass the computed-status/`offline` contract.
+        "model.Session.list",
+        "model.Session.get",
+        "model.Session.create",
+        "model.Session.update",
+        "model.Session.delete",
         "model.Account.frobnicate",
         "procedure.unknown",
         "",

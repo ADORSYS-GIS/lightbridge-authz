@@ -1,0 +1,1 @@
+../../.claude/skills/authz-procedure/SKILL.md

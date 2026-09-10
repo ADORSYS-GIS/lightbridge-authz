@@ -31,6 +31,7 @@
 mod common;
 
 use lightbridge_authz_core::identity::AccountId;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::Router;
@@ -45,7 +46,7 @@ use cratestack_core::CratestackCodec;
 use lightbridge_authz_api::schema;
 use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_bearer::{BearerTokenServiceTrait, TokenInfo};
-use lightbridge_authz_core::authz::Permission;
+use lightbridge_authz_core::authz::{Permission, PermissionSet};
 use lightbridge_authz_core::config::{BasicAuth, Billing, BillingPlan};
 use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
@@ -124,17 +125,8 @@ struct Ctx {
     refill_service: Arc<lightbridge_authz_budget::RefillService>,
     review_service: Arc<lightbridge_authz_budget::ReviewService>,
     budget_repo: Arc<lightbridge_authz_budget::repo::BudgetRepo>,
+    reset_scheduler: Arc<lightbridge_authz_budget::ResetScheduler>,
 }
-
-// `SqlxIdempotencyStore::ensure_schema()` issues its `CREATE TYPE`/`CREATE TABLE` DDL without
-// `IF NOT EXISTS`-safe concurrency handling, so when every one of this file's ~16 tests calls it
-// from `setup()` against the same fresh (just-migrated) database under `cargo test`'s default
-// parallelism, several race and hit `duplicate key value violates unique constraint
-// "pg_type_typname_nsp_index"`. The schema is process-wide idempotent (identical DDL, no
-// per-test state), so it only needs to run once per test binary -- guarded by a `OnceCell` shared
-// across every `setup()` call; concurrent callers await the same in-flight future rather than
-// each issuing their own DDL.
-static IDEMPOTENCY_SCHEMA_READY: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
 
 /// Build the full `build_api_router` for `bearer`, connecting the cratestack CRUD client,
 /// Postgres-backed idempotency store, and Redis rate-limit store to the live backends.
@@ -160,15 +152,12 @@ async fn setup_with_resolver(
     let cpool = cratestack_pool().await;
     let cdb = schema::Cratestack::builder(cpool.clone()).build();
     let issuer = Arc::new(AuthzStoreImpl::with_pool(core.clone()).with_billing(billing()));
+    // No `ensure_schema()` here any more: `cratestack_idempotency` is created by
+    // `migrations/20260904000002_cratestack_bootstrap_tables.sql`, so the DDL race this file used
+    // to guard against with a per-binary `OnceCell` no longer exists to guard (#684). The same
+    // migration also owns `cratestack_audit`, which no test could guard because cratestack issues
+    // that DDL itself from inside the create path.
     let idempotency = Arc::new(SqlxIdempotencyStore::new(cpool.clone()));
-    IDEMPOTENCY_SCHEMA_READY
-        .get_or_init(|| async {
-            idempotency
-                .ensure_schema()
-                .await
-                .expect("ensure idempotency schema");
-        })
-        .await;
     // A per-`setup()`-call namespace, not a shared literal: `RateLimitLayer`'s default key hashes
     // the raw `Authorization` header value, and every test in this file authenticates with the
     // literal bearer token `"admin"` (or another fixed literal like `"owner"`/`"viewer"`) -- a
@@ -210,6 +199,14 @@ async fn setup_with_resolver(
         budget_repo.clone(),
         augmentation_repo,
     ));
+    // ADR-0032: `build_*_router` takes the reset scheduler unconditionally (see `Procedures`'s own
+    // field doc). Nothing here drives the interval task -- that is spawned only by
+    // `start_budget_server` -- so this is an inert handle over the same lazily-connected pool.
+    let reset_scheduler = Arc::new(lightbridge_authz_budget::ResetScheduler::new(
+        core.clone(),
+        budget_repo.clone(),
+        Arc::new(lightbridge_authz_budget::UnavailableSpendReader),
+    ));
 
     let router = lightbridge_authz_rest::build_api_router(
         bearer,
@@ -219,6 +216,10 @@ async fn setup_with_resolver(
         refill_service.clone(),
         review_service.clone(),
         budget_repo.clone(),
+        reset_scheduler.clone(),
+        std::sync::Arc::new(lightbridge_authz_core::platform_role::known_platform_roles(
+            &lightbridge_authz_core::authz::Rbac::default(),
+        )),
         cdb,
         core.clone(),
         idempotency,
@@ -243,6 +244,7 @@ async fn setup_with_resolver(
         refill_service,
         review_service,
         budget_repo,
+        reset_scheduler,
     }
 }
 
@@ -1510,6 +1512,7 @@ fn opa_state(core: Arc<dyn DbPoolTrait>) -> Arc<OpaState> {
         api_key_audience: None,
         resolver: common::test_resolver(),
         federation_issuer: "https://keycloak.example.test/realms/dev".to_string(),
+        budget: Default::default(),
     })
 }
 
@@ -1897,11 +1900,16 @@ async fn batch_rpc_frames_succeed_and_fail_independently() {
     let bare: Router = schema::axum::rpc_router(
         cdb,
         Procedures::new(
+            lightbridge_authz_rest::SERVICE_API,
             ctx.issuer.clone(),
             ctx.policy_store.clone(),
             ctx.refill_service.clone(),
             ctx.review_service.clone(),
             ctx.budget_repo.clone(),
+            ctx.reset_scheduler.clone(),
+            std::sync::Arc::new(lightbridge_authz_core::platform_role::known_platform_roles(
+                &lightbridge_authz_core::authz::Rbac::default(),
+            )),
         ),
         // cratestack 0.8.11 (@computed) added this parameter; `()` is a no-op since
         // `authz.cstack` declares no `@computed` field (see src/lib.rs's own call sites).
@@ -3709,6 +3717,852 @@ async fn provision_account_admin_creates_account_for_target_subject() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Sessions read + per-session revoke (`procedure.querySessions` / `procedure.revokeSession`,
+// ADR-0020 Follow-up 4, #649).
+//
+// The property under test in most of these is that own-scoping is enforced by the `Session`
+// model's `@@allow("read", ...)` clause -- compiled into the SQL `WHERE` by cratestack -- and not
+// by anything in the handler. That is why the read tests all drive the REAL assembled router with
+// a REAL permission set: a unit test of the procedure body could not observe the policy at all.
+// ---------------------------------------------------------------------------------------------
+
+/// Seeds one session with full control over the columns the listing filters and computes on.
+/// `expires_in_hours` may be negative to produce a stored-`active` row that is already past its
+/// expiry -- the only way an `"expired"` session exists, since that status is never written
+/// (ADR-0020 Decision 6).
+#[allow(clippy::too_many_arguments)]
+async fn seed_session_detailed(
+    pool: &sqlx::PgPool,
+    subject: &str,
+    account_id: &str,
+    kind: &str,
+    status: &str,
+    client_id: Option<&str>,
+    created_minutes_ago: i64,
+    expires_in_hours: i64,
+) -> String {
+    let id = cuid2();
+    sqlx::query(
+        r#"
+        INSERT INTO sessions
+          (id, account_id, project_id, client_id, kind, status, created_at, updated_at,
+           expires_at, subject, user_agent)
+        VALUES ($1, $2, $3, $4, $5, $6,
+                now() - make_interval(mins => $7::int), now(),
+                now() + make_interval(hours => $8::int), $9, 'test-agent/1.0')
+        "#,
+    )
+    .bind(&id)
+    .bind(account_id)
+    .bind(cuid2())
+    .bind(client_id)
+    .bind(kind)
+    .bind(status)
+    .bind(created_minutes_ago as i32)
+    .bind(expires_in_hours as i32)
+    .bind(subject)
+    .execute(pool)
+    .await
+    .expect("seed detailed session row");
+    id
+}
+
+/// [`seed_session_detailed`] with `subject` left NULL -- the shape of a session minted before
+/// `20260824000003_sessions_add_subject.sql` (browser) or before #492's companion fix (token).
+/// Such a row belongs to nobody, which is exactly what both the own-scope read policy and the
+/// per-session revoke's ownership check have to fail closed on.
+async fn seed_session_detailed_null_subject(
+    pool: &sqlx::PgPool,
+    account_id: &str,
+    kind: &str,
+    status: &str,
+    created_minutes_ago: i64,
+    expires_in_hours: i64,
+) -> String {
+    let id = seed_session_detailed(
+        pool,
+        account_id,
+        account_id,
+        kind,
+        status,
+        (kind == "token").then_some("cli"),
+        created_minutes_ago,
+        expires_in_hours,
+    )
+    .await;
+    sqlx::query("UPDATE sessions SET subject = NULL WHERE id = $1")
+        .bind(&id)
+        .execute(pool)
+        .await
+        .expect("clear the seeded session's subject");
+    id
+}
+
+/// Inserts an `accounts` row with a caller-chosen id, so a test can make a session's `subject`
+/// resolve to a real owning user. The `accounts_set_user` trigger (20260830000003) provisions
+/// `user_id` (and the `users` row) from the account id for a first-time account, so the owning
+/// user id IS `account_id` here -- the same anchor #647's identity-resolution tests use.
+async fn seed_account_row(pool: &sqlx::PgPool, account_id: &str) {
+    sqlx::query(
+        r#"
+        INSERT INTO accounts (id, default_quota, name, created_at, updated_at)
+        VALUES ($1, NULL, $2, now(), now())
+        ON CONFLICT (id) DO NOTHING
+        "#,
+    )
+    .bind(account_id)
+    .bind(format!("{account_id} account"))
+    .execute(pool)
+    .await
+    .expect("seed account row");
+}
+
+/// Chains one `exchange_refresh_tokens` row under `session_id` with an explicit `scope` string --
+/// the column `offline` is derived from. `None` seeds a chain with a NULL scope, which must read
+/// as NOT offline rather than as unknown-so-assume-yes.
+async fn seed_chain_with_scope(
+    pool: &sqlx::PgPool,
+    session_id: &str,
+    subject: &str,
+    scope: Option<&str>,
+) {
+    let refresh_id = cuid2();
+    sqlx::query(
+        r#"
+        INSERT INTO exchange_refresh_tokens
+          (id, subject, account_id, project_id, client_id, token_hash, scope, status, chain_id,
+           chain_expires_at, session_id, created_at, expires_at)
+        VALUES ($1, $2, $2, $3, 'test-client', $4, $5, 'active', $1,
+                now() + interval '90 days', $6, now(), now() + interval '30 days')
+        "#,
+    )
+    .bind(&refresh_id)
+    .bind(subject)
+    .bind(cuid2())
+    .bind(cuid2())
+    .bind(scope)
+    .bind(session_id)
+    .execute(pool)
+    .await
+    .expect("seed refresh chain with an explicit scope");
+}
+
+/// The rows of one `querySessions` page, as JSON.
+async fn query_sessions(router: Router, token: &str, args: Value) -> (StatusCode, Value) {
+    let (status, body) = rpc_call(
+        router,
+        "procedure.querySessions",
+        Wire::Cbor,
+        &json!({ "args": args }),
+        Some(token),
+    )
+    .await;
+    let parsed = if status == StatusCode::OK {
+        as_json(Wire::Cbor, &body)
+    } else {
+        json!({ "raw": String::from_utf8_lossy(&body) })
+    };
+    (status, parsed)
+}
+
+fn row_ids(page: &Value) -> Vec<String> {
+    page["rows"]
+        .as_array()
+        .expect("rows array")
+        .iter()
+        .map(|row| row["id"].as_str().expect("row id").to_owned())
+        .collect()
+}
+
+/// An admin (holding `session:read`) sees rows belonging to a subject they have no relationship
+/// with -- the whole point of the estate-wide permission -- and `status: "all"` really does drop
+/// the status predicate rather than defaulting back to active.
+#[tokio::test]
+async fn query_sessions_as_admin_returns_other_subjects_rows() {
+    let admin_subject = format!("qs-admin-{}", cuid2());
+    let stranger = format!("qs-stranger-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> =
+        Arc::new(MapBearer::new().with("admin", token_info(&admin_subject, admin_perms())));
+    let ctx = setup(bearer).await;
+
+    let active = seed_session_detailed(
+        &ctx.verify,
+        &stranger,
+        &stranger,
+        "token",
+        "active",
+        Some("cli"),
+        10,
+        24,
+    )
+    .await;
+    let revoked = seed_session_detailed(
+        &ctx.verify,
+        &stranger,
+        &stranger,
+        "token",
+        "revoked",
+        Some("cli"),
+        20,
+        24,
+    )
+    .await;
+
+    let (status, page) = query_sessions(
+        ctx.router.clone(),
+        "admin",
+        json!({ "status": "all", "subject": stranger }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "page: {page}");
+    let ids = row_ids(&page);
+    assert!(
+        ids.contains(&active) && ids.contains(&revoked),
+        "an admin filtering by another subject must see both rows: {page}"
+    );
+    assert_eq!(
+        page["next"],
+        Value::Null,
+        "two rows is far short of the default limit, so this is the final page: {page}"
+    );
+}
+
+/// #649's headline negative: a caller holding ONLY `session:read-own` cannot reach another
+/// subject's rows with ANY filter -- proven by asking for exactly them by `subject`, the one
+/// filter that would otherwise do it. The empty page comes from the schema policy folded into the
+/// `WHERE`, not from a handler clamp, which is why the same call as an admin (above) succeeds.
+#[tokio::test]
+async fn query_sessions_own_scope_cannot_reach_another_subject_with_any_filter() {
+    let caller = format!("qs-own-{}", cuid2());
+    let stranger = format!("qs-other-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(MapBearer::new().with(
+        "own",
+        token_info(
+            &caller,
+            PermissionSet::from_iter([Permission::SessionReadOwn]),
+        ),
+    ));
+    let ctx = setup(bearer).await;
+
+    let mine = seed_session_detailed(
+        &ctx.verify,
+        &caller,
+        &caller,
+        "token",
+        "active",
+        Some("cli"),
+        5,
+        24,
+    )
+    .await;
+    let theirs = seed_session_detailed(
+        &ctx.verify,
+        &stranger,
+        &stranger,
+        "token",
+        "active",
+        Some("cli"),
+        5,
+        24,
+    )
+    .await;
+    let subjectless =
+        seed_session_detailed_null_subject(&ctx.verify, &caller, "token", "active", 5, 24).await;
+
+    for filters in [
+        json!({ "status": "all", "subject": stranger.clone() }),
+        json!({ "status": "all", "accountId": stranger.clone() }),
+        json!({ "status": "all", "kind": "token", "clientId": "cli", "subject": stranger.clone() }),
+    ] {
+        let (status, page) = query_sessions(ctx.router.clone(), "own", filters.clone()).await;
+        assert_eq!(status, StatusCode::OK, "page: {page}");
+        assert!(
+            !row_ids(&page).contains(&theirs),
+            "own-scope caller reached another subject's session with {filters}: {page}"
+        );
+    }
+
+    let (status, page) =
+        query_sessions(ctx.router.clone(), "own", json!({ "status": "all" })).await;
+    assert_eq!(status, StatusCode::OK, "page: {page}");
+    let ids = row_ids(&page);
+    assert!(
+        ids.contains(&mine),
+        "own-scope caller must see their own rows: {page}"
+    );
+    assert!(!ids.contains(&theirs));
+    assert!(
+        !ids.contains(&subjectless),
+        "a row with a NULL subject belongs to nobody and must stay invisible to an own-scope \
+         caller -- `NULL = $1` is never true, which is the fail-closed direction: {page}"
+    );
+}
+
+/// `"expired"` is computed, never stored (ADR-0020 Decision 6): the same clock rule selects the
+/// row and labels it, and a revoked row that is ALSO past its expiry still reads `"revoked"`.
+#[tokio::test]
+async fn query_sessions_computes_expired_status_and_selects_on_it() {
+    let admin_subject = format!("qs-exp-admin-{}", cuid2());
+    let owner = format!("qs-exp-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> =
+        Arc::new(MapBearer::new().with("admin", token_info(&admin_subject, admin_perms())));
+    let ctx = setup(bearer).await;
+
+    let live = seed_session_detailed(
+        &ctx.verify,
+        &owner,
+        &owner,
+        "token",
+        "active",
+        Some("cli"),
+        5,
+        24,
+    )
+    .await;
+    let stale = seed_session_detailed(
+        &ctx.verify,
+        &owner,
+        &owner,
+        "token",
+        "active",
+        Some("cli"),
+        10,
+        -1,
+    )
+    .await;
+    let revoked_and_stale = seed_session_detailed(
+        &ctx.verify,
+        &owner,
+        &owner,
+        "token",
+        "revoked",
+        Some("cli"),
+        15,
+        -1,
+    )
+    .await;
+
+    let (_, expired_page) = query_sessions(
+        ctx.router.clone(),
+        "admin",
+        json!({ "status": "expired", "subject": owner }),
+    )
+    .await;
+    assert_eq!(
+        row_ids(&expired_page),
+        vec![stale.clone()],
+        "`expired` must select stored-active-and-past-expiry only -- not the live row, and not \
+         the revoked one that happens to also be past its expiry: {expired_page}"
+    );
+    let row = &expired_page["rows"][0];
+    assert_eq!(row["status"], "expired", "computed status: {row}");
+    assert_eq!(row["expired"], true);
+
+    let (_, active_page) = query_sessions(
+        ctx.router.clone(),
+        "admin",
+        json!({ "status": "active", "subject": owner }),
+    )
+    .await;
+    assert_eq!(
+        row_ids(&active_page),
+        vec![live.clone()],
+        "the default `active` filter must exclude the expired row: {active_page}"
+    );
+    assert_eq!(active_page["rows"][0]["status"], "active");
+    assert_eq!(active_page["rows"][0]["expired"], false);
+
+    let (_, revoked_page) = query_sessions(
+        ctx.router.clone(),
+        "admin",
+        json!({ "status": "revoked", "subject": owner }),
+    )
+    .await;
+    assert_eq!(row_ids(&revoked_page), vec![revoked_and_stale.clone()]);
+    assert_eq!(
+        revoked_page["rows"][0]["status"], "revoked",
+        "revocation beats expiry -- an operator revoked this, the clock did not"
+    );
+    assert_eq!(
+        revoked_page["rows"][0]["expired"], true,
+        "`expired` still reports the clock fact independently of the status"
+    );
+
+    let (status, bad) = query_sessions(
+        ctx.router.clone(),
+        "admin",
+        json!({ "status": "acive", "subject": owner }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an unrecognised status must be REJECTED, never widened to `all`: {bad}"
+    );
+}
+
+/// Paging is stable and terminal: every row appears exactly once across the pages, in
+/// `created_at DESC` order, and the last page's `next` is null. Seeded with two rows sharing an
+/// identical `created_at` so the `id` tiebreak is actually exercised -- without it a page boundary
+/// landing inside the tie would skip or repeat one of them.
+#[tokio::test]
+async fn query_sessions_pages_deterministically_including_across_a_created_at_tie() {
+    let admin_subject = format!("qs-page-admin-{}", cuid2());
+    let owner = format!("qs-page-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> =
+        Arc::new(MapBearer::new().with("admin", token_info(&admin_subject, admin_perms())));
+    let ctx = setup(bearer).await;
+
+    let mut seeded = Vec::new();
+    for minutes in [50i64, 40, 30, 20, 10] {
+        seeded.push(
+            seed_session_detailed(
+                &ctx.verify,
+                &owner,
+                &owner,
+                "token",
+                "active",
+                Some("cli"),
+                minutes,
+                24,
+            )
+            .await,
+        );
+    }
+    // Two more sharing one exact `created_at` -- the tie the cursor's `id` half exists for.
+    seeded.push(
+        seed_session_detailed(
+            &ctx.verify,
+            &owner,
+            &owner,
+            "token",
+            "active",
+            Some("cli"),
+            25,
+            24,
+        )
+        .await,
+    );
+    seeded.push(
+        seed_session_detailed(
+            &ctx.verify,
+            &owner,
+            &owner,
+            "token",
+            "active",
+            Some("cli"),
+            25,
+            24,
+        )
+        .await,
+    );
+    sqlx::query("UPDATE sessions SET created_at = (SELECT min(created_at) FROM sessions WHERE id = ANY($1)) WHERE id = ANY($1)")
+        .bind(seeded[5..].to_vec())
+        .execute(&ctx.verify)
+        .await
+        .expect("force a created_at tie between the last two seeded rows");
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut pages = 0;
+    loop {
+        let mut args = json!({ "status": "all", "subject": owner, "limit": 2 });
+        if let Some(after) = cursor.clone() {
+            args["after"] = json!(after);
+        }
+        let (status, page) = query_sessions(ctx.router.clone(), "admin", args).await;
+        assert_eq!(status, StatusCode::OK, "page: {page}");
+        seen.extend(row_ids(&page));
+        pages += 1;
+        assert!(pages < 20, "pagination did not terminate: {seen:?}");
+        match page["next"].as_str() {
+            Some(next) => cursor = Some(next.to_owned()),
+            None => break,
+        }
+    }
+
+    let mut unique = seen.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        seen.len(),
+        "a row was served twice across pages: {seen:?}"
+    );
+    let mut expected = seeded.clone();
+    expected.sort();
+    assert_eq!(
+        unique, expected,
+        "every seeded row must appear exactly once"
+    );
+
+    let (_, single) = query_sessions(
+        ctx.router.clone(),
+        "admin",
+        json!({ "status": "all", "subject": owner, "limit": 100 }),
+    )
+    .await;
+    assert_eq!(
+        single["next"],
+        Value::Null,
+        "a page shorter than `limit` is the final page: {single}"
+    );
+    assert_eq!(
+        row_ids(&single).len(),
+        seeded.len(),
+        "one big page must hold everything the paged walk found: {single}"
+    );
+
+    let (status, bad) = query_sessions(
+        ctx.router.clone(),
+        "admin",
+        json!({ "status": "all", "subject": owner, "after": "not-a-cursor" }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a malformed cursor must be rejected, not silently ignored back to page 1: {bad}"
+    );
+}
+
+/// `offline` is derived from the chain's stored `offline_access` scope, matched as a whole word:
+/// a chain carrying it is offline, a chain carrying only other scopes is not, a chain with a NULL
+/// scope is not, and a session with no chain at all is not.
+#[tokio::test]
+async fn query_sessions_derives_offline_from_the_refresh_chain_scope() {
+    let admin_subject = format!("qs-off-admin-{}", cuid2());
+    let owner = format!("qs-off-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> =
+        Arc::new(MapBearer::new().with("admin", token_info(&admin_subject, admin_perms())));
+    let ctx = setup(bearer).await;
+
+    let offline = seed_session_detailed(
+        &ctx.verify,
+        &owner,
+        &owner,
+        "token",
+        "active",
+        Some("cli"),
+        40,
+        24,
+    )
+    .await;
+    seed_chain_with_scope(
+        &ctx.verify,
+        &offline,
+        &owner,
+        Some("openid profile offline_access"),
+    )
+    .await;
+    let online = seed_session_detailed(
+        &ctx.verify,
+        &owner,
+        &owner,
+        "token",
+        "active",
+        Some("cli"),
+        30,
+        24,
+    )
+    .await;
+    seed_chain_with_scope(&ctx.verify, &online, &owner, Some("openid profile")).await;
+    let null_scope = seed_session_detailed(
+        &ctx.verify,
+        &owner,
+        &owner,
+        "token",
+        "active",
+        Some("cli"),
+        20,
+        24,
+    )
+    .await;
+    seed_chain_with_scope(&ctx.verify, &null_scope, &owner, None).await;
+    let chainless = seed_session_detailed(
+        &ctx.verify,
+        &owner,
+        &owner,
+        "browser",
+        "active",
+        None,
+        10,
+        24,
+    )
+    .await;
+    let lookalike = seed_session_detailed(
+        &ctx.verify,
+        &owner,
+        &owner,
+        "token",
+        "active",
+        Some("cli"),
+        5,
+        24,
+    )
+    .await;
+    seed_chain_with_scope(
+        &ctx.verify,
+        &lookalike,
+        &owner,
+        Some("openid offline_access_readonly"),
+    )
+    .await;
+
+    let (status, page) = query_sessions(
+        ctx.router.clone(),
+        "admin",
+        json!({ "status": "all", "subject": owner }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "page: {page}");
+    let by_id: HashMap<String, bool> = page["rows"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|row| {
+            (
+                row["id"].as_str().expect("id").to_owned(),
+                row["offline"].as_bool().expect("offline is never null"),
+            )
+        })
+        .collect();
+    assert_eq!(by_id.get(&offline), Some(&true), "page: {page}");
+    assert_eq!(
+        by_id.get(&online),
+        Some(&false),
+        "a chain without offline_access is a browser-lifetime grant, not an offline one: {page}"
+    );
+    assert_eq!(
+        by_id.get(&null_scope),
+        Some(&false),
+        "an unrecorded scope is not evidence of offline access: {page}"
+    );
+    assert_eq!(
+        by_id.get(&chainless),
+        Some(&false),
+        "no refresh chain means nothing to outlive a browser session: {page}"
+    );
+    assert_eq!(
+        by_id.get(&lookalike),
+        Some(&false),
+        "the scope list is matched as whole space-delimited words -- a hypothetical          `offline_access_readonly` scope is a DIFFERENT scope and must not read as offline: {page}"
+    );
+}
+
+/// `subjectUserId` resolves the session's subject (an account id, ADR-0006) to the PERSON who owns
+/// that account (`accounts.user_id`, ADR-0026) -- the id the console feeds to `resolveUserProfiles`
+/// (#647). A subject naming no account row stays null rather than being fabricated.
+#[tokio::test]
+async fn query_sessions_resolves_the_subjects_owning_user() {
+    let admin_subject = format!("qs-user-admin-{}", cuid2());
+    let owner = format!("qs-user-{}", cuid2());
+    let unknown_subject = format!("qs-user-ghost-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> =
+        Arc::new(MapBearer::new().with("admin", token_info(&admin_subject, admin_perms())));
+    let ctx = setup(bearer).await;
+
+    // `accounts_set_user` provisions `accounts.user_id` from the account id for a first-time
+    // account, so the owning user id IS `owner` here (same anchor the #647 tests use).
+    seed_account_row(&ctx.verify, &owner).await;
+    let known = seed_session_detailed(
+        &ctx.verify,
+        &owner,
+        &owner,
+        "token",
+        "active",
+        Some("cli"),
+        10,
+        24,
+    )
+    .await;
+    let ghost = seed_session_detailed(
+        &ctx.verify,
+        &unknown_subject,
+        &unknown_subject,
+        "token",
+        "active",
+        Some("cli"),
+        5,
+        24,
+    )
+    .await;
+
+    let (_, page) = query_sessions(
+        ctx.router.clone(),
+        "admin",
+        json!({ "status": "all", "subject": owner }),
+    )
+    .await;
+    assert_eq!(
+        page["rows"][0]["subjectUserId"], owner,
+        "the session's subject must resolve to the user owning that account: {page}"
+    );
+    assert_eq!(page["rows"][0]["id"], known);
+
+    let (_, ghost_page) = query_sessions(
+        ctx.router.clone(),
+        "admin",
+        json!({ "status": "all", "subject": unknown_subject }),
+    )
+    .await;
+    assert_eq!(ghost_page["rows"][0]["id"], ghost);
+    assert_eq!(
+        ghost_page["rows"][0]["subjectUserId"],
+        Value::Null,
+        "a subject naming no account resolves to null, never to a fabricated id: {ghost_page}"
+    );
+}
+
+/// `revokeSession` closes exactly the session named, cascades to its refresh chain, leaves the
+/// caller's other sessions alone, and is idempotent on a second call.
+#[tokio::test]
+async fn revoke_session_closes_one_session_and_its_chain_idempotently() {
+    let caller = format!("rs-own-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(MapBearer::new().with(
+        "own",
+        token_info(
+            &caller,
+            PermissionSet::from_iter([Permission::SessionRevokeOwn]),
+        ),
+    ));
+    let ctx = setup(bearer).await;
+
+    let target = seed_active_session(&ctx.verify, &caller).await;
+    let keeper = seed_active_session(&ctx.verify, &caller).await;
+
+    let (status, body) = rpc_call(
+        ctx.router.clone(),
+        "procedure.revokeSession",
+        Wire::Cbor,
+        &json!({ "args": { "id": target, "reason": "lost laptop" } }),
+        Some("own"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "body: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(as_json(Wire::Cbor, &body)["revoked"], true);
+
+    assert_eq!(session_status(&ctx.verify, &target).await, "revoked");
+    assert_eq!(
+        refresh_token_status_for_session(&ctx.verify, &target).await,
+        "revoked",
+        "revoking a session without its chain would leave a working refresh token behind -- \
+         ADR-0020 Decision 9's cascade requirement"
+    );
+    assert_eq!(
+        session_status(&ctx.verify, &keeper).await,
+        "active",
+        "a per-session revoke must not behave like the bulk one"
+    );
+    assert_eq!(
+        refresh_token_status_for_session(&ctx.verify, &keeper).await,
+        "active"
+    );
+
+    let (status, body) = rpc_call(
+        ctx.router.clone(),
+        "procedure.revokeSession",
+        Wire::Cbor,
+        &json!({ "args": { "id": target } }),
+        Some("own"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a second revoke must succeed, not error"
+    );
+    assert_eq!(
+        as_json(Wire::Cbor, &body)["revoked"],
+        false,
+        "`revoked` reports whether THIS call changed state -- the second one did not"
+    );
+}
+
+/// The own-vs-other split on the revoke: a caller holding only `session:revoke-own` is refused a
+/// session that is not theirs (including one with a NULL subject, which belongs to nobody), and an
+/// admin holding `session:revoke` is not. An unknown id is a clean not-found either way.
+#[tokio::test]
+async fn revoke_session_refuses_another_subjects_session_without_session_revoke() {
+    let caller = format!("rs-other-{}", cuid2());
+    let stranger = format!("rs-stranger-{}", cuid2());
+    let admin_subject = format!("rs-admin-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(
+        MapBearer::new()
+            .with(
+                "own",
+                token_info(
+                    &caller,
+                    PermissionSet::from_iter([Permission::SessionRevokeOwn]),
+                ),
+            )
+            .with("admin", token_info(&admin_subject, admin_perms())),
+    );
+    let ctx = setup(bearer).await;
+
+    let theirs = seed_active_session(&ctx.verify, &stranger).await;
+    let orphan =
+        seed_session_detailed_null_subject(&ctx.verify, &caller, "token", "active", 5, 24).await;
+
+    for (id, why) in [
+        (theirs.clone(), "another subject's session"),
+        (orphan.clone(), "a session with no recorded subject"),
+    ] {
+        let (status, body) = rpc_call(
+            ctx.router.clone(),
+            "procedure.revokeSession",
+            Wire::Cbor,
+            &json!({ "args": { "id": id } }),
+            Some("own"),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{why} must be refused without session:revoke: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(session_status(&ctx.verify, &id).await, "active");
+    }
+
+    let (status, body) = rpc_call(
+        ctx.router.clone(),
+        "procedure.revokeSession",
+        Wire::Cbor,
+        &json!({ "args": { "id": theirs } }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "body: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(as_json(Wire::Cbor, &body)["revoked"], true);
+    assert_eq!(session_status(&ctx.verify, &theirs).await, "revoked");
+
+    let (status, _) = rpc_call(
+        ctx.router.clone(),
+        "procedure.revokeSession",
+        Wire::Cbor,
+        &json!({ "args": { "id": format!("does-not-exist-{}", cuid2()) } }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "an unknown session id is a clean not-found, not an internal error"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
 // Section: self-provisioning -- lightbridge-viewer/lightbridge-editor must be able to create their
 // own account (#219: the account row must exist before `project_members.account_id`'s FK to
 // `accounts` can be satisfied, so a low-privilege first-time caller who lacks `account:create`
@@ -4281,4 +5135,622 @@ async fn batch_response_null_allowed_models_encodes_as_cbor_null_not_empty_array
 
     let frames: Vec<Value> = Wire::Cbor.decode(&bytes);
     assert!(frames[0]["output"]["allowedModels"].is_null());
+}
+
+/// #647's positive half, end to end over the real RPC transport: an admin holding `user:read`
+/// resolves user, account and project ids into labels and searches for a user by name — and the
+/// unknown ids in the same batch come back ABSENT, never as fabricated placeholder rows.
+///
+/// The refusal half (a caller holding every permission EXCEPT `user:read`) is
+/// `rbac_gate_denies_identity_resolution_without_user_read` in `rpc_router_tests.rs`, which needs
+/// no database because the gate runs ahead of dispatch.
+#[tokio::test]
+async fn identity_resolution_procedures_resolve_labels_and_omit_unknown_ids() {
+    let owner = format!("owner-identity-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> =
+        Arc::new(MapBearer::new().with("admin", token_info(&owner, admin_perms())));
+    let ctx = setup(bearer).await;
+    let r = &ctx.router;
+
+    let account_id = create_account(r, "admin", "tenant-identity").await;
+    let project_id = create_project(r, "admin", &account_id, "identity-proj").await;
+
+    // The profile claims live on `federated_identities`, which no RPC surface writes: seed the row
+    // the way a completed login would.
+    let display_name = format!("Ada Lovelace {}", cuid2());
+    sqlx::query(
+        r#"
+        INSERT INTO federated_identities
+            (id, issuer, subject, account_id, email, email_verified, preferred_username, name,
+             last_authenticated_at, created_at, updated_at)
+        VALUES ($1, 'https://issuer.example', $2, $2, $3, true, $4, $5, now(), now(), now())
+        "#,
+    )
+    .bind(cuid2())
+    .bind(&owner)
+    .bind(format!("{owner}@example.com"))
+    .bind(format!("u{owner}"))
+    .bind(&display_name)
+    .execute(&ctx.verify)
+    .await
+    .unwrap();
+
+    let (status, body) = rpc_call(
+        r.clone(),
+        "procedure.resolveUserProfiles",
+        Wire::Cbor,
+        &json!({ "args": { "userIds": [owner, "definitely-not-a-user"] } }),
+        Some("admin"),
+    )
+    .await;
+    assert!(status.is_success(), "resolveUserProfiles: {status}");
+    let profiles = json_body(&body)["profiles"].as_array().unwrap().clone();
+    assert_eq!(
+        profiles.len(),
+        1,
+        "the unknown id must be absent: {profiles:?}"
+    );
+    assert_eq!(profiles[0]["userId"].as_str(), Some(owner.as_str()));
+    assert_eq!(
+        profiles[0]["displayName"].as_str(),
+        Some(display_name.as_str())
+    );
+    assert_eq!(
+        profiles[0]["email"].as_str(),
+        Some(format!("{owner}@example.com").as_str())
+    );
+
+    let (status, body) = rpc_call(
+        r.clone(),
+        "procedure.resolveActorLabels",
+        Wire::Cbor,
+        &json!({ "args": {
+            "userIds": [owner],
+            "accountIds": [account_id, "definitely-not-an-account"],
+            "projectIds": [project_id],
+            "apiKeyIds": [],
+        } }),
+        Some("admin"),
+    )
+    .await;
+    assert!(status.is_success(), "resolveActorLabels: {status}");
+    let labels = json_body(&body);
+    assert_eq!(labels["users"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        labels["users"][0]["displayName"].as_str(),
+        Some(display_name.as_str())
+    );
+    let accounts = labels["accounts"].as_array().unwrap();
+    assert_eq!(accounts.len(), 1, "the unknown account id must be absent");
+    assert_eq!(accounts[0]["accountId"].as_str(), Some(account_id.as_str()));
+    assert_eq!(accounts[0]["ownerUserId"].as_str(), Some(owner.as_str()));
+    let projects = labels["projects"].as_array().unwrap();
+    assert_eq!(projects.len(), 1);
+    assert_eq!(projects[0]["projectId"].as_str(), Some(project_id.as_str()));
+    assert_eq!(projects[0]["accountId"].as_str(), Some(account_id.as_str()));
+
+    let (status, body) = rpc_call(
+        r.clone(),
+        "procedure.searchUsers",
+        Wire::Cbor,
+        &json!({ "args": { "query": "ada lovelace" } }),
+        Some("admin"),
+    )
+    .await;
+    assert!(status.is_success(), "searchUsers: {status}");
+    let users = json_body(&body)["users"].as_array().unwrap().clone();
+    assert!(
+        users
+            .iter()
+            .any(|u| u["userId"].as_str() == Some(owner.as_str())),
+        "case-insensitive name search must find the seeded identity: {users:?}"
+    );
+
+    // A one-character query is refused rather than answered with a bounded table dump.
+    let (status, _) = rpc_call(
+        r.clone(),
+        "procedure.searchUsers",
+        Wire::Cbor,
+        &json!({ "args": { "query": "a" } }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a 1-character query must be refused"
+    );
+}
+
+/// `resolveActorLabels`' fourth kind, end to end (#647, owner feedback 2026-09-03: "can we use
+/// names on the 'Spend by API key' panel? API keys do have names").
+///
+/// This is the whole point of moving the op-id out of `user:read` and into the handler, so it
+/// pins all four halves of that move in one place, over the real RPC transport:
+///
+///  1. an ADMIN (`user:read`) resolves a FOREIGN key — one in an account they have no relationship
+///     with — because that is the same estate-wide reach they already have over users/accounts;
+///  2. a MEMBER holding every permission EXCEPT `user:read` resolves the keys of a project they are
+///     merely a `project_members` row on, and NOT the ones they are not — the exact ownership
+///     disjunction `ApiKey`'s own `@@allow("read", …)` compiles, reached through `db.api_key()`;
+///  3. a STRANGER gets `{ apiKeys: [] }` and a 200, never a 403: refusing would confirm the key
+///     exists, and would take their own resolvable keys down with it in the same batch;
+///  4. the three ESTATE-WIDE kinds still refuse a caller without `user:read` — that gate moved into
+///     the handler, it did not disappear — and the refusal is a 403, not a silent empty list.
+///
+/// Plus the `revoked` flag, which is what lets the console render "name (revoked)" instead of
+/// letting a dead key read as a live cost centre.
+#[tokio::test]
+async fn resolve_actor_labels_names_api_keys_row_scoped_without_user_read() {
+    let owner = format!("owner-keylabels-{}", cuid2());
+    let member = format!("member-keylabels-{}", cuid2());
+    let stranger = format!("stranger-keylabels-{}", cuid2());
+    // "Admin minus one": everything a person needs to run their own tenant, and NOT `user:read`.
+    // Stated as a subtraction rather than as `viewer_perms()` because the member has to CREATE the
+    // account/project/key this test scopes them to, and because the interesting failure would be
+    // `user:read` being implied by some broader grant.
+    let no_user_read: PermissionSet = Permission::ALL
+        .into_iter()
+        .filter(|permission| *permission != Permission::UserRead)
+        .collect();
+    let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(
+        MapBearer::new()
+            .with("admin", token_info(&owner, admin_perms()))
+            .with("member", token_info(&member, no_user_read.clone()))
+            .with("stranger", token_info(&stranger, no_user_read)),
+    );
+    let ctx = setup(bearer).await;
+    let r = &ctx.router;
+
+    let owner_account = create_account(r, "admin", "tenant-keylabels-owner").await;
+    let owned_project = create_project(r, "admin", &owner_account, "proj-keylabels-owned").await;
+    let shared_project = create_project(r, "admin", &owner_account, "proj-keylabels-shared").await;
+    let (owned_key, _) = create_api_key(r, "admin", &owned_project, "Owned ingest").await;
+    let (shared_key, _) = create_api_key(r, "admin", &shared_project, "Shared ingest").await;
+
+    let _member_account = create_account(r, "member", "tenant-keylabels-member").await;
+    let (status, body) = rpc_call(
+        r.clone(),
+        "procedure.addProjectMember",
+        Wire::Cbor,
+        &json!({ "args": { "projectId": shared_project, "accountId": member, "role": "member" } }),
+        Some("admin"),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "addProjectMember: {status} {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let stranger_account = create_account(r, "stranger", "tenant-keylabels-stranger").await;
+    let stranger_project =
+        create_project(r, "stranger", &stranger_account, "proj-keylabels-stranger").await;
+    let (stranger_key, _) =
+        create_api_key(r, "stranger", &stranger_project, "Stranger ingest").await;
+
+    let call = |token: &'static str, ids: Vec<String>| {
+        let router = r.clone();
+        async move {
+            rpc_call(
+                router,
+                "procedure.resolveActorLabels",
+                Wire::Cbor,
+                &json!({ "args": {
+                    "userIds": [],
+                    "accountIds": [],
+                    "projectIds": [],
+                    "apiKeyIds": ids,
+                } }),
+                Some(token),
+            )
+            .await
+        }
+    };
+    let key_labels = |body: &[u8]| -> HashMap<String, Value> {
+        json_body(body)["apiKeys"]
+            .as_array()
+            .expect("apiKeys array")
+            .iter()
+            .map(|label| {
+                (
+                    label["apiKeyId"].as_str().expect("apiKeyId").to_string(),
+                    label.clone(),
+                )
+            })
+            .collect()
+    };
+
+    // (1) The admin resolves every key, INCLUDING the stranger's, and each label carries the
+    // account edge the `ApiKey` model itself has no relation path for.
+    let all_ids = vec![
+        owned_key.clone(),
+        shared_key.clone(),
+        stranger_key.clone(),
+        "definitely-not-a-key".to_string(),
+    ];
+    let (status, body) = call("admin", all_ids.clone()).await;
+    assert!(
+        status.is_success(),
+        "admin resolveActorLabels: {status} {}",
+        String::from_utf8_lossy(&body)
+    );
+    let admin_view = key_labels(&body);
+    assert_eq!(
+        admin_view.len(),
+        3,
+        "the unknown id must be absent, never fabricated: {admin_view:?}"
+    );
+    assert_eq!(
+        admin_view[&owned_key]["name"].as_str(),
+        Some("Owned ingest")
+    );
+    assert_eq!(
+        admin_view[&owned_key]["projectId"].as_str(),
+        Some(owned_project.as_str())
+    );
+    assert_eq!(
+        admin_view[&owned_key]["accountId"].as_str(),
+        Some(owner_account.as_str())
+    );
+    assert_eq!(admin_view[&owned_key]["revoked"].as_bool(), Some(false));
+    assert_eq!(
+        admin_view[&stranger_key]["accountId"].as_str(),
+        Some(stranger_account.as_str()),
+        "user:read resolves a key in an account the caller has no relationship with — that is the \
+         same estate-wide reach the other three kinds already grant"
+    );
+
+    // (2) The member holds NO `user:read` and still gets a name for the shared project's key --
+    // and only that one.
+    let (status, body) = call("member", all_ids.clone()).await;
+    assert!(
+        status.is_success(),
+        "member resolveActorLabels: {status} {}",
+        String::from_utf8_lossy(&body)
+    );
+    let member_view = key_labels(&body);
+    assert_eq!(
+        member_view.keys().cloned().collect::<Vec<_>>(),
+        vec![shared_key.clone()],
+        "a project member sees that project's keys and nothing else: {member_view:?}"
+    );
+    assert_eq!(
+        member_view[&shared_key]["name"].as_str(),
+        Some("Shared ingest"),
+        "this is the panel label the whole change exists for"
+    );
+
+    // (3) A stranger to every one of those keys gets an EMPTY list and a 200 -- never a 403, which
+    // would confirm the ids exist.
+    let (status, body) = call("stranger", vec![owned_key.clone(), shared_key.clone()]).await;
+    assert!(
+        status.is_success(),
+        "a stranger must get an empty list, not a refusal: {status} {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(
+        key_labels(&body).is_empty(),
+        "an id the caller may not see is ABSENT, exactly like an id that does not exist"
+    );
+
+    // (4) The `user:read` gate did not disappear with the op-id mapping -- it moved into the
+    // handler, and it still refuses rather than answering empty.
+    let (status, _) = rpc_call(
+        r.clone(),
+        "procedure.resolveActorLabels",
+        Wire::Cbor,
+        &json!({ "args": {
+            "userIds": [owner],
+            "accountIds": [],
+            "projectIds": [],
+            "apiKeyIds": [shared_key],
+        } }),
+        Some("member"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "asking for an estate-wide kind without user:read must be REFUSED, not silently emptied"
+    );
+
+    // (5) A revoked key keeps its name and says so, so a spend row for a dead key does not read as
+    // a live cost centre.
+    let (status, body) = rpc_call(
+        r.clone(),
+        "procedure.revokeApiKey",
+        Wire::Cbor,
+        &json!({ "args": { "keyId": owned_key } }),
+        Some("admin"),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "revokeApiKey: {status} {}",
+        String::from_utf8_lossy(&body)
+    );
+    let (status, body) = call("admin", vec![owned_key.clone()]).await;
+    assert!(
+        status.is_success(),
+        "resolveActorLabels after revoke: {status}"
+    );
+    let after = key_labels(&body);
+    assert_eq!(
+        after[&owned_key]["name"].as_str(),
+        Some("Owned ingest"),
+        "a revoked key keeps its name -- the console renders name + \"(revoked)\", not a sentinel"
+    );
+    assert_eq!(after[&owned_key]["revoked"].as_bool(), Some(true));
+}
+
+/// ADR-0033's positive half over the real RPC transport: an admin grants a platform role, sees it
+/// in the listing, and revokes it — and the revoke CLOSES that person's sessions, which is what
+/// makes the change bite within an access-token TTL instead of a session lifetime.
+///
+/// The refusal half (a caller holding every permission EXCEPT `rbac:manage`) is
+/// `rbac_gate_denies_platform_role_management_without_rbac_manage` in `rpc_router_tests.rs`, which
+/// needs no database because the gate runs ahead of dispatch.
+#[tokio::test]
+async fn platform_role_grants_are_idempotent_listable_and_revoking_closes_sessions() {
+    let admin = format!("rbac-admin-{}", cuid2());
+    let target = format!("rbac-target-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> =
+        Arc::new(MapBearer::new().with("admin", token_info(&admin, admin_perms())));
+    let ctx = setup(bearer).await;
+    let r = &ctx.router;
+
+    // Both people need `users` rows; `createAccount`'s `accounts_set_user` trigger provisions one
+    // keyed to the same id, which is the grandfathered `users.id == accounts.id` shape.
+    create_account(r, "admin", "admin-tenant").await;
+    sqlx::query("INSERT INTO users (id) VALUES ($1) ON CONFLICT (id) DO NOTHING")
+        .bind(&target)
+        .execute(&ctx.verify)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO accounts (id, user_id, created_at, updated_at) VALUES ($1, $1, now(), now())",
+    )
+    .bind(&target)
+    .execute(&ctx.verify)
+    .await
+    .unwrap();
+    let target_session = seed_active_session(&ctx.verify, &target).await;
+
+    let (status, body) = rpc_call(
+        r.clone(),
+        "procedure.grantPlatformRole",
+        Wire::Cbor,
+        &json!({ "args": { "userId": target, "role": "lightbridge-admin", "reason": "on call" } }),
+        Some("admin"),
+    )
+    .await;
+    assert!(status.is_success(), "grantPlatformRole: {status}");
+    let grant = json_body(&body);
+    let grant_id = grant["id"].as_str().unwrap().to_string();
+    assert_eq!(grant["userId"].as_str(), Some(target.as_str()));
+    assert_eq!(
+        grant["grantedBy"].as_str(),
+        Some(admin.as_str()),
+        "the audit row names the granting PERSON, not the account the console was scoped to"
+    );
+    assert!(grant["revokedAt"].is_null());
+
+    // Idempotent: the same call again returns the SAME row, not a second one.
+    let (status, body) = rpc_call(
+        r.clone(),
+        "procedure.grantPlatformRole",
+        Wire::Cbor,
+        &json!({ "args": { "userId": target, "role": "lightbridge-admin" } }),
+        Some("admin"),
+    )
+    .await;
+    assert!(status.is_success());
+    assert_eq!(json_body(&body)["id"].as_str(), Some(grant_id.as_str()));
+
+    // An unknown role is refused rather than written: the row would confer nothing.
+    let (status, _) = rpc_call(
+        r.clone(),
+        "procedure.grantPlatformRole",
+        Wire::Cbor,
+        &json!({ "args": { "userId": target, "role": "lightbridge-admn" } }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a role absent from the configured catalogue must be refused, not silently written"
+    );
+
+    let (status, body) = rpc_call(
+        r.clone(),
+        "procedure.listPlatformRoleGrants",
+        Wire::Cbor,
+        &json!({ "args": { "userId": target } }),
+        Some("admin"),
+    )
+    .await;
+    assert!(status.is_success(), "listPlatformRoleGrants: {status}");
+    let entries = json_body(&body)["entries"].as_array().unwrap().clone();
+    assert_eq!(entries.len(), 1, "one active grant, not two: {entries:?}");
+
+    let (status, body) = rpc_call(
+        r.clone(),
+        "procedure.revokePlatformRole",
+        Wire::Cbor,
+        &json!({ "args": { "grantId": grant_id, "reason": "off call" } }),
+        Some("admin"),
+    )
+    .await;
+    assert!(status.is_success(), "revokePlatformRole: {status}");
+    let revocation = json_body(&body);
+    assert!(!revocation["grant"]["revokedAt"].is_null());
+    assert_eq!(
+        revocation["revokedSessionCount"].as_i64(),
+        Some(1),
+        "revocation must close the person's sessions, or the revoked role keeps being re-minted \
+         from a live refresh chain: {revocation}"
+    );
+    assert_eq!(
+        session_status(&ctx.verify, &target_session).await,
+        "revoked"
+    );
+
+    // Revoking twice is refused rather than re-stamping the audit fact.
+    let (status, _) = rpc_call(
+        r.clone(),
+        "procedure.revokePlatformRole",
+        Wire::Cbor,
+        &json!({ "args": { "grantId": grant_id } }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // Default listing is active-only; the audit view still has the history.
+    let (_, body) = rpc_call(
+        r.clone(),
+        "procedure.listPlatformRoleGrants",
+        Wire::Cbor,
+        &json!({ "args": { "userId": target } }),
+        Some("admin"),
+    )
+    .await;
+    assert!(json_body(&body)["entries"].as_array().unwrap().is_empty());
+    let (_, body) = rpc_call(
+        r.clone(),
+        "procedure.listPlatformRoleGrants",
+        Wire::Cbor,
+        &json!({ "args": { "userId": target, "includeRevoked": true } }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(json_body(&body)["entries"].as_array().unwrap().len(), 1);
+}
+
+/// `getBuildInfo` (#573) dispatches for a viewer and returns the running build's real stamp.
+///
+/// The hermetic sibling in `rpc_router_tests.rs` only proves the RBAC gate lets a zero-permission
+/// caller past; this one goes all the way through cratestack dispatch and asserts the payload the
+/// console's `/settings/info` screen actually deserializes — including that `service` names
+/// `authz-api` (the router under test here) and that the nullable image fields come back as null
+/// rather than empty strings when nothing is running in a container.
+#[tokio::test]
+async fn get_build_info_returns_the_running_builds_stamp_for_a_viewer() {
+    let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(MapBearer::new().with(
+        "viewer",
+        token_info(&format!("build-info-{}", cuid2()), viewer_perms()),
+    ));
+    let ctx = setup(bearer).await;
+
+    let (status, body) = rpc_call(
+        ctx.router.clone(),
+        "procedure.getBuildInfo",
+        Wire::Cbor,
+        &json!({ "args": {} }),
+        Some("viewer"),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "getBuildInfo must need no permission at all: {status}"
+    );
+    let info = json_body(&body);
+    assert_eq!(
+        info["service"].as_str(),
+        Some("authz-api"),
+        "the RPC answer names the same service `GET /version` does: {info}"
+    );
+    for field in [
+        "version",
+        "gitSha",
+        "gitShortSha",
+        "gitCommitDate",
+        "rustcVersion",
+        "buildTime",
+    ] {
+        assert!(
+            info[field].as_str().is_some_and(|v| !v.is_empty()),
+            "`{field}` must be a non-empty string (\"unknown\" when unresolvable, never blank): {info}"
+        );
+    }
+    assert!(info["gitDirty"].is_boolean(), "{info}");
+    for field in ["imageBuildSha", "imageTag", "imageBuildTime"] {
+        assert!(
+            info[field].is_null() || info[field].is_string(),
+            "`{field}` is nullable and never fabricated: {info}"
+        );
+    }
+}
+
+/// `getMyAccess` is allowed for ANY authenticated caller and returns the permission set the SERVER
+/// computed — read back out of the same auth context every `@allow` clause is evaluated against,
+/// never re-derived. Asserted with a VIEWER (who cannot call any `rbac:manage` op at all) precisely
+/// because that is the caller the console most needs it for.
+#[tokio::test]
+async fn get_my_access_returns_the_servers_own_permission_set_for_a_viewer() {
+    let viewer = format!("access-viewer-{}", cuid2());
+    let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(MapBearer::new().with(
+        "viewer",
+        TokenInfo {
+            roles: vec!["lightbridge-viewer".to_string()],
+            ..token_info(&viewer, viewer_perms())
+        },
+    ));
+    let ctx = setup(bearer).await;
+
+    sqlx::query("INSERT INTO users (id) VALUES ($1) ON CONFLICT (id) DO NOTHING")
+        .bind(&viewer)
+        .execute(&ctx.verify)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO accounts (id, user_id, created_at, updated_at) VALUES ($1, $1, now(), now())",
+    )
+    .bind(&viewer)
+    .execute(&ctx.verify)
+    .await
+    .unwrap();
+
+    let (status, body) = rpc_call(
+        ctx.router.clone(),
+        "procedure.getMyAccess",
+        Wire::Cbor,
+        &json!({ "args": {} }),
+        Some("viewer"),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "getMyAccess must need no permission at all: {status}"
+    );
+    let access = json_body(&body);
+    assert_eq!(access["userId"].as_str(), Some(viewer.as_str()));
+    assert_eq!(
+        access["roles"].as_array().unwrap(),
+        &vec![json!("lightbridge-viewer")],
+        "roles are the caller's own raw claim strings: {access}"
+    );
+    let mut permissions: Vec<String> = access["permissions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap().to_string())
+        .collect();
+    permissions.sort();
+    let mut expected: Vec<String> = viewer_perms()
+        .iter()
+        .map(|permission| permission.as_str().to_string())
+        .collect();
+    expected.sort();
+    assert_eq!(
+        permissions, expected,
+        "the compiled permission set, exactly -- not a client-side re-derivation, and not the \
+         whole enum: {access}"
+    );
+    assert!(
+        !permissions.contains(&"rbac:manage".to_string()),
+        "a viewer must not be told they may manage roles: {access}"
+    );
 }

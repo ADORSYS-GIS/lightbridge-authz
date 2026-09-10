@@ -1,0 +1,87 @@
+suite: single-source config rendering (mcp)
+templates:
+  - templates/common.yaml
+release:
+  name: lb
+tests:
+  - it: reads the SAME global.lightbridge.sharedConfig the authz components read
+    set:
+      global.lightbridge.sharedConfig:
+        oauth2:
+          rbac:
+            roles_claim: lightbridge_api_roles
+    documentSelector:
+      path: kind
+      value: ConfigMap
+    asserts:
+      # The shared object supplies the policy; this chart's own `configOverrides` still
+      # supplies the MCP-only allow-list on top of it.
+      - equal:
+          path: data["config.yaml"]
+          value: |
+            oauth2:
+              rbac:
+                roles_claim: lightbridge_api_roles
+            server:
+              api:
+                allowed_hosts:
+                - localhost
+                - 127.0.0.1
+                - 'lb-lightbridge-mcp'
+                - 'lb-lightbridge-mcp:3000'
+                - 'lb-lightbridge-mcp.NAMESPACE.svc.cluster.local'
+                - 'lb-lightbridge-mcp.NAMESPACE.svc.cluster.local:3000'
+
+  - it: keeps the release-derived /mcp allow-list working through the shared renderer
+    documentSelector:
+      path: kind
+      value: ConfigMap
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: "- 'lb-lightbridge-mcp.NAMESPACE.svc.cluster.local:3000'"
+
+  - it: appends mcpAllowedHosts to whatever allowed_hosts the deployment supplied
+    set:
+      global.lightbridge.sharedConfig:
+        server: {}
+      mcpAllowedHosts:
+        - mcp.example.com
+      configOverrides:
+        server:
+          api:
+            allowed_hosts:
+              - only-this-one
+    documentSelector:
+      path: kind
+      value: ConfigMap
+    asserts:
+      - equal:
+          path: data["config.yaml"]
+          value: |
+            server:
+              api:
+                allowed_hosts:
+                - only-this-one
+                - mcp.example.com
+
+  - it: adds nothing to allowed_hosts when mcpAllowedHosts is unset
+    set:
+      global.lightbridge.sharedConfig:
+        server: {}
+      configOverrides:
+        server:
+          api:
+            allowed_hosts:
+              - only-this-one
+    documentSelector:
+      path: kind
+      value: ConfigMap
+    asserts:
+      - equal:
+          path: data["config.yaml"]
+          value: |
+            server:
+              api:
+                allowed_hosts:
+                - only-this-one

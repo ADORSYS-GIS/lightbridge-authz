@@ -1,0 +1,1 @@
+../../.claude/skills/authz-migration/SKILL.md

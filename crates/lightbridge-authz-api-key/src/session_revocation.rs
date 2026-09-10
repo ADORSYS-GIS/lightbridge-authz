@@ -8,6 +8,7 @@ use lightbridge_authz_core::error::Result;
 use lightbridge_authz_core::identity::AccountId;
 
 use crate::db::StoreRepo;
+use crate::entities::session_row::SessionOwnerRow;
 
 impl StoreRepo {
     /// Ends a browser SSO session without disturbing other clients' `offline_access` grants.
@@ -77,5 +78,80 @@ impl StoreRepo {
         .await?;
         tx.commit().await?;
         Ok(revoked_sessions.rows_affected())
+    }
+}
+
+impl StoreRepo {
+    /// Who a session belongs to, and whether it is already revoked — the two facts
+    /// `procedure.revokeSession` (#649) needs to decide whether the caller may act on it, read
+    /// BEFORE anything is written.
+    ///
+    /// `Ok(None)` means no such session: the caller gets a clean not-found, distinct from the
+    /// forbidden a real-but-someone-else's session produces. Keeping the two distinct is safe here
+    /// precisely because a session id is an opaque CUID2 (ADR-0039) that nobody can enumerate — a
+    /// `403` confirms existence only to someone who already had the id.
+    pub async fn find_session_owner(&self, session_id: &str) -> Result<Option<SessionOwnerRow>> {
+        let row = sqlx::query_as::<_, SessionOwnerRow>(
+            r#"
+            SELECT subject, status
+            FROM sessions
+            WHERE id = $1
+            "#,
+        )
+        .bind(session_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row)
+    }
+
+    /// Revokes ONE session and the refresh chain hanging off it, in one transaction.
+    ///
+    /// The missing middle between [`StoreRepo::revoke_sessions_and_cascade`] ("every session this
+    /// subject holds") and [`StoreRepo::revoke_for_logout`] ("the browser ones plus this client's")
+    /// — same two statements, same order, same transaction, keyed on the session's own id instead
+    /// of on `subject`. The refresh-chain `UPDATE` is not optional and not a follow-up: a revoked
+    /// session whose chain is still `active` leaves a working refresh token for a session that is
+    /// gone, which is exactly the hole ADR-0020 Decision 9's cascade requirement closes.
+    ///
+    /// Returns whether THIS call changed anything: `true` when an `active` row flipped to
+    /// `revoked`, `false` when it was already revoked. Idempotent by construction — the `WHERE
+    /// status = 'active'` guard makes a second call a no-op rather than a second state change —
+    /// and the boolean is what `RevokeSessionResult.revoked` reports, mirroring
+    /// `revokeSubjectSessions` answering `revokedCount: 0` for a subject with nothing left.
+    ///
+    /// Callers must have already authorized the action (see
+    /// `lightbridge_authz_rest::session_directory::revoke_session`): this method applies no
+    /// ownership filter, deliberately, because `session:revoke` holders act on sessions that are
+    /// not theirs and the filter would have to be bypassed for them anyway.
+    pub async fn revoke_session_by_id(&self, session_id: &str) -> Result<bool> {
+        let mut tx = self.pool().begin().await?;
+        let revoked = sqlx::query(
+            r#"
+            UPDATE sessions
+            SET status = 'revoked', updated_at = now()
+            WHERE id = $1
+              AND status = 'active'
+            "#,
+        )
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await?;
+        // Runs unconditionally, not only when the session row flipped: a chain left active under
+        // an already-revoked session (possible for a row revoked before this cascade existed) is
+        // exactly the state this is here to clean up, and re-revoking nothing costs one no-op
+        // statement.
+        sqlx::query(
+            r#"
+            UPDATE exchange_refresh_tokens
+            SET status = 'revoked'
+            WHERE status = 'active'
+              AND session_id = $1
+            "#,
+        )
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(revoked.rows_affected() > 0)
     }
 }

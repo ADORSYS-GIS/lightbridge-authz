@@ -47,6 +47,7 @@ fn sample_event(account_id: &str, observed_at: DateTime<Utc>, total_cost: f64) -
     UsageEvent {
         observed_at,
         signal_type: "trace".to_string(),
+        source: Some("eaig".to_string()),
         account_id: Some(account_id.to_string()),
         project_id: None,
         api_key_id: None,
@@ -54,6 +55,9 @@ fn sample_event(account_id: &str, observed_at: DateTime<Utc>, total_cost: f64) -
         user_name: None,
         model: None,
         metric_name: None,
+        azp: None,
+        operation: None,
+        billing_plan: None,
         usage_value: 0.0,
         request_count: 1,
         prompt_tokens: None,

@@ -6,6 +6,18 @@
 **Find any document:** [`docs/README.md`](docs/README.md) is the navigation map for this
 repository's documentation — use it to jump straight to the guide, ADR, or runbook you need.
 
+## Roadmap
+
+**[`docs/ROADMAP.md`](docs/ROADMAP.md)** is the standing status matrix for this repository — every
+workstream, one row per item, each row carrying a state (*Done / Done, unverified in prod / Partial
+/ Missing / Broken / Flaky / Not future-proof / Decision needed*) and a citation. It is where to
+look before planning work: it names what is missing, what is flaky, what is broken, and what is
+waiting on an owner decision rather than on effort.
+
+**Update rule — this is not optional.** A merged PR **updates its own row in the same PR**. A
+roadmap maintained afterwards is a roadmap that lies; a row with no PR/issue/SHA/file citation is a
+rumour and should be deleted rather than believed.
+
 Lightbridge Authz is a multi-service backend for API key management and usage analytics:
 - `authz-api` and `authz-opa` handle key lifecycle and validation.
 - `authz-idp` is the OIDC broker for both the human plane (browser SSO, RFC 8628 device flow, token
@@ -193,7 +205,9 @@ Split across two listeners since #347 — ingest `:3002` (compose) / query `:300
   scopes) — query listener: requires mTLS (#347) **plus** `Authorization: Bearer <end-user access
   token>` and an ownership check against `authz-opa`'s `authorize-usage-scope` for `account`/
   `project` scopes; `scope=all` instead requires the `usage:read-all` permission (#570/#603/#605).
-  `scope=api_key` has no resolvable ownership authority and is always `403`.
+  `scope=api_key` has no resolvable ownership authority and is always `403`. A caller holding
+  `usage:read-all` may query `user`/`project`/`account` with ANY `scope_id` (#648's admin bypass);
+  `api_key` stays refused for them too, and nothing changes for a caller without the permission.
 - `POST /usage/v1/spend/query` (summed spend for an account/period) — query listener: mTLS-only,
   `authz-budget`'s service-to-service reader; refuses any request carrying an `Authorization`
   header (#603).
@@ -209,13 +223,20 @@ Example query body:
   "start_time": "2026-02-20T00:00:00Z",
   "end_time": "2026-02-23T00:00:00Z",
   "bucket": "1 hour",
-  "group_by": ["model"],
+  "group_by": ["model", "azp"],
   "filters": {
-    "signal_type": "metric"
+    "signal_type": "metric",
+    "operation_in": ["chat_completions", "responses", "messages"]
   },
   "limit": 1000
 }
 ```
+
+`usage_events` also carries the three dimensions #648 promoted out of the `attributes` JSONB blob
+into real indexed columns — `azp` (the OAuth client / channel), `operation` (which API surface,
+from the closed vocabulary `chat_completions` | `responses` | `messages` | `embeddings` | `other`)
+and `billing_plan` — each groupable and filterable, plus the `operation_in` set filter. Interim by
+design: #581's `usage_request_events` rewrite carries them forward and drops `usage_events`.
 
 Run locally:
 

@@ -1,35 +1,45 @@
 #[path = "support/mod.rs"]
 mod support;
 
-use axum::body::{Body, to_bytes};
-use axum::http::{Request, StatusCode, header};
-use axum::{Json, body::Bytes, http::HeaderMap};
+use std::sync::Arc;
+
+use axum::{
+    Json,
+    body::{Body, Bytes, to_bytes},
+    http::{HeaderMap, HeaderValue, Request, StatusCode, header},
+};
 use chrono::{Duration, Utc};
-use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
-use lightbridge_authz_core::{Error, Result, async_trait};
-use lightbridge_authz_usage_rest::UsageRepoTrait;
-use lightbridge_authz_usage_rest::UsageState;
-use lightbridge_authz_usage_rest::handlers::ingest::{ingest_logs, ingest_metrics, ingest_traces};
-use lightbridge_authz_usage_rest::handlers::query::query_usage;
-use lightbridge_authz_usage_rest::models::{
-    UsageGroupBy, UsageQueryFilters, UsageQueryRequest, UsageQueryResponse, UsageScope,
-    UsageSeriesPoint,
+use lightbridge_authz_core::{
+    Error, Result, async_trait,
+    db::{DbPool, DbPoolTrait},
 };
-use lightbridge_authz_usage_rest::repo::{StoreRepo, UsageEvent};
-use lightbridge_authz_usage_rest::{build_ingest_router, build_query_router};
-use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
-use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
-use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
-use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
-use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
-use opentelemetry_proto::tonic::metrics::v1::{
-    Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum, metric, number_data_point,
+use lightbridge_authz_usage_rest::{
+    UsageRepoTrait, UsageState, build_ingest_router, build_query_router,
+    handlers::{
+        ingest::{ingest_logs, ingest_metrics, ingest_traces},
+        query::query_usage,
+    },
+    models::{
+        UsageGroupBy, UsageQueryFilters, UsageQueryRequest, UsageQueryResponse, UsageScope,
+        UsageSeriesPoint,
+    },
+    repo::{StoreRepo, UsageEvent},
 };
-use opentelemetry_proto::tonic::resource::v1::Resource;
-use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
+use opentelemetry_proto::tonic::{
+    collector::{
+        logs::v1::ExportLogsServiceRequest, metrics::v1::ExportMetricsServiceRequest,
+        trace::v1::ExportTraceServiceRequest,
+    },
+    common::v1::{AnyValue, KeyValue, any_value},
+    logs::v1::{LogRecord, ResourceLogs, ScopeLogs},
+    metrics::v1::{
+        Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum, metric, number_data_point,
+    },
+    resource::v1::Resource,
+    trace::v1::{ResourceSpans, ScopeSpans, Span},
+};
 use prost::Message;
 use sqlx::postgres::PgPoolOptions;
-use std::sync::Arc;
 use tower::ServiceExt;
 
 #[derive(Debug, Default)]
@@ -76,6 +86,7 @@ fn base_request() -> UsageQueryRequest {
         filters: UsageQueryFilters::default(),
         group_by: vec![UsageGroupBy::Model],
         limit: 100,
+        metrics: None,
     }
 }
 
@@ -158,6 +169,49 @@ async fn build_query_router_serves_probes() {
         StatusCode::OK,
         "the query listener must serve its own health probes independently of the ingest listener"
     );
+}
+
+/// `GET /version` (#573) on BOTH usage listeners, each naming itself.
+///
+/// The two listeners are one process on two ports with different auth postures (#347), so they
+/// report as two distinct services: `authz-usage` (ingest) and `authz-usage-query` (mTLS query).
+/// A support engineer who has curl'd a port needs to know which one answered, and the compiled-in
+/// stamp is identical for both — only the `service` field distinguishes them.
+#[tokio::test]
+async fn both_listeners_serve_version_and_name_themselves() {
+    for (app, expected) in [
+        (usage_app(false), "authz-usage"),
+        (query_app(false), "authz-usage-query"),
+    ] {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/version")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "/version on {expected}");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let info: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(info["service"].as_str(), Some(expected), "{info}");
+        for field in [
+            "version",
+            "gitSha",
+            "gitShortSha",
+            "rustcVersion",
+            "buildTime",
+        ] {
+            assert!(
+                info[field].as_str().is_some_and(|v| !v.is_empty()),
+                "`{field}` must be a non-empty string on {expected}: {info}"
+            );
+        }
+        assert!(info["gitDirty"].is_boolean(), "{info}");
+    }
 }
 
 #[tokio::test]
@@ -305,6 +359,10 @@ async fn query_usage_returns_timeseries_points_when_query_is_valid() {
                 model: Some("gpt-4.1".to_string()),
                 metric_name: Some("gen_ai.usage.total_tokens".to_string()),
                 signal_type: Some("metric".to_string()),
+                source: Some("eaig".to_string()),
+                azp: Some("console-web".to_string()),
+                operation: Some("chat_completions".to_string()),
+                billing_plan: Some("pro".to_string()),
                 requests: 3,
                 total_cost: 42.0,
                 usage_value: 120.0,
@@ -340,6 +398,53 @@ async fn query_usage_returns_timeseries_points_when_query_is_valid() {
 }
 
 /// #570: no `Authorization` header at all -- 401, no data.
+/// #648: an `operation_in` value outside the closed vocabulary is a `400` naming the offending
+/// value, not a silently empty series. A blank chart is indistinguishable from "no usage this
+/// month", and the caller who typed `chat` instead of `chat_completions` would never find out.
+#[tokio::test]
+async fn query_usage_returns_bad_request_for_an_unknown_operation_filter() {
+    let req = UsageQueryRequest {
+        filters: UsageQueryFilters {
+            operation_in: Some(vec!["chat".to_string()]),
+            ..Default::default()
+        },
+        ..base_request()
+    };
+
+    let result = query_usage(
+        axum::extract::State(mock_state()),
+        authorized_headers(),
+        Json(req),
+    )
+    .await;
+
+    assert!(matches!(
+        result,
+        Err(Error::BadRequest(message)) if message.contains("chat") && message.contains("operation_in")
+    ));
+}
+
+/// #648: validation runs AFTER authentication, like every other body check on this handler -- an
+/// unauthenticated caller must not be able to tell a well-formed request from a malformed one.
+#[tokio::test]
+async fn query_usage_refuses_an_unauthenticated_caller_before_validating_filters() {
+    let req = UsageQueryRequest {
+        filters: UsageQueryFilters {
+            operation_in: Some(vec!["chat".to_string()]),
+            ..Default::default()
+        },
+        ..base_request()
+    };
+
+    let response = call_query_usage(mock_state(), HeaderMap::new(), req).await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::UNAUTHORIZED,
+        "a bad filter must not turn a 401 into a 400"
+    );
+}
+
 #[tokio::test]
 async fn query_usage_refuses_missing_bearer_with_401() {
     let response = call_query_usage(mock_state(), HeaderMap::new(), base_request()).await;
@@ -395,6 +500,10 @@ async fn query_usage_refuses_when_scope_authority_declines() {
                 model: None,
                 metric_name: None,
                 signal_type: None,
+                source: None,
+                azp: None,
+                operation: None,
+                billing_plan: None,
                 requests: 1,
                 total_cost: 1.0,
                 usage_value: 1.0,
@@ -608,7 +717,7 @@ async fn ingest_logs_treats_noop_insert_as_success() {
 
     let response = ingest_logs(
         axum::extract::State(state),
-        HeaderMap::new(),
+        headers_with_source(),
         encoded_log_request(),
     )
     .await
@@ -633,7 +742,7 @@ async fn ingest_logs_rejects_invalid_protobuf_as_bad_request() {
 
     let result = ingest_logs(
         axum::extract::State(state),
-        HeaderMap::new(),
+        headers_with_source(),
         Bytes::from_static(b"not protobuf"),
     )
     .await;
@@ -643,6 +752,71 @@ async fn ingest_logs_rejects_invalid_protobuf_as_bad_request() {
         Err(Error::BadRequest(message))
             if message.contains("invalid OTLP logs protobuf payload")
     ));
+}
+
+#[tokio::test]
+async fn ingest_logs_rejects_unknown_source() {
+    let state = Arc::new(UsageState {
+        repo: Arc::new(MockUsageRepo {
+            points: vec![],
+            inserted_events: 0,
+            spend: None,
+            truncated: false,
+        }),
+        bearer: support::trust_no_one_bearer(),
+        scope_authority: support::refuse_everything_scope_authority(),
+    });
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-source", "not-a-real-source".parse().unwrap());
+
+    let result = ingest_logs(axum::extract::State(state), headers, encoded_log_request()).await;
+
+    assert!(matches!(
+        result,
+        Err(Error::BadRequest(message))
+            if message.contains("unknown source")
+    ));
+}
+
+#[tokio::test]
+async fn ingest_logs_rejects_missing_source_header() {
+    let state = Arc::new(UsageState {
+        repo: Arc::new(MockUsageRepo {
+            points: vec![],
+            inserted_events: 0,
+            spend: None,
+            truncated: false,
+        }),
+        bearer: support::trust_no_one_bearer(),
+        scope_authority: support::refuse_everything_scope_authority(),
+    });
+
+    let result = ingest_logs(
+        axum::extract::State(state),
+        HeaderMap::new(),
+        encoded_log_request(),
+    )
+    .await;
+
+    assert!(matches!(
+        result,
+        Err(Error::BadRequest(message))
+            if message.contains("missing x-source")
+    ));
+}
+
+/// `resolve_source` now requires a known `X-Source` header on every ingest request (#584); these
+/// handler-level tests predate that requirement, so they need it added explicitly.
+///
+/// `HeaderValue::from_static` (not `"eaig".parse().unwrap()`) on purpose: it takes no `Result`,
+/// so it needs no `.unwrap()`/`.expect()` -- this is a free helper fn, not a `#[test]` body, so
+/// it falls outside clippy.toml's `allow-unwrap-in-tests` carve-out (that only recognizes
+/// `#[cfg(test)]` modules and `#[test]`/`#[tokio::test]` functions themselves).
+fn headers_with_source() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert("x-source", HeaderValue::from_static("eaig"));
+    headers
 }
 
 fn encoded_log_request() -> Bytes {
@@ -775,7 +949,7 @@ async fn ingest_traces_treats_noop_insert_as_success() {
 
     let response = ingest_traces(
         axum::extract::State(state),
-        HeaderMap::new(),
+        headers_with_source(),
         encoded_trace_request(),
     )
     .await
@@ -800,7 +974,7 @@ async fn ingest_traces_rejects_invalid_protobuf_as_bad_request() {
 
     let result = ingest_traces(
         axum::extract::State(state),
-        HeaderMap::new(),
+        headers_with_source(),
         Bytes::from_static(b"not protobuf"),
     )
     .await;
@@ -809,6 +983,36 @@ async fn ingest_traces_rejects_invalid_protobuf_as_bad_request() {
         result,
         Err(Error::BadRequest(message))
             if message.contains("invalid OTLP trace protobuf payload")
+    ));
+}
+
+#[tokio::test]
+async fn ingest_traces_rejects_unknown_source() {
+    let state = Arc::new(UsageState {
+        repo: Arc::new(MockUsageRepo {
+            points: vec![],
+            inserted_events: 0,
+            spend: None,
+            truncated: false,
+        }),
+        bearer: support::trust_no_one_bearer(),
+        scope_authority: support::refuse_everything_scope_authority(),
+    });
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-source", "not-a-real-source".parse().unwrap());
+
+    let result = ingest_traces(
+        axum::extract::State(state),
+        headers,
+        encoded_trace_request(),
+    )
+    .await;
+
+    assert!(matches!(
+        result,
+        Err(Error::BadRequest(message))
+            if message.contains("unknown source")
     ));
 }
 
@@ -827,7 +1031,7 @@ async fn ingest_metrics_treats_noop_insert_as_success() {
 
     let response = ingest_metrics(
         axum::extract::State(state),
-        HeaderMap::new(),
+        headers_with_source(),
         encoded_metrics_request(),
     )
     .await
@@ -852,7 +1056,7 @@ async fn ingest_metrics_rejects_invalid_protobuf_as_bad_request() {
 
     let result = ingest_metrics(
         axum::extract::State(state),
-        HeaderMap::new(),
+        headers_with_source(),
         Bytes::from_static(b"not protobuf"),
     )
     .await;
@@ -861,6 +1065,36 @@ async fn ingest_metrics_rejects_invalid_protobuf_as_bad_request() {
         result,
         Err(Error::BadRequest(message))
             if message.contains("invalid OTLP metrics protobuf payload")
+    ));
+}
+
+#[tokio::test]
+async fn ingest_metrics_rejects_unknown_source() {
+    let state = Arc::new(UsageState {
+        repo: Arc::new(MockUsageRepo {
+            points: vec![],
+            inserted_events: 0,
+            spend: None,
+            truncated: false,
+        }),
+        bearer: support::trust_no_one_bearer(),
+        scope_authority: support::refuse_everything_scope_authority(),
+    });
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-source", "not-a-real-source".parse().unwrap());
+
+    let result = ingest_metrics(
+        axum::extract::State(state),
+        headers,
+        encoded_metrics_request(),
+    )
+    .await;
+
+    assert!(matches!(
+        result,
+        Err(Error::BadRequest(message))
+            if message.contains("unknown source")
     ));
 }
 
@@ -895,7 +1129,7 @@ async fn ingest_logs_accepts_json_content_type_payload() {
     })
     .to_string();
 
-    let mut headers = HeaderMap::new();
+    let mut headers = headers_with_source();
     headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
 
     let response = ingest_logs(
@@ -912,9 +1146,9 @@ async fn ingest_logs_accepts_json_content_type_payload() {
 
 #[tokio::test]
 async fn ingest_logs_accepts_gzip_encoded_body() {
-    use flate2::Compression;
-    use flate2::write::GzEncoder;
     use std::io::Write;
+
+    use flate2::{Compression, write::GzEncoder};
 
     let state = Arc::new(UsageState {
         repo: Arc::new(MockUsageRepo {
@@ -933,7 +1167,7 @@ async fn ingest_logs_accepts_gzip_encoded_body() {
         .expect("write should succeed");
     let compressed = encoder.finish().expect("gzip encoding should succeed");
 
-    let mut headers = HeaderMap::new();
+    let mut headers = headers_with_source();
     headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
 
     let response = ingest_logs(

@@ -76,16 +76,31 @@
   "bucket": "1 hour",
   "filters": {
     "model": "gpt-4.1",
-    "signal_type": "metric"
+    "signal_type": "metric",
+    "operation_in": ["chat_completions", "responses", "messages"]
   },
-  "group_by": ["model", "metric_name"],
-  "limit": 1000
+  "group_by": ["model", "metric_name", "azp"],
+  "limit": 1000,
+  "metrics": ["totals"]
 }
 ```
 
+`metrics` (optional; **omit it and you get everything**, which is what every caller written before
+2026-09-03 does) selects which metric FAMILIES the query computes:
+
+| value                  | fields                                                                                            | cost |
+|------------------------|---------------------------------------------------------------------------------------------------|------|
+| `totals`               | `requests`, `usage_value`, `prompt_tokens`, `completion_tokens`, `total_tokens`, `total_cost`, `latency_samples` | free -- plain `SUM`/`COUNT` in the pass that already reads the row. Always computed; listing it is a documented no-op. |
+| `latency_percentiles`  | `latency_p50_ms`, `latency_p95_ms`, `latency_p99_ms`                                              | changes the PLAN. See [Query cost](#query-cost-2026-09-03). |
+
+Omitting `latency_percentiles` returns the three percentile fields as `null`, and the response
+echoes back a `metrics` array saying so -- which is what keeps that `null` unambiguous. A point
+with `latency_samples > 0` and `latency_p50_ms: null` means "percentiles were not requested";
+`latency_samples: 0` still means "no row in this bucket reported a latency at all".
+
 ## Response shape and truncation (#578)
 
-The response is `{ "points": [...], "truncated": bool }`. `limit` bounds the number of DISTINCT
+The response is `{ "points": [...], "truncated": bool, "metrics": [...] }`. `limit` bounds the number of DISTINCT
 `bucket_start` values returned, not the number of `points` entries (rows) -- with a non-empty
 `group_by`, each bucket can contribute multiple `points` (one per series), so `points.len()` can
 exceed `limit` even when `truncated` is `false`. `truncated: true` means more than `limit`
@@ -94,6 +109,30 @@ every series for exactly the newest `limit` buckets, in ascending `bucket_start`
 always drops a bucket WHOLE — every series that bucket had, together, never an arbitrary subset of
 one bucket's series while its sibling buckets keep theirs; a bucket that straddles the truncation
 boundary is dropped or kept as a whole bucket, not split (a known caveat tracked as #586).
+
+## Query cost (2026-09-03)
+
+The owner reported the query backend as "very slow". It was: the console's estate-wide 30-day
+overview took **34.8 s** on production. Three independent causes, all fixed in #665, and the
+biggest one is not the one the question assumed:
+
+1. **The table was scanned twice** — #578's bucket-scoped truncation was two statements over the
+   same `WHERE`. `StoreRepo::query_usage` is now one statement.
+2. **87% of the heap is `attributes`, a column no query reads** — it averages 1,445 B and stays
+   inline, so a page holds ~4 rows instead of ~35.
+   `migrations-usage/20260903000002_usage_event_query_covering_index.sql` adds a covering index over
+   the eighteen columns the query actually reads: 279,627 → 13,436 pages on a production-width
+   fixture, 20.8x fewer.
+3. **`percentile_cont` cannot be hash-aggregated** — asking for latency percentiles changes the
+   plan, not just its cost. That is what the `metrics` request field above turns off: send
+   `"metrics": ["totals"]` when the caller does not render percentiles.
+
+**The measurements, the query shape before/after, the rejected alternatives (BRIN, a CTE), the
+log-noise fix and how to re-measure on the read-only replica live in
+[`docs/usage-performance.md`](./usage-performance.md)** — they are not repeated here. The related
+question *"would Timescale hypertables fix this?"* is answered against the same numbers in
+[`docs/plans/0581-multi-source-usage-plan-of-work.md` §0a](./plans/0581-multi-source-usage-plan-of-work.md).
+
 
 ## Scope semantics
 
@@ -110,11 +149,124 @@ boundary is dropped or kept as a whole bucket, not split (a known caveat tracked
   the `usage:read-all` permission (`Permission::UsageReadAll`); `scope_id` is ignored and
   should be sent as `""`.
 
+**Admin bypass (#648).** A caller whose token holds `usage:read-all` may query
+`scope=user`, `scope=project` or `scope=account` with ANY `scope_id`, with no
+ownership round trip to `authz-opa` at all. This is not a widening: that same
+permission already returns every row in the estate through `scope=all`, so
+refusing the same data sliced by one account was a missing feature (it is what
+blocked the console's per-actor usage pages), not a boundary. Two things are
+deliberately unchanged: `scope=api_key` is still refused for **everyone**,
+`usage:read-all` holders included — no permission conjures an ownership authority
+that has never existed for a raw `api_key_id` — and a caller **without** the
+permission sees exactly today's behaviour, `scope=user` self-only and
+account/project through `ScopeAuthority`.
+
 `filters` also accepts `api_key_id` and `user_name` (in addition to `account_id`,
-`project_id`, `user_id`, `model`, `metric_name`, `signal_type`), and `group_by`
-accepts the same set of dimensions. See
+`project_id`, `user_id`, `model`, `metric_name`, `signal_type`), plus the three
+usage dimensions below (`azp`, `operation`, `billing_plan`) and the set-membership
+filter `operation_in`. `group_by` accepts the same set of dimensions. See
 [`docs/lightbridge-query-api.md`](lightbridge-query-api.md) for the full field
 reference.
+
+## Usage dimensions: `azp`, `operation`, `billing_plan` (#648)
+
+Three dimensions the AI gateway has always emitted are stored as real, indexed,
+groupable columns on `usage_events` rather than only inside the `attributes` JSONB
+blob:
+
+| Column | Source attribute keys, first match wins | Meaning |
+|---|---|---|
+| `azp` | `azp`, `x-oidc-azp`, `oauth.azp`, `client_id` | The OAuth client the request arrived on — "which channel". Gateway: `ai-helm` `charts/core-gateway/templates/envoy-proxy.yaml:257`, from Authorino's `x-oidc-azp`. |
+| `billing_plan` | `billing_plan`, `x-billing-plan` | The plan Authorino stamped on the request (`envoy-proxy.yaml:240`). |
+| `operation` | derived from `x-envoy-origin-path`, `http.route`, `url.path`, `route_name` | Which API surface was called. Closed vocabulary, below. |
+
+`operation` is derived at ingest by **path prefix** (a real request target carries a
+query string, so `/v1/chat/completions?stream=true` must still be
+`chat_completions`):
+
+| Path prefix | `operation` |
+|---|---|
+| `/v1/chat/completions` | `chat_completions` |
+| `/v1/responses` | `responses` |
+| `/v1/messages` | `messages` |
+| `/v1/embeddings` | `embeddings` |
+| anything else | `other` |
+| *no path key present at all* | `null` |
+
+The last two rows are different facts and are stored differently on purpose:
+`other` means "a surface was called and we have no name for it", `null` means "this
+signal never told us which surface". Collapsing the second into the first would
+invent data — the same honesty rule `total_cost` and `latency_ms` already follow.
+`operation_in` is a set-membership filter (`operation = ANY($1)`, one bound
+`text[]`) validated against exactly the five values above, so the console's chat
+view asks one query instead of three that can disagree with each other at a bucket
+boundary.
+
+**This bridge is interim and dies with the table.** #581
+(`docs/plans/0581-multi-source-usage-plan-of-work.md`) replaces `usage_events` with
+the `usage_request_events` hypertable and ends with `DROP TABLE usage_events`;
+PR-1b there carries these three columns and this exact vocabulary forward. Total
+surface here: three columns, one backfill, the query-schema additions.
+
+### How a dimension gets from the gateway to a chart
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant GW as Envoy AI Gateway<br/>(access log)
+    participant IN as POST /v1/otel/logs<br/>handlers/ingest.rs
+    participant DB as usage_events<br/>(Postgres)
+    participant Q as POST /usage/v1/usage/query<br/>handlers/query.rs
+    participant C as Console
+
+    GW->>IN: OTLP LogRecord attributes<br/>azp, billing_plan, x-envoy-origin-path
+    Note over IN: extract_string(&attrs, &AZP_KEYS)<br/>extract_string(&attrs, &BILLING_PLAN_KEYS)<br/>derive_operation(&attrs) -- ingest.rs
+    IN->>DB: INSERT ... (azp, operation, billing_plan, attributes)<br/>repo.rs::insert_usage_events
+    Note over DB: the raw attributes blob is written too,<br/>unchanged -- the columns are a projection,<br/>not a replacement
+    C->>Q: {scope, group_by:["azp"],<br/>filters:{operation_in:[...]}}
+    Q->>Q: filters.validate() -- closed vocabulary, else 400
+    Q->>Q: bearer + ownership, or the usage:read-all bypass (#648)
+    Q->>DB: GROUP BY bucket_start, azp<br/>AND operation = ANY($n) -- repo.rs::push_scope_filters
+    DB-->>Q: rows
+    Q-->>C: points[] echoing azp / operation / billing_plan
+```
+
+### A row's `operation`, and why `null` is not `other`
+
+```mermaid
+stateDiagram-v2
+    [*] --> NoPathKey: signal carries none of PATH_KEYS
+    [*] --> PathPresent: signal carries a path key
+
+    NoPathKey --> OperationNull: derive_operation -> None
+    PathPresent --> KnownSurface: prefix matches OPERATION_PREFIXES
+    PathPresent --> Other: prefix matches nothing
+
+    OperationNull --> BackfilledNull: backfill migration finds<br/>no path key in attributes either
+    BackfilledNull --> OperationNull
+
+    OperationNull --> NeverMatched: operation_in filter<br/>(SQL `= ANY` is false for NULL)
+    KnownSurface --> Matched: operation_in filter
+    Other --> Matched: operation_in only if 'other' was asked for
+
+    note right of OperationNull
+        "we do not know which surface"
+        Never rewritten to 'other'.
+        Groups as a null series, filters out.
+    end note
+    note right of Other
+        "a surface we have no name for"
+        A real, storable, filterable value.
+    end note
+```
+
+Every transition above is exercised by a test:
+`operation_derivation_should_cover_the_whole_table` and
+`extract_log_events_should_promote_azp_billing_plan_and_operation_to_columns`
+(`crates/lightbridge-authz-usage/src/handlers/ingest.rs`),
+`operation_in_never_matches_rows_with_a_null_operation` and
+`backfill_derives_the_new_columns_from_the_attributes_blob`
+(`crates/lightbridge-authz-usage/tests/repo_it_tests.rs`).
 
 ## Latency
 
@@ -131,6 +283,12 @@ percentiles rather than a zero. See
 [`docs/lightbridge-query-api.md`](lightbridge-query-api.md)'s "Latency, and when it is legitimately
 absent" for the full source table and the honesty contract consumers are expected to honour.
 
+Since 2026-09-03 the three percentiles are computed by ONE multi-quantile
+`percentile_cont(ARRAY[0.5, 0.95, 0.99])` call rather than three separate ones (each ordered-set
+aggregate builds its own tuplesort, so the old form sorted the same latencies three times), and a
+caller that does not need them can say so with `"metrics": ["totals"]` -- see
+[Query cost](#query-cost-2026-09-03).
+
 ## Migrations
 
 Usage storage migrations are separate from authz migrations:
@@ -138,4 +296,23 @@ Usage storage migrations are separate from authz migrations:
 - `migrations-usage/`
 - migration module: `app/lightbridge-authz-usage/src/migrate.rs`
 
-The primary table is `usage_events` (hypertable when Timescale is available).
+The primary table is `usage_events`. Production is PLAIN POSTGRES: `SELECT count(*) FROM
+pg_extension WHERE extname = 'timescaledb'` is `0` on `lightbridge-main-db` (re-confirmed
+2026-09-03), so `usage_events` is an ordinary table there and nothing may depend on hypertable
+functions or continuous aggregates. `20260223000001`'s `create_hypertable` block is conditional on
+the extension being available and no-ops.
+
+`20260903000002_usage_event_query_covering_index.sql` adds `idx_usage_events_query_cover` -- see
+[Query cost](#query-cost-2026-09-03) for the measurements that justify it and for the BRIN
+alternative that was measured and rejected.
+
+#648's bridge is three files, in this order and for this reason: columns added
+nullable first (`20260902000001`, catalog-only, no rewrite), then the backfill
+(`20260902000002`) as a `-- no-transaction` migration whose single `DO` block
+updates by `id` range in batches of **10 000** and `COMMIT`s each one — so
+autovacuum can reclaim as it goes and a killed run resumes instead of rolling
+back — then the indexes (`20260902000003`), built once over final data. The
+backfill reads `attributes` and never rewrites it, and only touches a row whose
+three columns are all still NULL and whose blob actually yields something, which
+is what makes a re-run free. No `EXCEPTION WHEN OTHERS` anywhere: a migration that
+cannot do its job fails loudly.

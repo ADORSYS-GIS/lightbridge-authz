@@ -106,6 +106,7 @@ async fn start_mcp_server_runs_without_redis_and_never_fails_on_it() {
             ttl_seconds: 300,
             redeem_base_url: "https://auth.example.test".to_string(),
         }),
+        &None,
         lazy_pool(),
     )
     .await;

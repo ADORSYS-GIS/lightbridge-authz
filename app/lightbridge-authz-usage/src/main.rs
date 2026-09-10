@@ -21,6 +21,8 @@ async fn main() -> Result<()> {
         Some(Commands::Serve { config_path }) => Some(config_path),
         Some(Commands::Migrate { config_path }) => Some(config_path),
         Some(Commands::Config { config_path }) => Some(config_path),
+        // `version` reads no config on purpose -- see the subcommand's doc comment.
+        Some(Commands::Version) => None,
         None => None,
     };
 
@@ -50,6 +52,18 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Config { config_path }) => {
             let _ = load_from_path(&config_path)?;
+            Ok(())
+        }
+        Some(Commands::Version) => {
+            let info = lightbridge_authz_core::build_info(crate::utils::cli::SERVICE_CLI);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&info).map_err(|e| {
+                    lightbridge_authz_core::Error::Server(format!(
+                        "failed to serialize build info: {e}"
+                    ))
+                })?
+            );
             Ok(())
         }
         None => {

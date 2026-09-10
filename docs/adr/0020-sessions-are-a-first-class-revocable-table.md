@@ -571,16 +571,36 @@ Implementation tickets this ADR implies, each scoped to land as its own PR:
 3. **Introspection session-status check** (Decision 4): `resolve_exchange_token_context` gains the
    fail-closed session lookup, plus the required "session store unreachable ⇒ error, never
    `active: true`" regression test.
-4. **RPC procedures + RBAC** (Decision 3): `session:read-own`/`session:read` added to
-   `Permission` (`crates/lightbridge-authz-core/src/authz.rs`) and `rpc_authorize.rs`'s op-id map;
-   `listMySessions`/`listSubjectSessions`/`revokeOwnSession`/`revokeSession` added to
-   `authz.cstack`; existing `revokeOwnSessions`/`revokeSubjectSessions` repointed at `sessions`
-   with the refresh-token cascade (Decision 9); role-mapping config
-   (`config/default.yaml`/`.docker/authz/container.yaml`, and any `ai-helm-values` prod
-   equivalent) grants `session:read-own` alongside existing `session:revoke-own` holders.
-5. **UI screen** (`lightbridge-ss`): a session list consuming `listMySessions`, with a per-row
-   "log out this device" action calling `revokeOwnSession`, and copy that states the bounded
-   revocation guarantee from Decision 5 honestly rather than promising instant effect.
+4. ~~**RPC procedures + RBAC** (Decision 3)~~ — **DONE**, lightbridge-authz#649, 2026-09-02. See
+   `docs/sessions-api.md` for the shipped contract and its diagrams. What landed, and how it
+   differs from what this ADR sketched:
+   - `session:read` / `session:read-own` are in `Permission`, in `rpc_authorize.rs`'s op-id map,
+     and `session:read-own` is granted to `lightbridge-editor`/`lightbridge-viewer` in both
+     `default_role_permissions()` and the shipped `config/default.yaml` /
+     `.docker/authz/container.yaml`, exactly as sketched.
+   - **One** read procedure, `querySessions`, not the `listMySessions` + `listSubjectSessions`
+     pair. The pair existed in this sketch because own-scoping was assumed to need two input
+     shapes; it does not. `Session` gained its `@@allow("read", (auth().permSessionRead == true ||
+     subject == auth().id) && ...)` clause instead, which cratestack folds into the SQL `WHERE`, so
+     ONE procedure serves both audiences and an own-scope caller cannot escape their scope with any
+     filter — the enforcement is the schema, not a handler clamp. Named `querySessions` rather than
+     `listSessions` for a codegen constraint, not a design one: cratestack emits
+     `handle_list_sessions` for the generic `model.Session.list` verb, so a procedure of that name
+     is a hard compile error.
+   - Per-session revoke is `revokeSession` as sketched. Its own-vs-other check is in the handler
+     (`session_directory::revoke_session`) and cannot move into the schema: `Session` has no
+     `@@allow("update", ...)` — adding one would light up the generic `model.Session.update` verb,
+     i.e. a way to flip a revoked session back to `active` — and a procedure `@allow` clause can
+     only see `auth()`, never the row an id names.
+   - `revokeOwnSessions`/`revokeSubjectSessions` were already repointed at `sessions` with the
+     cascade by #437/#492 and are untouched by #649.
+   - Two additions this sketch did not anticipate, both driven by what a console session table has
+     to render: `offline` (does the session's refresh chain carry `offline_access`) and
+     `subjectUserId` (the person owning the subject's account, for `resolveUserProfiles`).
+5. **UI screen**: a session list consuming `querySessions`, with a per-row "log out this device"
+   action calling `revokeSession`, and copy that states the bounded revocation guarantee from
+   Decision 5 honestly rather than promising instant effect. Now unblocked by Follow-up 4; the
+   admin-console half is tracked as converse-frontends' `/admin/sessions` story.
 6. **Gateway verification check** (tracked separately, against a real `ai-helm-values` deployment,
    not this repo): confirm whether `"lightbridge-key-active"`'s existing deny-on-`inactive` step
    already covers token-exchange-shaped tokens once this ADR's introspection change ships, per the

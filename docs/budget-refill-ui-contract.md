@@ -56,6 +56,8 @@ mutation requestBudgetRefill(args: {
   original outcome instead of being evaluated twice. Use a fresh UUID/cuid per logical user action
   (one click = one key), not a fixed constant.
 - Returns an `AugmentationRequest` — see "Response shape" below for what to render from it.
+- The authenticated caller is recorded on the row as `requestedByUserId` — see "The requester"
+  below.
 
 Requires the caller to hold `budget:self-refill`. A caller who lacks it gets a `403`; the UI should
 not normally let a user reach this action if their role doesn't carry it, but should still handle a
@@ -191,7 +193,87 @@ The fields a UI actually needs to render, in plain terms (the schema has the exh
 | `policyReasonCodes` | Machine-readable reason codes (e.g. `"within_unaided_allowance"`, `"unaided_allowance_exhausted"`, `"policy_engine_unavailable"`). Useful for debugging/support tooling; not designed to be shown to an end user verbatim — write your own copy per code, or fall back to a generic message for codes you don't have copy for yet. An amount outside `allowedAmountsMicros` never reaches this field at all — it is refused as a request-level `BadRequest` before any `AugmentationRequest` row exists. |
 | `rejectionReason` | Present only when `status == "denied"` **and a human rejected it** (as opposed to a policy denial — see below). Always show this verbatim when present; see "Rejection reasons" below. |
 | `grantId` | Present when a grant was actually issued. Not usually shown directly, but its presence/absence is a reliable way to tell "did this produce money" apart from `status` alone if you want a belt-and-suspenders check. |
+| `requestedByUserId` | **Who asked.** The token subject of the caller that submitted the request — the counterpart to `reviewedBy` (who decided it). Nullable, permanently: see "The requester" below before rendering it. |
 | `createdAt` / `reviewedAt` | Timestamps for queue/history views. |
+
+## The requester (`requestedByUserId`)
+
+`AugmentationRequest.requestedByUserId` is the subject of the authenticated caller at the moment
+`requestBudgetRefill` ran. It is stamped server-side from the token; there is no client-supplied
+requester field and there will not be one, so the value always means "this person asked", never
+"this person was named as the asker".
+
+Three rules for rendering it:
+
+1. **`null` means unknown, not "nobody" and not the account.** Requests created before this field
+   existed carry `null` and nothing can reconstruct them. Render an explicit sentinel
+   ("Unknown — requested before this was recorded") rather than a blank cell, and never fall back
+   to the account id: showing the account in a "Requester" column is exactly the confusion the
+   earlier console column was removed for.
+2. **It is a raw subject id, not a display name.** Resolving it to a name/email is a separate
+   admin-only batch RPC (`resolveUserProfiles`, story A2) reading `federated_identities`; until a
+   screen calls it, show the id truncated or nothing at all — not a fabricated label.
+3. **It is not `reviewedBy`.** The requester is set at creation and never changes; the reviewer is
+   set only when a human decides a `pending_review` request. Both can be present on the same row,
+   and they are usually different people. An auto-approved request has a requester and no reviewer.
+
+An idempotent retry (same `idempotencyKey`) returns the original row, so the requester recorded is
+whoever submitted first — a retry never rewrites it.
+
+It is an **audit** field. No authorization decision reads it: who may request, review, or read is
+decided from the caller's own token (`budget:self-refill` / `budget:review` / `budget:read-own`),
+never from a value stored on the row. Do not build client-side gating on it either.
+
+### Where the requester comes from
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User as Requester (OIDC user)
+    participant Console as Console (converse-frontends)
+    participant RPC as authz-budget · requestBudgetRefill
+    participant Svc as RefillService::request_refill
+    participant Repo as AugmentationRepo
+    participant DB as budget_augmentation_requests
+    actor Admin as Admin reviewer
+
+    User->>Console: pick an offered amount, submit
+    Console->>RPC: POST /budget/rpc/requestBudgetRefill (bearer token)
+    Note over RPC: rpc_authorize has already gated on budget:self-refill<br/>using the token alone — the row is never consulted
+    RPC->>RPC: subject_from_ctx(ctx) → auth().id (401 if absent)
+    RPC->>Svc: RefillRequest { …, requested_by_user_id: Some(subject) }
+    Svc->>Repo: create(NewAugmentationRequest { …, requested_by_user_id })
+    Repo->>DB: INSERT … requested_by_user_id
+    DB-->>Repo: row
+    Repo-->>Svc: AugmentationRequest
+    Svc-->>RPC: AugmentationRequest (after policy evaluation)
+    RPC-->>Console: requestedByUserId = subject
+    Admin->>RPC: listPendingAugmentationRequests
+    RPC-->>Admin: entries[].requestedByUserId (null for pre-#646 rows)
+```
+
+### What the field looks like over a request's lifetime
+
+```mermaid
+stateDiagram-v2
+    [*] --> Unattributed: row written before #646<br/>(requested_by_user_id NULL)
+    [*] --> Attributed: requestBudgetRefill<br/>(requested_by_user_id = auth().id)
+
+    Unattributed --> Unattributed: record_decision / record_review<br/>(stays NULL — never backfilled)
+    Attributed --> Attributed: record_decision / record_review<br/>(reviewed_by is written; requester untouched)
+
+    note right of Unattributed
+        Terminal by design. No source can
+        reconstruct a historical requester,
+        so NULL is permanent, not a to-do.
+    end note
+    note right of Attributed
+        Write-once. There is no transition
+        that changes the requester — an
+        idempotent retry returns this row
+        rather than re-stamping it.
+    end note
+```
 
 ### Why amounts are strings
 
@@ -285,6 +367,9 @@ This RPC surface was built across a PR sequence in `lightbridge-authz` implement
 - #214 — self-service refill orchestration (`RefillService`)
 - #215 — admin review queue (`ReviewService`)
 - the PR that added this doc — wires both into the RPC surface described above
+- #646 — persists the requester (`requested_by_user_id`, migration
+  `20260902000004_budget_augmentation_requests_add_requested_by.sql`) and exposes it as
+  `AugmentationRequest.requestedByUserId`
 
 If this doc doesn't answer a question you have, #191's own body (acceptance criteria,
 implementation notes, the two "will look like bugs" behaviors) and the PRs above are the next place
@@ -300,3 +385,120 @@ landing — see the PR description for the investigation and the tracking follow
 doesn't change anything about how the UI should call these RPCs (a real end-user session token
 works exactly as described above); it's called out here so nobody building against this contract
 assumes that acceptance criterion is already enforced server-side.
+
+---
+
+## Budget reset schedules (ADR-0032, story #651)
+
+Six more procedures on the same `authz-budget` service and the same `/budget/rpc/{op_id}` prefix.
+A **reset schedule** is a standing, operator-authored rule — *"reset remaining to $2.00 every day at
+00:00 UTC for every account on the `free` plan"* — that a background task in `authz-budget`
+executes, writing one grant per matching budget account per window into the same append-only ledger
+every other grant goes to.
+
+Source of truth is again `crates/lightbridge-authz-api/schema/authz.cstack` (search for
+`BudgetResetSchedule`, `listBudgetResetSchedules`, `createBudgetResetSchedule`,
+`updateBudgetResetSchedule`, `deleteBudgetResetSchedule`, `runBudgetResetScheduleNow`,
+`getEffectiveResetSchedule`); the decisions behind them are
+[`docs/adr/0032-budget-reset-schedules.md`](./adr/0032-budget-reset-schedules.md).
+
+### The procedures
+
+| Procedure | Permission | Notes |
+| --- | --- | --- |
+| `listBudgetResetSchedules({})` → `BudgetResetSchedule[]` | `budget:schedule-manage` | Every schedule, enabled or not, oldest first. Unpaginated — this is configuration, not a ledger. |
+| `createBudgetResetSchedule({ name, scopeKind, scopeId?, cadence, anchor?, runAtUtc?, amountMicros, mode, nextRunAt? })` → `BudgetResetSchedule` | `budget:schedule-manage` | **Always created disabled.** There is no `enabled` input field to set. `nextRunAt` forces the first window onto a specific instant; it must be in the future. |
+| `updateBudgetResetSchedule({ id, …all optional… , enabled?, nextRunAt? })` → `BudgetResetSchedule` | `budget:schedule-manage` | Partial. The only way to flip `enabled`. `nextRunAt` forces the next window and outranks the cadence re-seed. |
+| `deleteBudgetResetSchedule({ id })` → `{ id, deleted }` | `budget:schedule-manage` | Removes the future; grants already written stay in the ledger forever. |
+| `runBudgetResetScheduleNow({ id, dryRun })` → `BudgetResetScheduleRunResult` | `budget:schedule-manage` | `dryRun: true` writes **nothing**: no grant, no `nextRunAt` advance, no `lastRunAt`. |
+| `getEffectiveResetSchedule({ budgetAccountId })` → `{ schedule?, nextRunAt? }` | **`budget:read`** | Deliberately NOT `budget:schedule-manage` — this is what a budget card calls. |
+
+### `BudgetResetSchedule`
+
+```
+{
+  id: string
+  name: string
+  scopeKind: "global" | "billing_plan" | "account"
+  scopeId?: string        // null for global; a billing-plan name, or an account id
+  cadence: "daily" | "weekly" | "monthly"
+  anchor?: number         // ISO weekday 1..7 (weekly), day of month 1..28 (monthly), null (daily)
+  runAtUtc: string        // "HH:MM", always UTC
+  amountMicros: string    // integer micro-USD as a string — see "Why amounts are strings" above
+  mode: "reset" | "top_up"
+  enabled: boolean
+  nextRunAt: string       // ISO-8601
+  lastRunAt?: string
+  createdBy?: string
+  createdAt: string
+  updatedAt: string
+}
+```
+
+`scopeKind`/`cadence`/`mode` are plain strings carrying the exact wire values above, the same
+convention `Decision.effect` already uses. A cadence sentence renders straight off these fields:
+*"Reset remaining to $2.00 every day at 00:00 UTC"*.
+
+### The four behaviors that need explicit copy
+
+**1. `reset` clamps BOTH ways.** `delta = amount − (effectiveBudget − spendToDate)`. When an
+account has MORE remaining than the target, the schedule writes a **negative** row — `source:
+"correction"`, the compensating entry the append-only ledger defines — and remaining lands exactly
+on the target. A reset is not only a top-up with a ceiling; it can take budget away, and the UI
+copy must say so before anyone enables a global one. An account already exactly on target gets no
+row at all.
+
+**2. Only the most specific schedule fires.** Precedence is `account` > `billing_plan` > `global`;
+at equal specificity the oldest wins; disabled schedules are invisible to precedence. So an account
+covered by all three sees exactly one grant, from the account-scoped one — and disabling that
+override silently hands the account back to the plan schedule. A list view should say which
+schedule actually governs which accounts rather than implying all matching ones apply.
+
+**3. Preview before enabling, and mean it.** `runBudgetResetScheduleNow({ id, dryRun: true })`
+returns `entries: [{ budgetAccountId, remainingMicros, deltaMicros }]` — the exact rows a real run
+would write, from the exact same code path — plus `deferredAccountIds` (accounts whose spend could
+not be read; they would get nothing) and `supersededAccountIds` (accounts a more specific schedule
+covers). Show the first ~25 entries and the two id counts. `deltaMicros` is never zero.
+
+`runBudgetResetScheduleNow` with `dryRun: false` fires the schedule's **pending window** — the same
+`triggerKey` the scheduled tick would have used — so a manual fire followed by the tick catching up
+cannot double-grant.
+
+**4. An operator can force the next execution onto a date.** `nextRunAt` is optional on both
+`createBudgetResetSchedule` and `updateBudgetResetSchedule`. Set it and that instant becomes the
+schedule's window verbatim; omit it and the cadence decides, exactly as before. Two rules the UI
+must carry:
+
+- **It must be strictly in the future.** A past (or exactly-now) instant is a `400` whose message
+  names the rule — a backdated window would fire on the very next 60-second tick, across every
+  account the schedule matches, before anyone had dry-run it. Validate client-side too, so the
+  operator sees it before the round trip.
+- **It is a ONE-OFF, not a new grid.** Once the forced window fires, the schedule returns to its own
+  cadence at its own `runAtUtc`. A daily schedule forced onto `2026-09-15T09:30Z` next fires
+  `2026-09-16T00:00Z`, not `2026-09-16T09:30Z`; a Wednesday-anchored weekly schedule forced onto a
+  Tuesday is back on Wednesday afterwards. A list view can therefore render a `nextRunAt` that is
+  **off the cadence grid** — that row is a forced one, and saying so is more honest than letting the
+  reader infer a cadence that does not exist.
+
+Forcing a date does **not** bypass create-disabled: a new schedule is still created disabled and a
+human still has to enable it.
+
+### The honest caption (required)
+
+> Schedules change the ledger balance and the minted budget tier; gateway rate limits still follow
+> the plan buckets until lightbridge-authz Phase 6a lands.
+
+This is the same gap ["Today, a refill has no gateway effect at all"](#2-today-a-refill-has-no-gateway-effect-at-all--not-until-the-next-token-refresh-none)
+above documents, and it applies identically to reset schedules. A fired schedule changes
+`budget_balances` and the `budget_tier` claim minted at token exchange; it does not change what a
+request experiences at the Envoy gateway. Do not ship a schedules screen without this line.
+
+### Auditing what fired
+
+Every scheduled grant is visible through `listBudgetGrants` with no new procedure:
+
+- `source: "automatic"` for a top-up or a reset-up, `source: "correction"` for a reset-down.
+- `triggerKey` is `"<scheduleId>:<windowStartIso>:<budgetAccountId>"` — filter or group on the
+  leading segment to see everything one schedule ever did.
+- `reason` carries the schedule's name and the window, e.g.
+  `budget reset schedule 'free plan daily' (reset) for window 2026-09-03T00:00:00+00:00`.

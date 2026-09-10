@@ -53,6 +53,130 @@ Authorization is unchanged by the move: every procedure keeps its exact permissi
 else's budget) survives verbatim — the split only changes which host and path prefix serves a
 call, never what a caller needs to hold to make it.
 
+## The gateway's remaining-budget read (ADR-0034)
+
+`authz-budget` binds a **second, shared-secret-gated listener** (`config::BudgetInternalServer`,
+config key `server.budget_internal`) serving exactly one route:
+
+```
+GET /budget/v1/remaining?account_id=<budget account id>[&period=YYYY-MM]
+
+200 {"budget_account_id","period","ceiling_micros","spent_micros","remaining_micros",
+     "next_reset_at","source_lag_seconds"}
+400 {"error":"bad_request","message":…}              malformed account id / period
+401 {"error":"unauthorized","message":…}             the shared secret was missing or wrong
+403 {"error":"forbidden","message":…}                an Authorization header was present
+404 {"error":"unknown_account","account_id":…}       the id names no account
+503 {"error":"budget_unavailable","message":…}       the answer is not knowable right now
+```
+
+It is the data-plane half of the budget domain — the read the gateway's Dynamic Budget Limiter
+makes, per identity per Authorino cache TTL, so that a refill takes effect at the gateway without
+any claim, any token refresh, or any tier ladder. See
+[`docs/adr/0034-dynamic-budget-limiter.md`](../adr/0034-dynamic-budget-limiter.md) for the whole
+chain (AuthConfig `metadata` → ext_authz dynamic metadata → an Envoy Lua filter that answers `402
+budget_exhausted`), and for why the enforcement decision deliberately does **not** live here.
+
+Four properties, each of which is a decision:
+
+- **A separate listener, not a route.** The console's bearer-JWT RPC surface stays untouched, and
+  this route's credential cannot be bypassed by hitting a sibling route — the same split, for a
+  related reason, as `lightbridge-authz-usage`'s ingest/query listeners (#347).
+- **A shared secret, not mTLS — ADR-0034's 2026-09-03 amendment.** The ADR first specified
+  `Tls::client_ca_bundle_path`, copying #347. That was checked against the deployed CRD and does
+  not work: Authorino **v0.24.0**'s `AuthConfig.spec.metadata.http` exposes `body`,
+  `bodyParameters`, `contentType`, `credentials`, `headers`, `method`, `oauth2`, `sharedSecretRef`,
+  `url` and `urlExpression` — nothing that references a client key/certificate — and the deployed
+  pod mounts only `ca.crt`. An mTLS-only listener would fail every metadata handshake, leaving the
+  value absent and 503-ing every model request. So the route takes the credential Authorino *can*
+  send: a `sharedSecretRef` value in a custom header (`credentials.customHeader`). `shared_secret`
+  is **mandatory** — `start_budget_server` refuses to start without it — and
+  `tls.client_ca_bundle_path` must stay unset, which startup also enforces. A NetworkPolicy
+  restricting the port to the gateway namespace is the second layer. Like `/usage/v1/spend/query`,
+  the route additionally refuses any request carrying an `Authorization` header (`403`), before the
+  credential is even looked at.
+- **It reports, it does not decide.** The body is `ceiling_micros` (the expiry/revocation-aware
+  `BudgetRepo::effective_balance`, not the raw `budget_balances` projection — an expired grant must
+  not buy gateway traffic), `spent_micros`, their signed difference, `next_reset_at`, and
+  `source_lag_seconds`. Thresholding is the gateway's job.
+- **Unknown is never zero.** An unreadable ledger or an unreachable usage service is
+  `503 {"error":"budget_unavailable"}`, never a `200` with `remaining_micros: 0` — those two produce
+  opposite correct behaviours at the gateway, and conflating them would bill a user's
+  exhausted-budget page for our own outage.
+- **A non-existent account is never zero either** (owner directive 2026-09-03, ADR-0034 §3.3). An
+  id that matches no `accounts` row is `404 {"error":"unknown_account","account_id":…}`. It has to
+  be a distinct answer because `effective_balance` is a `COALESCE(SUM(...), 0)`: a row-less account
+  and a non-existent one both sum to `0`, so before this a typo in an identity mapping reached the
+  gateway as an ordinary `402 budget_exhausted` for a phantom account.
+
+  **"Unknown" means exactly one thing here: no row in `accounts` whose `user_id` resolves to a row
+  in `users`.** The ledger keys on `accounts.id` — `budget_grants.budget_account_id` is
+  `TEXT NOT NULL REFERENCES accounts(id)` — not on `users.id`, because ADR-0026 lets one identity
+  own many accounts. The `users` join is the ADR-0014 intra-DB read pattern, the same join the
+  reset scheduler's account enumeration uses (#653). Three things are deliberately **not**
+  unknown: a real account with **no grants this period** (`200`, `ceiling_micros: 0` — the state of
+  every account before its first grant, and the same figure the console's Budget card shows for
+  it; the policy's `starting_amount_micros` materialises only when a grant is actually booked, and
+  this endpoint never reports an amount the ledger has not booked); a **suspended** account
+  (`200` — suspension is enforced upstream, via `effective_status`); and an **unreadable**
+  database (`503` — the existence probe's own failure is an error, never a `404`). The probe runs
+  in front of the spend read, so an unknown id answers `404` even during a usage-service outage.
+- **A bounded grace window.** `RemainingService` keeps the last known `spent_micros` per
+  `(account, period)` and serves it for up to `remaining_grace_seconds` (default 120) while the
+  usage service is unreachable, stamping the reading's age into `source_lag_seconds`. Only the
+  spend half is cached: the ceiling is re-read every time, so a refill that lands *during* an
+  outage takes effect immediately. This lives here because neither component downstream can express
+  it — Envoy's Lua filter has no cross-request state, and Authorino's metadata cache drops an entry
+  on a failed fetch rather than serving it stale.
+
+The service is built over the SAME `BudgetRepo`, the SAME fail-closed `SpendReader` and the SAME
+`ResetScheduler` the RPC surface uses (`budget_services::BudgetServices`), so the number the gateway
+enforces on can never disagree with the number a refill decision or a reset tick would compute.
+
+### The four answers, and what each one means downstream
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant AZ as Authorino
+    participant B as authz-budget :3007<br/>budget_remaining
+    participant DB as Postgres
+    participant U as authz-usage
+
+    AZ->>B: GET /budget/v1/remaining?account_id=…
+    B->>DB: does this account exist? (accounts ⨝ users)
+    DB-->>B: yes / no / read failed
+    B->>DB: effective_balance (only when the account exists)
+    B->>U: spend for (account, period)
+    B-->>AZ: 200 numbers | 404 unknown_account | 503 budget_unavailable
+```
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> Answered
+
+    Answered --> UnknownAccount: no accounts row
+    Answered --> KnownBalance: account exists, both halves readable
+    Answered --> NotKnowable: ledger unreadable OR spend unaskable<br/>(past the grace window)
+
+    UnknownAccount --> Gateway404: 404 unknown_account
+    KnownBalance --> GatewayPass: 200, remaining > 0
+    KnownBalance --> Gateway402: 200, remaining <= 0 → budget_exhausted
+    NotKnowable --> Gateway503: 503 budget_unavailable
+
+    note right of Gateway404
+        Authorino cannot branch on a metadata step's status, so
+        today the gateway sees this as an ABSENT value and refuses
+        with 503 budget_unavailable — fail-closed, and no longer
+        mistakable for 402. ADR-0034 §3.3 proposes turning it into a
+        distinct 403 unknown_account; not implemented.
+    end note
+```
+
+The one edge that does **not** exist here is the one this endpoint is about: nothing reaches
+`Gateway402` from an account the ledger has never heard of.
+
 ## Augmentation request lifecycle
 
 `budget_augmentation_requests` carries the exact state machine from the RFC's "Domain (ADR-0009)"
@@ -109,7 +233,7 @@ flowchart TD
     Idem -- yes --> Existing["return existing request\n(no re-evaluation)"]
     Idem -- no --> Offered{"requested_amount_micros\nin allowed_amounts_micros?\n(ADR-0015, active policy)"}
     Offered -- no --> DenyAmount["Err: AmountNotOffered\n(policy engine never called)"]
-    Offered -- yes --> Create["create budget_augmentation_requests row\n(status = created)"]
+    Offered -- yes --> Create["create budget_augmentation_requests row\n(status = created,\nrequested_by_user_id = auth().id)"]
     Create --> Facts["gather Facts:\neffective_balance_micros (BudgetRepo)\nself_service_grant_count (budget_balances)\nspend_this_period, spend_last_period (SpendReader)"]
     Facts --> Engine["PolicyEngine::evaluate(Facts, requested_amount)"]
     Engine -- Err --> EngineDown["pending_review:\npolicy_engine_unavailable"]
@@ -241,6 +365,16 @@ see "Service boundary" above.
   `listBudgetGrants` (`budget:audit-read`) (both admin, arbitrary-target).
 - Direct admin grant/revoke: `grantBudget` (`budget:grant`), `revokeBudgetGrant`
   (`budget:revoke`).
+- Budget reset schedules (ADR-0032): `listBudgetResetSchedules` / `createBudgetResetSchedule` /
+  `updateBudgetResetSchedule` / `deleteBudgetResetSchedule` / `runBudgetResetScheduleNow` (all
+  `budget:schedule-manage`), plus `getEffectiveResetSchedule` (`budget:read`, deliberately NOT the
+  manage permission — it is what a per-account budget card reads). These are the RPC face of the
+  one background job this process runs: `start_budget_server` spawns a 60-second
+  `tokio::time::interval` task driving `ResetScheduler::tick`, which claims due
+  `budget_reset_schedules` rows with `FOR UPDATE SKIP LOCKED` (replica-safe) and writes one grant
+  per matching account per window. A `reset` clamps remaining BOTH ways: a negative delta is booked
+  as the `source = 'correction'` compensating row, never a mutation. See
+  [`docs/adr/0032-budget-reset-schedules.md`](../adr/0032-budget-reset-schedules.md).
 
 See [`docs/rbac.md`](../rbac.md) for the authoritative permission table and the full self-vs-admin
 reasoning; the list here is derived from `rpc_authorize.rs`'s `required_permission` map, not

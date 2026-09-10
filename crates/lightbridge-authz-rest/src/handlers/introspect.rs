@@ -77,6 +77,12 @@ async fn introspect_api_key_row(
         "api key introspection resolved active"
     );
 
+    // ADR-0034 §15: the budget rides on THIS response, so the gateway needs one metadata call per
+    // request instead of two. `None` (absent fields) is "unknown", never a zero balance.
+    let budget = state
+        .budget
+        .read_and_touch(&state.repo, &validated.account_id)
+        .await;
     let plan = state.billing.get(&validated.api_key.billing_plan);
     if plan.is_none() {
         tracing::warn!(
@@ -103,6 +109,9 @@ async fn introspect_api_key_row(
         role: validated.owner_role.clone(),
         quota_tier: validated.owner_quota_tier.clone(),
         exp: validated.api_key.expires_at.map(|value| value.timestamp()),
+        budget_remaining_micros: budget.map(|b| b.remaining_micros),
+        budget_next_reset_at: budget.and_then(|b| b.next_reset_at),
+        budget_snapshot_age_seconds: budget.map(|b| b.snapshot_age_seconds),
     };
 
     Ok((StatusCode::OK, Json(response)).into_response())
@@ -125,6 +134,12 @@ async fn introspect_exchange_token(
         return Ok((StatusCode::OK, Json(IntrospectResponse::inactive())).into_response());
     };
 
+    // ADR-0034 §15, same as the API-key branch: a native RFC 8693 exchange session is metered
+    // against its own budget account, and its introspection carries the balance too.
+    let budget = state
+        .budget
+        .read_and_touch(&state.repo, &ctx.account_id)
+        .await;
     let plan = state.billing.get(&ctx.project.billing_plan);
     if plan.is_none() {
         tracing::warn!(
@@ -150,6 +165,9 @@ async fn introspect_exchange_token(
         role: ctx.role,
         quota_tier: ctx.quota_tier,
         exp: None,
+        budget_remaining_micros: budget.map(|b| b.remaining_micros),
+        budget_next_reset_at: budget.and_then(|b| b.next_reset_at),
+        budget_snapshot_age_seconds: budget.map(|b| b.snapshot_age_seconds),
     };
 
     Ok((StatusCode::OK, Json(response)).into_response())

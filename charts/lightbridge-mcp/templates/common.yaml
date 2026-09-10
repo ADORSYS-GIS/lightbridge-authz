@@ -1,1 +1,17 @@
+{{- /*
+`mcpAllowedHosts` appends operator-supplied Host authorities to the `/mcp` DNS-rebinding
+allow-list. It cannot be expressed in values.yaml any more: `server.api.allowed_hosts` now
+lives in `configOverrides` as REAL YAML data (not inside a `|` string blob), and a values
+file cannot carry a structural `{{ range }}`. So the append happens here, before delegating
+to the bjw-s common loader — the same pre-processing pattern
+charts/lightbridge-authz-usage/templates/common.yaml already uses.
+
+Appending (rather than deriving the whole list here) is deliberate: a deployment that
+replaces `configOverrides.server.api.allowed_hosts` outright gets exactly the list it
+asked for, plus nothing, unless it also sets `mcpAllowedHosts`.
+*/ -}}
+{{- with (.Values.mcpAllowedHosts | default list) }}
+  {{- $api := dig "server" "api" dict ($.Values.configOverrides | default dict) }}
+  {{- $_ := set $api "allowed_hosts" (concat ($api.allowed_hosts | default list) .) }}
+{{- end }}
 {{- include "bjw-s.common.loader.all" . -}}

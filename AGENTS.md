@@ -5,7 +5,20 @@ This repository provides API key management plus usage analytics:
 - `authz-api`: OAuth2/JWT-protected CRUD API for Accounts, Projects, and API keys.
 - `authz-budget`: OAuth2/JWT-protected RPC API for the budget domain (policy lifecycle,
   self-service refill, the admin review queue, and direct balance/ledger reads/writes) — carried
-  off `authz-api` as a hard cutover (ADR-0010, #351).
+  off `authz-api` as a hard cutover (ADR-0010, #351). Since ADR-0034 it also binds a **second,
+  shared-secret-gated listener** (`server.budget_internal`) serving one route,
+  `GET /budget/v1/remaining` — the live `ceiling − spend` read the gateway's Dynamic Budget Limiter
+  makes through Authorino, so a refill counts at the gateway without any claim or token refresh.
+  Separate listener so the console's bearer-JWT surface is untouched and this route's credential
+  cannot be bypassed by hitting a sibling route. **Not mTLS**, unlike `lightbridge-authz-usage`'s
+  query listener (#347): Authorino v0.24.0's `AuthConfig.spec.metadata.http` has no field that
+  references a client certificate, so an mTLS-only listener would be unreachable by its only
+  caller (ADR-0034's 2026-09-03 amendment). `shared_secret` is mandatory — the server refuses to
+  start without it, and refuses to start WITH a `tls.client_ca_bundle_path`, which would demand a
+  certificate Authorino cannot present. `503 budget_unavailable` is never a zero balance, and since
+  the 2026-09-03 owner directive (ADR-0034 §3.3) an id matching no `accounts` row is
+  `404 unknown_account` rather than a `200` with `remaining_micros: 0` — a real account with no
+  grants yet stays a `200` with `ceiling_micros: 0`. See `docs/architecture/budget.md`.
 - `authz-opa`: Basic-auth protected validation API intended to be called by Authorino (or similar external auth components). It validates API keys and returns rich context plus dynamic metadata, and is also the ownership authority for the usage query API (`POST /idp/v1/authorize-usage-scope`, #570).
 - `authz-idp`: OIDC broker server (ADR-0012, ADR-0019, ADR-0023) exposing
   `.well-known/openid-configuration`, `.well-known/jwks.json`, `/oauth2/token`, `/oauth2/revoke`,
@@ -57,6 +70,33 @@ today has no effect on, the Envoy/Authorino-side rate limiting
 `docs/governance-model-and-enforcement.md` describes.
 
 This file documents structure, architecture, workflows, and practices for contributors and agents working on this codebase.
+
+**Repository status matrix:** [`docs/ROADMAP.md`](docs/ROADMAP.md) — what is done, missing, broken,
+flaky, not future-proof or waiting on an owner decision; a merged PR updates its row in the same PR.
+
+## Skills and agents
+
+**This file is the entry point.** It is read directly by Claude Code (via the `CLAUDE.md` symlink),
+GitHub Copilot in VS Code, OpenCode, Antigravity/Gemini (via the `GEMINI.md` symlink), Cursor and Roo
+(via `.roo/rules/AGENTS.md`). Task-level playbooks live beside it as **skills**, and role definitions
+as **agents** — one copy each, surfaced to every other harness through committed relative symlinks.
+The link map, and what each harness picks up without configuration, is
+[`docs/agent-harnesses.md`](docs/agent-harnesses.md).
+
+**Skills** (`.claude/skills/<name>/SKILL.md`):
+
+| Skill | Read it when |
+| --- | --- |
+| `authz-procedure` | Adding, renaming or re-gating a cratestack RPC procedure or a `Permission` — nine places move together |
+| `authz-migration` | Anything under `migrations/` or `migrations-usage/`: prefix collisions, sqlx transaction semantics, batched backfills, fail-loud |
+| `authz-verify` | Before claiming a Rust change here is verified — private `CARGO_TARGET_DIR`, the DB-backed suites, the LoC gate and its split convention |
+| `authz-release-verify` | After merging — CI concurrency, the cosign gate, the ArgoCD pin, `GET /version` |
+| `governance-pr` | Opening any PR or issue in this repo |
+| `usage-query-perf` | A usage/spend query is slow, or you are about to propose an index or a storage change |
+
+**Agents** (`.claude/agents/<name>.md`): `authz-implementer` (implements one scoped story and ships
+it), `authz-verifier` (**read-only** — runs the checks and reports what is true), `docs-curator`
+(writes and maintains the docs under the citation/diagram/no-duplication rules).
 
 ## Quick Reference - Build/Test Commands
 
@@ -406,6 +446,14 @@ Tables (see `migrations/`):
   backfilled/trigger-provisioned account's own id verbatim (an id-reuse, not a new mint — ADR-0039
   bans minting, not storing) — the fresh-`cuid2()`-for-a-brand-new-person case no longer arises,
   since a federated identity can no longer exist without an adopted account.
+- `platform_role_grants` (ADR-0033; deliberately absent from `authz.cstack` — see "Persistence"
+  below): `(id, user_id -> users.id, role, granted_by NULL = CLI bootstrap, granted_at,
+  revoked_at NULL = active, reason)`, with a PARTIAL unique index over active `(user_id, role)`.
+  Keyed on the PERSON, not an account — a platform role follows the human across every account
+  they own (ADR-0026). `ClaimSource::PlatformRoles` reads the active rows at token mint and unions
+  them into the roles claim alongside `ClaimSource::ProjectRole`; `lightbridge-authz rbac grant` is
+  the bootstrap writer (there is no admin to grant the first admin). Before this, prod mapped
+  `owner -> lightbridge-admin`, which under ADR-0026 minted admin for every signed-in person.
 - `federated_identities` (ADR-0024, corrected 2026-08-25; deliberately absent from `authz.cstack`
   — see "Persistence" below): keyed by `(issuer, subject)`, the login federation key. Carries the
   sealed Keycloak token set (`token_envelope`, AES-256-GCM, `lightbridge_authz_core::crypto`) —
@@ -460,7 +508,11 @@ API keys are stored as:
   never displaces a good one (`PolicyStore`).
 - `budget_augmentation_requests`: one row per self-service refill request, from creation through
   auto-approval or admin approve/reject — the audit trail for "who asked, what decided, who
-  reviewed."
+  reviewed." "Who asked" is `requested_by_user_id` (the caller's token subject, stamped at
+  `requestBudgetRefill`, #646) and "who reviewed" is `reviewed_by`; they are different columns and
+  usually different people. `requested_by_user_id` is NULL for rows predating
+  `migrations/20260902000004_budget_augmentation_requests_add_requested_by.sql` and is never
+  backfilled — NULL means unknown. It is an audit column: no authorization path reads it.
 
 ### Identifier Format (CUID2)
 
@@ -484,6 +536,19 @@ read, never rewritten, never regenerated into our own format.
   would break federation with any IdP that doesn't happen to issue UUID- or CUID2-shaped subjects.
 - **Never sort or paginate by id** — CUID2 has no ordering. Use `created_at`.
 - **Store as `TEXT`**; no native `uuid` columns, no `DEFAULT gen_random_uuid()`.
+
+**One deliberate exception, documented here so it is not "fixed" by accident:** the execution
+grain's ids in the usage store (`usage_executions.id = exec_{source}_{trace_id}_{span_id}`,
+`usage_model_calls.id = {source}_{trace_id}_{span_id}:mc`,
+`usage_tool_calls.id = {source}_{trace_id}_{span_id}:tc`, #582) are **span-derived, not CUID2**.
+This is required, not a lapse: OTLP exports child spans before their parent execution span, so
+ingest must be able to derive a child's `execution_id` from the child's `parent_span_id` *before
+the parent row exists* — a minted CUID2 would be unknowable to the child. The span-derived id is
+what makes the child-before-parent link (and the stub-execution contract) work. The id embeds
+`source`, `trace_id` AND `span_id` (an OTLP `span_id` is only unique within a trace, and
+`trace_id` only within a source), and the dedup key `UNIQUE (source, trace_id, span_id)` is
+deliberately bijective with it. Do not "fix" these to `cuid2()` without first solving the
+child-before-parent linking problem; see the `20260907000002_usage_executions.sql` header.
 
 ### Service Responsibilities
 
@@ -759,6 +824,18 @@ Check health:
 - `curl -k https://localhost:13004/healthz` (`authz-idp`)
 - `curl -k https://localhost:13005/healthz` (`authz-budget`)
 
+Check WHICH BUILD is running (#573, `docs/build-info.md`) — `GET /version` is mounted beside the
+probes on every listener and is unauthenticated for the same reason `/healthz` is. It reports the
+crate version, git SHA + commit date, rustc version, build time, and (inside a container) the image
+build SHA/tag. Same struct over RPC as `getBuildInfo` for the console, and the same JSON from
+`lightbridge-authz version` / `lightbridge-authz --version` at a shell:
+
+- `curl -k https://localhost:13000/version` (`authz-api`)
+- `curl -k https://localhost:13001/version` (`authz-opa`)
+- `curl -k https://localhost:13002/version` (`authz-usage`)
+- `curl -k https://localhost:13004/version` (`authz-idp`)
+- `curl -k https://localhost:13005/version` (`authz-budget`)
+
 OpenAPI docs:
 
 - CRUD API: removed. Swagger UI/OpenAPI generation for the CRUD API was dropped as part of the cratestack migration (see `docs/adr/0003-cratestack-crud-migration.md`); the generated cratestack Rust client is now the primary integration contract.
@@ -816,7 +893,7 @@ These tests include:
 
 ### Persistence tests (it-tests)
 
-The Postgres-backed `lightbridge-authz-api-key` tests (rotate/limits), `lightbridge-authz-budget` tests (ledger writes, replay, policy store, refill/review services), and `lightbridge-authz-usage-rest` tests (`repo_it_tests`, `spend_query_it_tests`, `scope_ownership_it_tests`) are guarded by the `it-tests` feature so they only compile/run when requested. This keeps the default `cargo test` free of database setup, and lets us treat these as Docker-backed integration tests.
+The Postgres-backed `lightbridge-authz-api-key` tests (rotate/limits), `lightbridge-authz-budget` tests (ledger writes, replay, policy store, refill/review services), and `lightbridge-authz-usage-rest` tests (`repo_it_tests`, `spend_query_it_tests`, `scope_ownership_it_tests`, `seed_it_tests` — the last the #528 seed-then-query roundtrip proof) are guarded by the `it-tests` feature so they only compile/run when requested. This keeps the default `cargo test` free of database setup, and lets us treat these as Docker-backed integration tests.
 
 Run them with `just it-tests`, which brings up the `postgresql`/`redis` services, waits a moment, then sets `DATABASE_URL="postgres://postgres:postgres@localhost:5432/lightbridge_authz"` before invoking `lightbridge-authz-api-key`, `lightbridge-authz-budget`, `lightbridge-authz-rest`, and `lightbridge-authz-usage-rest` with `--features it-tests`. These tests exercise the migrations under `sqlx::test` — `lightbridge-authz-usage-rest`'s own migrations under `migrations-usage/` are deliberately written to run against this same plain Postgres, not a dedicated TimescaleDB (production runs plain Postgres today; Timescale-shaped CI is deferred to a later phase of #581, gated on that epic's storage-image decision).
 
@@ -930,10 +1007,23 @@ Traces capture the full lifecycle of a validation request, including database lo
     `lightbridge-admin` by default, #605). `scope=api_key` has no resolvable ownership authority
     and is refused unconditionally. Missing/invalid bearer -> `401`; unauthorized, or the
     authority being unreachable/erroring -> `403`, fail-closed, never treated as authorized.
+    **Since #648 a caller holding `usage:read-all` may query `user`/`project`/`account` with ANY
+    `scope_id`** (the ownership round trip is skipped entirely) -- that permission already returns
+    the whole estate via `scope=all`, so a per-account slice of it is not a wider grant. The two
+    edges of that bypass are load-bearing and tested: `scope=api_key` stays refused for permission
+    holders too, and a caller WITHOUT the permission sees the unchanged rules above.
   - **`/usage/v1/spend/query` stays mTLS-only** -- it is `authz-budget`'s legitimate cross-account
     service-to-service reader with no per-caller ownership check by design -- but now REFUSES any
     request carrying an `Authorization` header (#603), closing a "console catch-all-proxy" hole
     where a misrouted browser bearer token could otherwise reach this ownerless cross-account read.
+  - **Usage dimensions (#648):** `usage_events` carries `azp`, `operation` and `billing_plan` as
+    real, indexed, groupable/filterable columns (promoted out of the `attributes` JSONB blob, which
+    is still written unchanged), plus an `operation_in` set-membership filter over the closed
+    vocabulary `chat_completions` | `responses` | `messages` | `embeddings` | `other`. `operation`
+    is derived at ingest by path prefix; NO path key at all stores `NULL`, never `other`. This is
+    an explicitly interim bridge on a table #581 will drop -- see `docs/usage-api.md`'s "Usage
+    dimensions" section and the interim-bridge note in
+    `docs/plans/0581-multi-source-usage-plan-of-work.md`.
   - See `docs/lightbridge-query-api.md` and `docs/usage-api.md` for the full contract; this section
     is cited as authoritative by `docs/local-testing.md`.
 
@@ -1014,18 +1104,59 @@ hand-written SQL and direct `sqlx` dependencies.
     `crates/lightbridge-authz-api-key/src/repo.rs`).
   - `lightbridge-authz-usage`: dynamic `QueryBuilder` aggregates against the Timescale-backed
     `usage_events` table (`query_usage` in `crates/lightbridge-authz-usage/src/repo.rs`).
+  - `usage_day_facts` / `usage_seat_snapshots` (#583): same class as `usage_events` — TimescaleDB
+    hypertables with upsert-on-natural-key semantics. Cratestack's generated CRUD cannot express
+    `create_hypertable`, `add_retention_policy`, `add_compression_policy`, or `ON CONFLICT
+    (composite, including partition column) DO UPDATE`. Justified in the migration headers as an
+    ADR-0038 exception per the grain-partitioned time-series + CAS/upsert exception class.
   - `federated_identities`: deliberately ABSENT from `authz.cstack` entirely, not merely
     `@@allow`-less -- it carries the sealed Keycloak token envelope, so a credential-bearing table
     must be unreachable from any generated read path, not just gated behind the coarse-RBAC check
     a present-but-unallowed model would still have (ADR-0024 Q4; created by
     `migrations/20260825000001_users_and_federated_identities.sql`; justified in the `User` model
     comment in `crates/lightbridge-authz-api/schema/authz.cstack`).
+  - `accounts`/`projects`, READ-ONLY, for admin identity resolution only (#647): the estate-wide
+    label lookups in `crates/lightbridge-authz-api-key/src/identity_resolution.rs`
+    (`resolve_account_labels`/`resolve_project_labels`, and the `accounts` hop
+    `resolve_user_profiles`/`search_user_profiles` join through). These two models ARE in
+    `authz.cstack`, but their `@@allow("read", ...)` clauses are ownership-scoped
+    (`userId == auth().id`) and cratestack folds them into every generated query unconditionally
+    with no bypass -- an estate-wide admin label lookup is exactly the query that policy cannot
+    express, and widening the shared clause would widen `model.Account.list`/`model.Project.list`
+    for every other caller too. Gated instead by the dedicated `user:read` permission at the RPC
+    layer; see `docs/admin-identity-resolution.md`. Reads only -- every write to these tables still
+    goes through the generated client or the pre-existing exceptions.
+  - `platform_role_grants` (ADR-0033): who holds a platform role, read at token mint by
+    `ClaimSource::PlatformRoles`. Two independent reasons: the hot read runs on the mint path
+    inside `authz-idp`, which builds no cratestack client at all; and the grant's idempotency is an
+    `ON CONFLICT ... WHERE revoked_at IS NULL DO NOTHING` against a PARTIAL unique index, with
+    revocation an `UPDATE ... WHERE revoked_at IS NULL RETURNING` -- the same
+    single-statement-conditional-write class as `authorization_codes`/`secret_claims`
+    (`migrations/20260902000006_platform_role_grants.sql`;
+    `crates/lightbridge-authz-api-key/src/platform_roles.rs` and `platform_role_lookup.rs`).
+  - `sessions`/`exchange_refresh_tokens`, for the sessions read+revoke surface (#649): the
+    per-page enrichment query in `crates/lightbridge-authz-api-key/src/session_listing.rs`
+    (`session_listing_facts` -- the `subject -> accounts.user_id` hop and the `offline_access`
+    scope `EXISTS` over the refresh chain) and the per-session revoke in `session_revocation.rs`
+    (`find_session_owner`/`revoke_session_by_id`, alongside the pre-existing
+    `revoke_sessions_and_cascade`/`revoke_for_logout`). `Session` IS a cratestack model and the
+    listing's ROWS come from the generated client on purpose -- that is what makes its
+    `@@allow("read", ...)` own-scoping unbypassable. The exception is only the annotation and the
+    write: `exchange_refresh_tokens` is already an exception above and absent from the schema, the
+    `accounts` hop is the same ownership-scoped-policy problem as #647's entry, and the revoke is a
+    two-statement transaction the generic `update` verb must never be able to express (it would
+    also be able to flip a revoked session back to `active`). See `docs/sessions-api.md`.
   - `secret_claims`: single-use, subject-bound claims for handing an API key secret to a human
     without routing it through a model's context (GHSA-9pc6-965v-2c44, #538); redemption needs a
     single-statement CAS so concurrent requests can never both obtain the same secret, which
     generated CRUD cannot express -- the same exception class as `authorization_codes`
     (`migrations/20260827000001_secret_claims.sql`; `consume_secret_claim` in
     `crates/lightbridge-authz-api-key/src/repo.rs`).
+  - the execution grain (`usage_executions`, `usage_model_calls`, `usage_tool_calls`, plus the
+    `usage_identities` side table, #582): grain-partitioned time-series with CAS/upsert
+    (`ON CONFLICT`) semantics that generated CRUD cannot express, in the usage DB which is
+    already hand-written SQL (see `usage_events`). Same exception class as `secret_claims`;
+    justified in each migration header under `migrations-usage/2026090700000{1,2,3,4}_*.sql`.
 - This repo runs cratestack (`cratestack-pg`) `=0.10.0` (pinned exactly in the root `Cargo.toml`,
   which also documents why the pin cannot float past it -- see that file's `cratestack-core =
   "=0.10.0"` block); ADR-0038's capability findings were verified against 0.7.8. Re-verify any
@@ -1065,6 +1196,20 @@ hand-written SQL and direct `sqlx` dependencies.
 
 - **Documentation navigation map (start here to find a doc):** `docs/README.md`
 - Overview and quickstart: `README.md`
+- **Is my merged change live?** — the CI → GHCR → cosign → argocd-image-updater → ArgoCD chain as a
+  procedure, with the `/version` check, the live image list, and the two links in it that are
+  currently broken (#666's chart publishing; ADR-0031 accepted but the chart still shipping the
+  ADR-0016 sync-wave Job): `docs/runbooks/release-and-rollout.md`
+- Why a usage query was 34.8 s and is not any more — the measurements, the covering index, the
+  `metrics` field, the rejected alternatives (BRIN, a CTE), the `#[instrument]` log-noise trap, and
+  how to re-measure on the read-only replica: `docs/usage-performance.md`
+- One `sharedConfig` object instead of five copies of `config.yaml` — the chart contract, the
+  replace-don't-merge rule and the env-placeholder re-quoting: `docs/single-source-config.md`
+- What build a service is running (`GET /version`, `getBuildInfo`, `--version`, the `service.build`
+  startup log, and the git → env → `unknown` fallback ladder): `docs/build-info.md`
+- Release narratives — why a batch of PRs was one thing, what order it had to ship in, and what is
+  live. `CHANGELOG.md` is owned by release-please and is never hand-edited: `docs/releases/`
+- Skills, agents, and how a non-Claude harness picks them up: `docs/agent-harnesses.md`
 - Run the whole platform locally (backend + frontend console) and test it end to end — issuer vs
   discovery split, seeded Keycloak users, RBAC gating, honest usage-chart limitations, automated
   suites, troubleshooting table: `docs/local-testing.md`
@@ -1074,9 +1219,17 @@ hand-written SQL and direct `sqlx` dependencies.
 - Manual end-to-end protocol (OAuth2 + OPA): `docs/test-protocol.md`
 - Authorino endpoint usage + integration test: `docs/authorino-usage.md`
 - Usage ingest/query API: `docs/usage-api.md`
-- RBAC (JWT claim → permission mapping): `docs/rbac.md`
+- RBAC (JWT claim → permission mapping; how the roles claim is assembled at mint from
+  `project_members` + `platform_role_grants`, the mapper MERGE semantics, the `lightbridge-viewer`
+  default for account owners, TTL-bounded propagation, and the `rbac` CLI bootstrap runbook):
+  `docs/rbac.md`
 - API key approaching-expiry visibility (`listMyExpiringApiKeys`, window/threshold rationale, why
   there is no cross-tenant admin surface): `docs/api-key-expiry-visibility.md`
+- Identity resolution (`resolveUserProfiles`/`resolveActorLabels`/`searchUsers`, the `user:read`
+  permission, why `resolveActorLabels` is gated PER KIND — three estate-wide kinds behind
+  `user:read`, `apiKeyIds` row-scoped through `ApiKey`'s own `@@allow("read", …)` — the
+  never-fabricate-an-identity and reject-don't-truncate rules, and the search index's honest
+  limits): `docs/admin-identity-resolution.md`
 - Governance data model + how quotas/allowlists are actually enforced at the gateway (accounts,
   projects, roster, keys; introspection, Authorino claim extraction, BackendTrafficPolicy rule
   families; worked scenarios and the gaps that remain): `docs/governance-model-and-enforcement.md`
@@ -1085,6 +1238,9 @@ hand-written SQL and direct `sqlx` dependencies.
   policy engine, self-service refill, discrete tiers): `docs/rfc/0001-budget-refill.md`
 - Budget refill decision contract (the `Facts`/`Decision`/`PolicyEngine` seam a rule-data
   evaluator and, later, an OPA-Wasm evaluator both sit behind; the fail-closed rule): `docs/budget-decision-contract.md`
+- **Booking a grant unattended** (`lightbridge-authz budget grant`: flags, what it refuses, the
+  idempotency key, the Job pattern, the $8-vs-$15 rule that keeps the reset scheduler from booking a
+  clawback, and why the ledger is never written with raw SQL): `docs/budget-cli.md`
 - Budget refill UI contract (RPC shapes for self-service refill and the admin review queue, the
   reset-not-add and token-refresh-delay behaviors, status values, oriented for the `lightbridge-ss`
   frontend team): `docs/budget-refill-ui-contract.md`

@@ -97,11 +97,14 @@ fn lazy_refill_and_review_services(
     Arc<lightbridge_authz_budget::RefillService>,
     Arc<lightbridge_authz_budget::ReviewService>,
     Arc<lightbridge_authz_budget::repo::BudgetRepo>,
+    Arc<lightbridge_authz_budget::ResetScheduler>,
 ) {
     let budget_repo = Arc::new(lightbridge_authz_budget::repo::BudgetRepo::new(
         core.clone(),
     ));
-    let augmentation_repo = Arc::new(lightbridge_authz_budget::AugmentationRepo::new(core));
+    let augmentation_repo = Arc::new(lightbridge_authz_budget::AugmentationRepo::new(
+        core.clone(),
+    ));
     let refill_service = Arc::new(lightbridge_authz_budget::RefillService::new(
         budget_repo.clone(),
         augmentation_repo.clone(),
@@ -112,7 +115,12 @@ fn lazy_refill_and_review_services(
         budget_repo.clone(),
         augmentation_repo,
     ));
-    (refill_service, review_service, budget_repo)
+    let reset_scheduler = Arc::new(lightbridge_authz_budget::ResetScheduler::new(
+        core,
+        budget_repo.clone(),
+        Arc::new(lightbridge_authz_budget::UnavailableSpendReader),
+    ));
+    (refill_service, review_service, budget_repo, reset_scheduler)
 }
 
 /// Assemble the full budget router with a caller-supplied bearer, everything else lazily wired
@@ -122,7 +130,7 @@ fn build_router(bearer: Arc<dyn BearerTokenServiceTrait>) -> Router {
     let core = lazy_core_pool();
     let issuer = Arc::new(AuthzStoreImpl::with_pool(core.clone()));
     let policy_store = lazy_policy_store(core.clone());
-    let (refill_service, review_service, budget_repo) =
+    let (refill_service, review_service, budget_repo, reset_scheduler) =
         lazy_refill_and_review_services(core.clone(), &policy_store);
     lightbridge_authz_rest::build_budget_router(
         issuer,
@@ -130,6 +138,10 @@ fn build_router(bearer: Arc<dyn BearerTokenServiceTrait>) -> Router {
         refill_service,
         review_service,
         budget_repo,
+        reset_scheduler,
+        std::sync::Arc::new(lightbridge_authz_core::platform_role::known_platform_roles(
+            &lightbridge_authz_core::authz::Rbac::default(),
+        )),
         lazy_cratestack_db(),
         core,
         bearer,
@@ -174,6 +186,37 @@ async fn health_probes_report_ok() {
     }
 }
 
+/// `GET /version` (#573) on `authz-budget` names `authz-budget`, not `authz-api`.
+///
+/// This is the assertion the whole "thread a `&'static str` through `probe_router` and
+/// `Procedures`" design exists for: one binary serves both routers, so if the service name were
+/// derived from the process rather than the router, the console's `/settings/info` screen would
+/// show two identical rows and be unable to detect a version skew between the two services — which
+/// is the exact failure mode it was built to catch.
+#[tokio::test]
+async fn version_endpoint_reports_the_budget_service_not_the_api() {
+    let router = build_router(admin_bearer());
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/version")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let info: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(info["service"].as_str(), Some("authz-budget"), "{info}");
+    assert!(
+        info["gitSha"].as_str().is_some_and(|v| !v.is_empty()),
+        "the same stamp every other listener reports: {info}"
+    );
+}
+
 #[tokio::test]
 async fn readiness_reports_unavailable_when_the_database_is_unreachable() {
     let router = build_router(admin_bearer());
@@ -209,6 +252,13 @@ async fn every_budget_op_id_is_reachable_past_the_gate_for_an_admin() {
         "procedure.grantBudget",
         "procedure.revokeBudgetGrant",
         "procedure.createBudgetPolicyRevision",
+        // ADR-0032, story #651.
+        "procedure.listBudgetResetSchedules",
+        "procedure.createBudgetResetSchedule",
+        "procedure.updateBudgetResetSchedule",
+        "procedure.deleteBudgetResetSchedule",
+        "procedure.runBudgetResetScheduleNow",
+        "procedure.getEffectiveResetSchedule",
     ];
     for op in op_ids {
         let router = build_router(admin_bearer());
@@ -237,6 +287,8 @@ async fn non_budget_op_ids_404_on_authz_budget_even_without_a_token() {
         "model.Account.create",
         "procedure.createAccount",
         "procedure.createApiKey",
+        "procedure.querySessions",
+        "procedure.revokeSession",
         "procedure.revokeOwnSessions",
         "procedure.revokeSubjectSessions",
         "procedure.unknown",
@@ -461,4 +513,126 @@ async fn batch_frame_aimed_at_a_non_budget_op_id_fails_independently() {
         StatusCode::UNAUTHORIZED,
         "a valid admin token must clear the outer batch gate"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// ADR-0032 / story #651: the budget reset schedule authorization matrix. `budget:schedule-manage`
+// is the ONLY grant that reaches the five management procedures, and it is deliberately NOT what
+// gates `getEffectiveResetSchedule` -- that rides `budget:read`, so a console budget card can
+// render "next reset: <date>" without also being able to author a standing rule that rewrites
+// every account's balance on a timer.
+// ---------------------------------------------------------------------------------------------
+
+/// The five management procedures, refused for every caller who holds every OTHER budget
+/// permission. Built by subtracting exactly one variant from `Permission::ALL`, so this test can
+/// never silently pass because some adjacent grant happens to cover them.
+#[tokio::test]
+async fn schedule_management_requires_budget_schedule_manage_and_nothing_else_covers_it() {
+    let without_manage: lightbridge_authz_core::authz::PermissionSet = Permission::ALL
+        .into_iter()
+        .filter(|permission| *permission != Permission::BudgetScheduleManage)
+        .collect();
+    let bearer: Arc<dyn BearerTokenServiceTrait> =
+        Arc::new(MapBearer::new().with("almost-admin", token_info("almost-admin", without_manage)));
+
+    for op in [
+        "procedure.listBudgetResetSchedules",
+        "procedure.createBudgetResetSchedule",
+        "procedure.updateBudgetResetSchedule",
+        "procedure.deleteBudgetResetSchedule",
+        "procedure.runBudgetResetScheduleNow",
+    ] {
+        let router = build_router(bearer.clone());
+        let (status, _) = rpc_call(router, op, &json!({}), Some("almost-admin")).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "`{op}` must require budget:schedule-manage -- no other budget grant may cover it"
+        );
+    }
+}
+
+/// The converse: `budget:schedule-manage` alone reaches all five, and reaches NOTHING else on the
+/// budget surface -- authoring schedules must not smuggle in the ability to grant or review budget
+/// directly.
+#[tokio::test]
+async fn budget_schedule_manage_alone_reaches_the_five_and_no_other_budget_op() {
+    let only_manage: lightbridge_authz_core::authz::PermissionSet =
+        [Permission::BudgetScheduleManage].into_iter().collect();
+    let bearer: Arc<dyn BearerTokenServiceTrait> =
+        Arc::new(MapBearer::new().with("scheduler", token_info("scheduler", only_manage)));
+
+    for op in [
+        "procedure.listBudgetResetSchedules",
+        "procedure.createBudgetResetSchedule",
+        "procedure.updateBudgetResetSchedule",
+        "procedure.deleteBudgetResetSchedule",
+        "procedure.runBudgetResetScheduleNow",
+    ] {
+        let router = build_router(bearer.clone());
+        let (status, _) = rpc_call(router, op, &json!({}), Some("scheduler")).await;
+        assert!(
+            status != StatusCode::UNAUTHORIZED
+                && status != StatusCode::FORBIDDEN
+                && status != StatusCode::NOT_FOUND,
+            "budget:schedule-manage must reach `{op}` past the gate, got {status}"
+        );
+    }
+
+    for op in [
+        "procedure.grantBudget",
+        "procedure.revokeBudgetGrant",
+        "procedure.approveAugmentationRequest",
+        "procedure.getBudgetBalance",
+        // The read companion is `budget:read`, NOT `budget:schedule-manage` -- refused here on
+        // purpose, which is the whole point of splitting it out.
+        "procedure.getEffectiveResetSchedule",
+    ] {
+        let router = build_router(bearer.clone());
+        let (status, _) = rpc_call(router, op, &json!({}), Some("scheduler")).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "budget:schedule-manage must NOT reach `{op}`"
+        );
+    }
+}
+
+/// `getEffectiveResetSchedule` is reachable with `budget:read` alone -- the grant a budget card
+/// already needs for `getBudgetBalance` -- and refused without it.
+#[tokio::test]
+async fn the_effective_schedule_read_rides_budget_read() {
+    let only_read: lightbridge_authz_core::authz::PermissionSet =
+        [Permission::BudgetRead].into_iter().collect();
+    let bearer: Arc<dyn BearerTokenServiceTrait> =
+        Arc::new(MapBearer::new().with("reader", token_info("reader", only_read)));
+
+    let router = build_router(bearer.clone());
+    let (status, _) = rpc_call(
+        router,
+        "procedure.getEffectiveResetSchedule",
+        &json!({}),
+        Some("reader"),
+    )
+    .await;
+    assert!(
+        status != StatusCode::UNAUTHORIZED
+            && status != StatusCode::FORBIDDEN
+            && status != StatusCode::NOT_FOUND,
+        "budget:read must reach getEffectiveResetSchedule past the gate, got {status}"
+    );
+
+    let no_budget: lightbridge_authz_core::authz::PermissionSet =
+        [Permission::AccountRead].into_iter().collect();
+    let bearer: Arc<dyn BearerTokenServiceTrait> =
+        Arc::new(MapBearer::new().with("outsider", token_info("outsider", no_budget)));
+    let router = build_router(bearer);
+    let (status, _) = rpc_call(
+        router,
+        "procedure.getEffectiveResetSchedule",
+        &json!({}),
+        Some("outsider"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }

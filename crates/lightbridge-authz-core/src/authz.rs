@@ -16,7 +16,7 @@
 //! Expansion happens once, at service start, so authorization checks at request time are a plain
 //! set lookup with no wildcard evaluation.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -121,15 +121,43 @@ pub enum Permission {
     /// see that variant's doc comment.
     #[serde(rename = "budget:policy-activate")]
     BudgetPolicyActivate,
+    /// Author, edit, delete and manually fire budget reset schedules (ADR-0032). Kept distinct
+    /// from [`Permission::BudgetGrant`] even though a firing schedule ultimately writes grants: a
+    /// direct grant is one amount to one account that an admin typed out, whereas a schedule is a
+    /// standing rule that can, at `global` scope, rewrite every account's balance on a timer
+    /// without anyone in the loop. Reading which schedule currently governs an account
+    /// (`getEffectiveResetSchedule`) is deliberately NOT gated here -- it rides
+    /// [`Permission::BudgetRead`], so a console budget card can render "next reset: <date>"
+    /// without the caller also being able to author schedules.
+    #[serde(rename = "budget:schedule-manage")]
+    BudgetScheduleManage,
 
-    /// Revoke all of the caller's own refresh-token sessions ("log out everywhere"). Kept
+    /// Enumerate ANY subject's sessions, estate-wide (`querySessions` with arbitrary filters).
+    /// A sensitive read -- user agents, client ids and last-used times for people the caller has
+    /// no relationship with -- so it is admin-only by default, held solely via
+    /// `lightbridge-admin`'s `*` grant (see [`default_role_permissions`]). It is what WIDENS the
+    /// `Session` model's `@@allow("read", ...)` clause from "my own rows" to "every row"; it is
+    /// not itself the floor to call the procedure (that is [`Permission::SessionReadOwn`]).
+    #[serde(rename = "session:read")]
+    SessionRead,
+    /// See your own sessions and nothing else. The floor capability behind `querySessions`:
+    /// granted to every default non-admin role, because "which devices am I logged in on" is
+    /// self-service, not administration. The row-level scoping is enforced by the `Session`
+    /// model's `@@allow("read", ...)` clause, which cratestack folds into the SQL `WHERE` --
+    /// so a caller holding only this permission cannot reach another subject's row with ANY
+    /// filter combination, rather than relying on a handler remembering to clamp one.
+    #[serde(rename = "session:read-own")]
+    SessionReadOwn,
+    /// Revoke all of the caller's own refresh-token sessions ("log out everywhere"), and one
+    /// specific session of the caller's own by id (`revokeSession`). Kept
     /// distinct from [`Permission::SessionRevoke`] -- same self/admin split as
     /// [`Permission::BudgetSelfRefill`] vs [`Permission::BudgetReview`] -- because acting on your
     /// own sessions is a materially different capability from acting on someone else's.
     #[serde(rename = "session:revoke-own")]
     SessionRevokeOwn,
-    /// Revoke every active refresh-token session for another subject: the offboarding kill switch
-    /// that otherwise requires a manual SQL `UPDATE` against prod.
+    /// Revoke every active refresh-token session for another subject (the offboarding kill
+    /// switch that otherwise requires a manual SQL `UPDATE` against prod), and any single
+    /// session by id regardless of whose it is.
     #[serde(rename = "session:revoke")]
     SessionRevoke,
 
@@ -145,12 +173,42 @@ pub enum Permission {
     /// `scope=all` to admins out of the box.
     #[serde(rename = "usage:read-all")]
     UsageReadAll,
+
+    /// Resolve another person's display identity: the estate-wide, ownership-filter-free batch
+    /// reads `resolveUserProfiles`/`searchUsers` (and `resolveActorLabels`' user/account/project
+    /// kinds) serve so an admin console can render "Stephane Segning - selast@example.com" instead
+    /// of a bare cuid. Its own permission, not a reuse of [`Permission::AccountRead`]: those
+    /// procedures read `federated_identities` profile claims for subjects the caller has no
+    /// relationship with at all, which is a PII surface of a different shape from "list the
+    /// accounts I own". Included in the default `lightbridge-admin`'s `*` grant (see
+    /// [`default_role_permissions`]) and in no other default role, so an unconfigured deployment
+    /// keeps it admin-only out of the box.
+    ///
+    /// NOT what gates `resolveActorLabels`' `apiKeyIds` kind (owner feedback 2026-09-03): an API
+    /// key's NAME is not estate-wide PII, so it is scoped per row by `ApiKey`'s own
+    /// `@@allow("read", ...)` clause and readable by ordinary members. See
+    /// `docs/admin-identity-resolution.md`; do not fold that kind back under this permission.
+    #[serde(rename = "user:read")]
+    UserRead,
+
+    /// Grant, revoke and list PLATFORM role grants (`platform_role_grants`, ADR-0033) -- the rows
+    /// `ClaimSource::PlatformRoles` stamps into the roles claim at mint. Its own permission, not a
+    /// reuse of [`Permission::UserRead`] or any `account:*` grant, because it is the one
+    /// capability that can hand out every other capability: a caller who can write this table can
+    /// make themselves `lightbridge-admin`. Included in the default `lightbridge-admin`'s `*`
+    /// grant (see [`default_role_permissions`]) and in no other default role.
+    ///
+    /// Deliberately NOT required by `getMyAccess`, which any authenticated caller may invoke:
+    /// reading back your OWN already-minted roles and the permissions the server derives from them
+    /// discloses nothing the caller's own token does not already carry.
+    #[serde(rename = "rbac:manage")]
+    RbacManage,
 }
 
 impl Permission {
     /// Every permission, in declaration order. The single source of truth for wildcard expansion
     /// and documentation.
-    pub const ALL: [Permission; 33] = [
+    pub const ALL: [Permission; 38] = [
         Permission::AccountCreate,
         Permission::AccountRead,
         Permission::AccountUpdate,
@@ -181,9 +239,14 @@ impl Permission {
         Permission::BudgetPolicyWrite,
         Permission::BudgetPolicySimulate,
         Permission::BudgetPolicyActivate,
+        Permission::BudgetScheduleManage,
+        Permission::SessionRead,
+        Permission::SessionReadOwn,
         Permission::SessionRevokeOwn,
         Permission::SessionRevoke,
         Permission::UsageReadAll,
+        Permission::UserRead,
+        Permission::RbacManage,
     ];
 
     /// Canonical `resource:action` string.
@@ -219,9 +282,14 @@ impl Permission {
             Permission::BudgetPolicyWrite => "budget:policy-write",
             Permission::BudgetPolicySimulate => "budget:policy-simulate",
             Permission::BudgetPolicyActivate => "budget:policy-activate",
+            Permission::BudgetScheduleManage => "budget:schedule-manage",
+            Permission::SessionRead => "session:read",
+            Permission::SessionReadOwn => "session:read-own",
             Permission::SessionRevokeOwn => "session:revoke-own",
             Permission::SessionRevoke => "session:revoke",
             Permission::UsageReadAll => "usage:read-all",
+            Permission::UserRead => "user:read",
+            Permission::RbacManage => "rbac:manage",
         }
     }
 
@@ -231,55 +299,9 @@ impl Permission {
     }
 }
 
-/// The set of permissions a caller holds. Built once per request from JWT grants; checked with
-/// [`PermissionSet::require`].
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PermissionSet(HashSet<Permission>);
-
-impl PermissionSet {
-    pub fn new() -> Self {
-        Self(HashSet::new())
-    }
-
-    pub fn contains(&self, permission: Permission) -> bool {
-        self.0.contains(&permission)
-    }
-
-    pub fn insert(&mut self, permission: Permission) {
-        self.0.insert(permission);
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = Permission> + '_ {
-        self.0.iter().copied()
-    }
-
-    /// Returns `Ok(())` when the caller holds `permission`, otherwise a [`Error::Forbidden`]
-    /// carrying the missing permission (mapped to HTTP 403 by the REST layer).
-    pub fn require(&self, permission: Permission) -> Result<(), Error> {
-        if self.contains(permission) {
-            Ok(())
-        } else {
-            Err(Error::Forbidden(format!(
-                "missing required permission: {}",
-                permission.as_str()
-            )))
-        }
-    }
-}
-
-impl FromIterator<Permission> for PermissionSet {
-    fn from_iter<I: IntoIterator<Item = Permission>>(iter: I) -> Self {
-        Self(iter.into_iter().collect())
-    }
-}
+/// Re-exported from [`crate::permission_set`], which holds the type itself. Split out only to
+/// keep this file inside its LoC-gate baseline; see that module's own doc comment.
+pub use crate::permission_set::PermissionSet;
 
 /// Expand a single grant string into the permissions it confers. Unknown grants expand to nothing
 /// (and are logged by [`Rbac::compile`]); they never widen access.
@@ -416,35 +438,9 @@ fn default_roles_claim() -> String {
     "roles".to_string()
 }
 
-/// Built-in role → grant mapping used when `oauth2.rbac.role_permissions` is not configured. Keep
-/// this in sync with `docs/rbac.md`.
-pub fn default_role_permissions() -> HashMap<String, Vec<String>> {
-    HashMap::from([
-        ("lightbridge-admin".to_string(), vec!["*".to_string()]),
-        (
-            "lightbridge-editor".to_string(),
-            vec![
-                "account:create".to_string(),
-                "account:read".to_string(),
-                "project:*".to_string(),
-                "apikey:*".to_string(),
-                "session:revoke-own".to_string(),
-                "budget:read-own".to_string(),
-            ],
-        ),
-        (
-            "lightbridge-viewer".to_string(),
-            vec![
-                "account:create".to_string(),
-                "account:read".to_string(),
-                "project:read".to_string(),
-                "apikey:read".to_string(),
-                "session:revoke-own".to_string(),
-                "budget:read-own".to_string(),
-            ],
-        ),
-    ])
-}
+/// Re-exported from [`crate::role_defaults`], which holds the mapping itself. Split out only to
+/// keep this file inside its LoC-gate baseline; see that module's own doc comment.
+pub use crate::role_defaults::default_role_permissions;
 
 /// Resolve the permission set for a caller given the raw role strings extracted from their JWT and
 /// a precompiled [`CompiledRbac`]. Applied per role: a role string matching a configured entry
@@ -551,9 +547,11 @@ mod tests {
     }
 
     #[test]
-    fn session_wildcard_expands_to_both_actions() {
+    fn session_wildcard_expands_to_all_four_actions() {
         let session = expand_grant("session:*");
-        assert_eq!(session.len(), 2);
+        assert_eq!(session.len(), 4);
+        assert!(session.contains(&Permission::SessionRead));
+        assert!(session.contains(&Permission::SessionReadOwn));
         assert!(session.contains(&Permission::SessionRevokeOwn));
         assert!(session.contains(&Permission::SessionRevoke));
     }

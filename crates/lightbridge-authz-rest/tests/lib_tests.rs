@@ -274,7 +274,9 @@ mod db {
     use lightbridge_authz_api::schema;
     use lightbridge_authz_api_key::repo::StoreRepo;
     use lightbridge_authz_bearer::BearerTokenServiceTrait;
-    use lightbridge_authz_core::config::{BudgetServer, JwtSigning, Oauth2Issuance};
+    use lightbridge_authz_core::config::{
+        BudgetInternalServer, BudgetServer, JwtSigning, Oauth2Issuance,
+    };
     use lightbridge_authz_core::cuid::cuid2;
     use lightbridge_authz_core::{CreateAccount, CreateApiKey, CreateProject};
     use lightbridge_authz_rest::OpaRepoTrait;
@@ -474,6 +476,12 @@ mod db {
             address: "127.0.0.1".to_string(),
             port: 0,
             tls: bad_tls(),
+            snapshot_refresh_seconds: 15,
+            snapshot_active_window_minutes: 1440,
+            snapshot_slow_lane_minutes: 10,
+            snapshot_seed_lookback_days: 30,
+            snapshot_batch: 500,
+            snapshot_concurrency: 8,
         }
     }
 
@@ -484,6 +492,7 @@ mod db {
         let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool));
         let err = lightbridge_authz_rest::start_budget_server(
             &budget_server(),
+            None,
             db_pool,
             &external_oauth2_with_issuance(),
             &sample_billing(),
@@ -507,6 +516,7 @@ mod db {
         let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool));
         let result = lightbridge_authz_rest::start_budget_server(
             &budget_server(),
+            None,
             db_pool,
             &external_oauth2_with_issuance(),
             &sample_billing(),
@@ -522,6 +532,98 @@ mod db {
             !format!("{err}").to_lowercase().contains("redis"),
             "an unreachable-but-well-formed redis.url must not fail the mandatory-redis check: \
              got {err}"
+        );
+    }
+
+    /// ADR-0034 + its 2026-09-03 amendment: `server.budget_internal` is optional, but a configured
+    /// internal listener with an EMPTY `shared_secret` is a hard startup failure, never a listener
+    /// served with no credential at all. `GET /budget/v1/remaining` answers a cross-account
+    /// balance question with no per-caller ownership check of any kind; the shared secret is the
+    /// only thing in front of it, and forgetting it must be loud rather than silently permissive.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn start_budget_server_refuses_an_internal_listener_without_a_shared_secret(
+        pool: PgPool,
+    ) {
+        let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool));
+        let internal = BudgetInternalServer {
+            address: "127.0.0.1".to_string(),
+            port: 0,
+            tls: bad_tls(),
+            shared_secret: "   ".to_string(),
+            shared_secret_header: "x-lightbridge-budget-token".to_string(),
+            remaining_grace_seconds: 120,
+        };
+
+        let err = lightbridge_authz_rest::start_budget_server(
+            &budget_server(),
+            Some(&internal),
+            db_pool,
+            &external_oauth2_with_issuance(),
+            &sample_billing(),
+            &sample_quota_tiers(),
+            &sample_models(),
+            &sample_api_key_expiry(),
+            &unreachable_redis(),
+            &None,
+        )
+        .await
+        .expect_err("a budget_internal listener without a shared secret must not start");
+
+        let message = format!("{err}");
+        assert!(
+            message.contains("shared_secret"),
+            "the error must name the missing credential: got {message}"
+        );
+        assert!(
+            message.contains("/budget/v1/remaining"),
+            "the error must name the route it protects: got {message}"
+        );
+    }
+
+    /// The other half of the amendment, and the one that would otherwise be discovered in
+    /// production: a client-CA bundle here is not a *stricter* configuration, it is a broken one.
+    /// Authorino v0.24.0's `metadata.http` cannot present a client certificate, so requiring one
+    /// makes the route unreachable by its only caller — every metadata fetch fails the handshake
+    /// and the gateway reads `budget_unavailable` on every request. Refuse at startup instead.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn start_budget_server_refuses_an_internal_listener_that_demands_a_client_certificate(
+        pool: PgPool,
+    ) {
+        let db_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool));
+        let mut tls = bad_tls();
+        tls.client_ca_bundle_path = Some("/etc/lightbridge/tls/ca.crt".to_string());
+        let internal = BudgetInternalServer {
+            address: "127.0.0.1".to_string(),
+            port: 0,
+            tls,
+            shared_secret: "a-real-secret".to_string(),
+            shared_secret_header: "x-lightbridge-budget-token".to_string(),
+            remaining_grace_seconds: 120,
+        };
+
+        let err = lightbridge_authz_rest::start_budget_server(
+            &budget_server(),
+            Some(&internal),
+            db_pool,
+            &external_oauth2_with_issuance(),
+            &sample_billing(),
+            &sample_quota_tiers(),
+            &sample_models(),
+            &sample_api_key_expiry(),
+            &unreachable_redis(),
+            &None,
+        )
+        .await
+        .expect_err("a budget_internal listener demanding mTLS must not start");
+
+        let message = format!("{err}");
+        assert!(
+            message.contains("client_ca_bundle_path"),
+            "the error must name the offending key: got {message}"
+        );
+        assert!(
+            message.contains("Authorino"),
+            "the error must say WHY it is refused: got {message}"
         );
     }
 
@@ -579,6 +681,11 @@ mod db {
             budget_repo.clone(),
             augmentation_repo,
         ));
+        let reset_scheduler = Arc::new(lightbridge_authz_budget::ResetScheduler::new(
+            db_pool.clone(),
+            budget_repo.clone(),
+            Arc::new(lightbridge_authz_budget::UnavailableSpendReader),
+        ));
         let router = lightbridge_authz_rest::build_api_router(
             bearer,
             test_resolver(),
@@ -587,6 +694,10 @@ mod db {
             refill_service,
             review_service,
             budget_repo,
+            reset_scheduler,
+            std::sync::Arc::new(lightbridge_authz_core::platform_role::known_platform_roles(
+                &lightbridge_authz_core::authz::Rbac::default(),
+            )),
             lazy_cratestack_db(),
             db_pool.clone(),
             lazy_idempotency_store(),

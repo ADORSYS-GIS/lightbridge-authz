@@ -40,6 +40,16 @@ FROM rust:1-alpine as builder
 
 ARG TARGETARCH
 
+# This stage compiles from bind-mounted sources with NO `.git` in the context (see the mounts
+# below: Cargo.toml, Cargo.lock, app/, crates/, migrations*/ — nothing else). So
+# `crates/lightbridge-authz-core/build.rs` cannot ask git for the commit, and falls back to these
+# instead (#573). Pass them with `--build-arg` to get a real stamp out of a compose build; leave
+# them unset and every git-derived field honestly reports `unknown` rather than a guess.
+ARG GIT_SHA=""
+ARG SOURCE_DATE_EPOCH=""
+ENV GIT_SHA=${GIT_SHA} \
+    SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
+
 RUN --mount=type=cache,target=/var/cache/apk \
     apk add --no-cache \
     musl-dev \
@@ -98,6 +108,24 @@ FROM gcr.io/distroless/base-debian12:nonroot as runtime
 LABEL maintainer="stephane-segning <selastlambou@gmail.com>"
 LABEL org.opencontainers.image.description="Backend for LightBridge Authz"
 
+# Build stamp (#573), promoted from ARG to ENV so the running process can read the identity of the
+# IMAGE it is inside. The binary already carries its own git SHA, commit date and rustc version,
+# compiled in by `crates/lightbridge-authz-core/build.rs` — but the image does not exist yet at
+# compile time (CI builds binaries in one job and the image in a later one), so these three arrive
+# here instead and are read at runtime by `lightbridge_authz_core::build_info`.
+#
+# Empty defaults are load-bearing: an image built without them reports `null` for these fields
+# rather than a fabricated value, and `/version` says so plainly.
+#
+# Not the image DIGEST, deliberately — a digest cannot be baked into the artifact it identifies.
+# `IMAGE_TAG` carries the immutable `:<commit-sha>` tag, which resolves to exactly one digest.
+ARG IMAGE_BUILD_SHA=""
+ARG IMAGE_TAG=""
+ARG IMAGE_BUILD_TIME=""
+ENV IMAGE_BUILD_SHA=${IMAGE_BUILD_SHA} \
+    IMAGE_TAG=${IMAGE_TAG} \
+    IMAGE_BUILD_TIME=${IMAGE_BUILD_TIME}
+
 # Set working directory
 WORKDIR /app
 
@@ -133,6 +161,14 @@ FROM gcr.io/distroless/base-debian12:nonroot as usage-runtime
 LABEL maintainer="stephane-segning <selastlambou@gmail.com>"
 LABEL org.opencontainers.image.description="Backend for LightBridge Authz Usage"
 
+# Build stamp (#573) — see the `runtime` stage above for why these are ARG -> ENV and not a digest.
+ARG IMAGE_BUILD_SHA=""
+ARG IMAGE_TAG=""
+ARG IMAGE_BUILD_TIME=""
+ENV IMAGE_BUILD_SHA=${IMAGE_BUILD_SHA} \
+    IMAGE_TAG=${IMAGE_TAG} \
+    IMAGE_BUILD_TIME=${IMAGE_BUILD_TIME}
+
 WORKDIR /app
 
 COPY --from=builder /app/lightbridge-authz-usage /usr/local/bin/lightbridge-authz-usage
@@ -151,6 +187,14 @@ FROM gcr.io/distroless/base-debian12:nonroot as mcp-runtime
 
 LABEL maintainer="stephane-segning <selastlambou@gmail.com>"
 LABEL org.opencontainers.image.description="Backend for LightBridge Authz MCP"
+
+# Build stamp (#573) — see the `runtime` stage above for why these are ARG -> ENV and not a digest.
+ARG IMAGE_BUILD_SHA=""
+ARG IMAGE_TAG=""
+ARG IMAGE_BUILD_TIME=""
+ENV IMAGE_BUILD_SHA=${IMAGE_BUILD_SHA} \
+    IMAGE_TAG=${IMAGE_TAG} \
+    IMAGE_BUILD_TIME=${IMAGE_BUILD_TIME}
 
 WORKDIR /app
 

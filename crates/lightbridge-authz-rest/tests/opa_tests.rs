@@ -92,10 +92,21 @@ struct MockOpaRepo {
     /// which exercises this endpoint) keeps its fail-closed posture even though it never sets this
     /// field explicitly.
     usage_scope_authorized: bool,
+    /// ADR-0034 §15: what `budget_remaining_snapshot` answers. `None` (every pre-existing test)
+    /// exercises the trait default — no snapshot, so the introspection omits the budget fields and
+    /// the gateway reads "unknown", never a zero balance.
+    budget_snapshot: Option<lightbridge_authz_budget::BudgetSnapshot>,
 }
 
 #[async_trait]
 impl lightbridge_authz_rest::OpaRepoTrait for MockOpaRepo {
+    async fn budget_remaining_snapshot(
+        &self,
+        _budget_account_id: &str,
+    ) -> Result<Option<lightbridge_authz_budget::BudgetSnapshot>> {
+        Ok(self.budget_snapshot.clone())
+    }
+
     async fn record_api_key_usage(&self, key_id: &str, ip: Option<String>) -> Result<ApiKey> {
         self.usage_calls
             .lock()
@@ -329,6 +340,7 @@ fn mk_state(repo: MockOpaRepo) -> Arc<OpaState> {
             outcome: Ok("acct_1".to_string()),
         }),
         federation_issuer: "https://keycloak.example.test/realms/dev".to_string(),
+        budget: Default::default(),
     })
 }
 
@@ -349,6 +361,7 @@ fn mk_state_with_resolver(repo: MockOpaRepo, resolver: MockResolver) -> Arc<OpaS
         api_key_audience: None,
         resolver: Arc::new(resolver),
         federation_issuer: "https://keycloak.example.test/realms/dev".to_string(),
+        budget: Default::default(),
     })
 }
 
@@ -365,6 +378,7 @@ fn bare_mock_opa_repo(member_context: Option<ResolvedContext>) -> MockOpaRepo {
         session_status: MockSessionStatus::Active,
         expected_subject: None,
         usage_scope_authorized: false,
+        budget_snapshot: None,
     }
 }
 
@@ -576,6 +590,7 @@ async fn introspect_returns_active_with_context_and_records_usage() {
         session_status: MockSessionStatus::Active,
         expected_subject: None,
         usage_scope_authorized: false,
+        budget_snapshot: None,
     });
 
     let (status, payload) = introspect(state, "lbk_secret_valid").await;
@@ -634,6 +649,7 @@ async fn introspect_omits_name_and_limits_for_plan_absent_from_catalogue() {
         session_status: MockSessionStatus::Active,
         expected_subject: None,
         usage_scope_authorized: false,
+        budget_snapshot: None,
     });
 
     let (status, payload) = introspect(state, "lbk_secret_valid").await;
@@ -668,6 +684,7 @@ async fn introspect_returns_inactive_when_revoked() {
         session_status: MockSessionStatus::Active,
         expected_subject: None,
         usage_scope_authorized: false,
+        budget_snapshot: None,
     });
 
     let (status, payload) = introspect(state, "lbk_secret_revoked").await;
@@ -692,6 +709,7 @@ async fn introspect_returns_inactive_when_missing() {
         session_status: MockSessionStatus::Active,
         expected_subject: None,
         usage_scope_authorized: false,
+        budget_snapshot: None,
     });
 
     let (status, payload) = introspect(state, "lbk_secret_missing").await;
@@ -717,6 +735,7 @@ async fn introspect_returns_inactive_when_expired() {
         session_status: MockSessionStatus::Active,
         expected_subject: None,
         usage_scope_authorized: false,
+        budget_snapshot: None,
     });
 
     let (status, payload) = introspect(state, "lbk_secret_expired").await;
@@ -741,6 +760,7 @@ async fn introspect_returns_inactive_when_account_suspended() {
         session_status: MockSessionStatus::Active,
         expected_subject: None,
         usage_scope_authorized: false,
+        budget_snapshot: None,
     });
 
     let (status, payload) = introspect(state, "lbk_secret_suspended_account").await;
@@ -766,6 +786,7 @@ async fn introspect_returns_inactive_when_project_suspended() {
         session_status: MockSessionStatus::Active,
         expected_subject: None,
         usage_scope_authorized: false,
+        budget_snapshot: None,
     });
 
     let (status, payload) = introspect(state, "lbk_secret_suspended_project").await;
@@ -790,6 +811,7 @@ async fn introspect_omits_allowed_models_when_null() {
         session_status: MockSessionStatus::Active,
         expected_subject: None,
         usage_scope_authorized: false,
+        budget_snapshot: None,
     });
 
     let (status, payload) = introspect(state, "lbk_secret_valid").await;
@@ -822,6 +844,7 @@ async fn introspect_returns_empty_allowed_models_when_empty() {
         session_status: MockSessionStatus::Active,
         expected_subject: None,
         usage_scope_authorized: false,
+        budget_snapshot: None,
     });
 
     let (status, payload) = introspect(state, "lbk_secret_valid").await;
@@ -855,6 +878,7 @@ async fn introspect_round_trips_each_model_policy_value() {
             session_status: MockSessionStatus::Active,
             expected_subject: None,
             usage_scope_authorized: false,
+            budget_snapshot: None,
         });
 
         let (status, payload) = introspect(state, "lbk_secret_valid").await;
@@ -888,6 +912,7 @@ async fn introspect_fails_closed_to_deny_all_for_an_unknown_stored_model_policy_
         session_status: MockSessionStatus::Active,
         expected_subject: None,
         usage_scope_authorized: false,
+        budget_snapshot: None,
     });
 
     let (status, payload) = introspect(state, "lbk_secret_valid").await;
@@ -997,6 +1022,7 @@ async fn introspect_resolves_active_exchange_session_with_live_project_authoriza
         session_status: MockSessionStatus::Active,
         expected_subject: None,
         usage_scope_authorized: false,
+        budget_snapshot: None,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -1056,6 +1082,7 @@ async fn introspect_returns_inactive_for_an_expired_exchange_token() {
         session_status: MockSessionStatus::Active,
         expected_subject: None,
         usage_scope_authorized: false,
+        budget_snapshot: None,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -1094,6 +1121,7 @@ async fn introspect_returns_inactive_for_a_token_signed_by_an_unknown_key() {
         session_status: MockSessionStatus::Active,
         expected_subject: None,
         usage_scope_authorized: false,
+        budget_snapshot: None,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -1132,6 +1160,7 @@ async fn introspect_returns_inactive_for_a_self_issued_token_with_no_project_cla
         session_status: MockSessionStatus::Active,
         expected_subject: None,
         usage_scope_authorized: false,
+        budget_snapshot: None,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -1169,6 +1198,7 @@ async fn introspect_returns_inactive_when_exchange_subject_is_no_longer_a_member
         session_status: MockSessionStatus::Active,
         expected_subject: None,
         usage_scope_authorized: false,
+        budget_snapshot: None,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -1206,6 +1236,7 @@ async fn introspect_returns_inactive_when_exchange_project_is_suspended() {
         session_status: MockSessionStatus::Active,
         expected_subject: None,
         usage_scope_authorized: false,
+        budget_snapshot: None,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -1243,6 +1274,7 @@ async fn introspect_returns_inactive_when_exchange_account_is_suspended() {
         session_status: MockSessionStatus::Active,
         expected_subject: None,
         usage_scope_authorized: false,
+        budget_snapshot: None,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -1291,6 +1323,7 @@ async fn a_revoked_api_key_jwt_is_never_reinterpreted_as_an_active_exchange_sess
         session_status: MockSessionStatus::Active,
         expected_subject: None,
         usage_scope_authorized: false,
+        budget_snapshot: None,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -1340,6 +1373,7 @@ async fn a_token_carrying_the_api_key_audience_as_azp_is_refused_even_with_no_ap
         session_status: MockSessionStatus::Active,
         expected_subject: None,
         usage_scope_authorized: false,
+        budget_snapshot: None,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -1384,6 +1418,7 @@ async fn a_token_with_no_azp_claim_at_all_is_refused() {
         session_status: MockSessionStatus::Active,
         expected_subject: None,
         usage_scope_authorized: false,
+        budget_snapshot: None,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -1428,6 +1463,7 @@ async fn introspect_returns_inactive_when_session_is_revoked() {
         session_status: MockSessionStatus::Revoked,
         expected_subject: None,
         usage_scope_authorized: false,
+        budget_snapshot: None,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -1466,6 +1502,7 @@ async fn introspect_returns_inactive_when_session_is_expired() {
         session_status: MockSessionStatus::Expired,
         expected_subject: None,
         usage_scope_authorized: false,
+        budget_snapshot: None,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -1501,6 +1538,7 @@ async fn introspect_returns_inactive_when_session_row_not_found() {
         session_status: MockSessionStatus::NotFound,
         expected_subject: None,
         usage_scope_authorized: false,
+        budget_snapshot: None,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -1541,6 +1579,7 @@ async fn introspect_returns_inactive_when_no_sid_claim_at_all() {
         session_status: MockSessionStatus::Active,
         expected_subject: None,
         usage_scope_authorized: false,
+        budget_snapshot: None,
     });
 
     let (status, payload) = introspect(state, &token).await;
@@ -1586,6 +1625,7 @@ async fn resolve_exchange_token_context_errors_when_session_lookup_fails_never_a
         session_status: MockSessionStatus::LookupErrors,
         expected_subject: None,
         usage_scope_authorized: false,
+        budget_snapshot: None,
     });
 
     let result = lightbridge_authz_rest::handlers::exchange_token::resolve_exchange_token_context(
@@ -1614,5 +1654,122 @@ async fn resolve_exchange_token_context_errors_when_session_lookup_fails_never_a
     assert!(
         http_result.is_err(),
         "the HTTP introspection entrypoint must also refuse, not silently resolve `active: false`"
+    );
+}
+
+// ── ADR-0034 §15: the budget rides on the introspection response ─────────────────────────────
+//
+// The gateway makes ONE metadata call per request now, and these three tests are the contract
+// that makes that safe. The one that matters most is the ABSENT case: a missing figure must stay
+// missing all the way to the wire, because a `0` here reaches the gateway as
+// `402 budget_exhausted` for an account that may be fully funded.
+
+/// Builds a snapshot carrying a usable reading for the CURRENT period.
+fn mk_budget_snapshot(remaining_micros: i64) -> lightbridge_authz_budget::BudgetSnapshot {
+    let now = Utc::now();
+    lightbridge_authz_budget::BudgetSnapshot {
+        budget_account_id: "acct_1".to_string(),
+        period: Some(lightbridge_authz_budget::Period::current(now)),
+        ceiling_micros: Some(24_000_000),
+        spent_micros: Some(24_000_000 - remaining_micros),
+        remaining_micros: Some(remaining_micros),
+        next_reset_at: Some(now + Duration::days(7)),
+        refreshed_at: Some(now - Duration::seconds(9)),
+        stale_since: None,
+        last_seen_at: now,
+    }
+}
+
+fn mk_repo_with_snapshot(
+    snapshot: Option<lightbridge_authz_budget::BudgetSnapshot>,
+) -> MockOpaRepo {
+    MockOpaRepo {
+        api_key: Some(mk_api_key(ApiKeyStatus::Active, None)),
+        project: Some(mk_project()),
+        account: Some(mk_account()),
+        usage_calls: Arc::new(Mutex::new(vec![])),
+        verification_jwks: Vec::new(),
+        member_context: None,
+        member_role: None,
+        member_quota_tier: None,
+        session_status: MockSessionStatus::Active,
+        expected_subject: None,
+        usage_scope_authorized: false,
+        budget_snapshot: snapshot,
+    }
+}
+
+#[tokio::test]
+async fn introspect_carries_the_budget_when_a_snapshot_exists() {
+    let state = mk_state(mk_repo_with_snapshot(Some(mk_budget_snapshot(20_790_000))));
+
+    let (status, payload) = introspect(state, "lbk_secret_valid").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["budget_remaining_micros"], 20_790_000);
+    assert!(
+        payload.get("budget_next_reset_at").is_some(),
+        "the 402 body tells the user when the balance comes back; the gateway needs the instant"
+    );
+    let age = payload["budget_snapshot_age_seconds"]
+        .as_u64()
+        .expect("the age must be reported alongside the figure");
+    assert!(
+        (8..=12).contains(&age),
+        "the snapshot's own age must travel with it so a consumer can see the window it is \
+         acting inside; got {age}"
+    );
+}
+
+#[tokio::test]
+async fn introspect_omits_the_budget_entirely_when_there_is_no_snapshot() {
+    let state = mk_state(mk_repo_with_snapshot(None));
+
+    let (status, payload) = introspect(state, "lbk_secret_valid").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        payload["active"], true,
+        "an unknown budget must never make a valid credential introspect as inactive"
+    );
+    for field in [
+        "budget_remaining_micros",
+        "budget_next_reset_at",
+        "budget_snapshot_age_seconds",
+    ] {
+        assert!(
+            payload.get(field).is_none(),
+            "{field} must be ABSENT, not zero -- absent is what the AuthConfig publishes as \
+             `known: false` and the Lua refuses with 503, while a zero is a 402 for an account \
+             that may be fully funded"
+        );
+    }
+}
+
+#[tokio::test]
+async fn introspect_omits_a_budget_whose_period_has_rolled_over() {
+    let mut snapshot = mk_budget_snapshot(20_790_000);
+    snapshot.period = Some(lightbridge_authz_budget::Period::current(Utc::now()).previous());
+    let state = mk_state(mk_repo_with_snapshot(Some(snapshot)));
+
+    let (_, payload) = introspect(state, "lbk_secret_valid").await;
+
+    assert!(
+        payload.get("budget_remaining_micros").is_none(),
+        "at 00:00 UTC on the 1st every stored reading describes LAST month; serving it would hand \
+         the fleet a balance it has already spent"
+    );
+}
+
+#[tokio::test]
+async fn introspect_still_reports_a_negative_budget_rather_than_clamping_it() {
+    let state = mk_state(mk_repo_with_snapshot(Some(mk_budget_snapshot(-1_500_000))));
+
+    let (_, payload) = introspect(state, "lbk_secret_valid").await;
+
+    assert_eq!(
+        payload["budget_remaining_micros"], -1_500_000,
+        "overspend is reachable by construction (the gateway charges after the response); a \
+         flattering zero would hide the one number an overspend alert needs"
     );
 }

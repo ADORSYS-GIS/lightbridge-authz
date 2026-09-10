@@ -81,6 +81,17 @@ runs:
         PLATFORM: ${{ inputs.platform }}
         TAGS: ${{ steps.docker-setup.outputs.tags }}
         LABELS: ${{ steps.docker-setup.outputs.labels }}
+        # Build stamp (#573). The binaries already carry their own git SHA / commit date / rustc
+        # version, compiled in by `crates/lightbridge-authz-core/build.rs` during the `binaries`
+        # job. These three describe the IMAGE, which did not exist when those binaries were
+        # compiled, and are the only way `GET /version` can report both halves of "which build is
+        # this?" -- see `Dockerfile.dist`'s ARG->ENV block.
+        #
+        # `IMAGE_BUILD_SHA` is the commit this image build ran at, NOT the pushed digest: a digest
+        # cannot be baked into the artifact it identifies. `IMAGE_TAG` carries the immutable
+        # `:<commit-sha>` tag instead, which resolves to exactly one digest.
+        IMAGE_BUILD_SHA: ${{ inputs.app-version }}
+        IMAGE_TAG: ${{ steps.docker-setup.outputs.version-tag }}
       run: |
         set -euo pipefail
 
@@ -100,6 +111,9 @@ runs:
           --file Dockerfile.dist \
           --target "$TARGET" \
           --platform "$PLATFORM" \
+          --build-arg "IMAGE_BUILD_SHA=${IMAGE_BUILD_SHA}" \
+          --build-arg "IMAGE_TAG=${IMAGE_TAG}" \
+          --build-arg "IMAGE_BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
           "${label_args[@]}" \
           "${tag_args[@]}" \
           .

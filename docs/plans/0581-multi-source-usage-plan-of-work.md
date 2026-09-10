@@ -37,6 +37,38 @@ issue corpus, the ADRs, and the governance repo — so none gets settled by acci
 
 ---
 
+## 0a. "Would Timescale hypertables fix the slow queries?" — measured 2026-09-03
+
+The owner asked this directly. The answer, with the numbers behind it, is **partly — and not the
+expensive part**. Everything here was measured read-only on the production replica
+(`lightbridge-main-db-2`, database `usage`, PostgreSQL 18.4, 933,494 rows / 3,267 MB heap /
+625 MB indexes, `shared_buffers = 128MB`, `work_mem = 4MB`) plus a 2M-row local fixture built to
+production's row width (`.docker/it/seed-usage-perf-fixture.sql`). The console's estate-wide
+30-day overview query took **34.8 s** on production (2,993 ms picking buckets + 31,806 ms
+aggregating).
+
+Where that 34.8 s actually goes, and who fixes each part:
+
+| cost | share | what fixes it |
+|------|-------|---------------|
+| Reading 3,268 MB of heap for eighteen narrow columns, because inline `attributes` (avg 1,445 B, 87% of the row) makes a page hold ~4 rows instead of ~35 | ~27 s of 31.8 s in the aggregation, plus most of the bucket-pick step | **Shipped today**: the covering index (`migrations-usage/20260903000002`) — 279,627 → 13,436 pages on the fixture, 20.8× fewer. Timescale's **columnar compression** would attack the same cost from the other side and go further (`attributes` is a compressible blob nobody reads), but it is not the only way to get there, and PR-1b's `usage_request_events` split — which moves `attributes` out of the hot table entirely — is the real structural fix. |
+| Scanning the same rows a second time for the bucket list | 2,993 ms (8.6%) | **Shipped today**: one statement instead of two. Nothing to do with Timescale. |
+| `percentile_cont` forcing `GroupAggregate` + a disk-spilling `Sort` instead of `HashAggregate` | 222 ms vs 130 ms on the fixture with the index; 34,387 ms vs 31,500 ms on production without it | **Partly shipped today**: one multi-quantile call instead of three, and a `metrics` request field so a caller that does not need percentiles does not pay for them. **Continuous aggregates (#587) are the real fix** — they make the percentile a lookup instead of a computation — and they need `timescaledb_toolkit` (D1). |
+| Chunk exclusion (only reading the chunks a time range touches) | **~0 for the shapes the console actually issues** | Hypertables. But the console asks for 7d/30d/90d/mtd against a table with a **30-day retention window** — a 30-day query IS the whole table, so there are no chunks to exclude. Chunk exclusion earns its keep only once retention is longer than the typical query range (#582/#583's day/seat facts). |
+
+**Residual after this PR, before any Timescale work:** the estate-wide 30-day query should land
+around 1–2 s on production (13,436 pages of index instead of 418,280 of heap, extrapolating the
+fixture's 20.8× at production's shape), dominated by the aggregate itself rather than by I/O. That
+is the number #587's continuous aggregates would then take further, and the number PR-1a/1b should
+be judged against — not the 34.8 s it replaced.
+
+**So: no, hypertables are not the fix for this.** Compression and continuous aggregates are the
+two Timescale features that would help, chunk exclusion is not, and both remain gated on D1–D7.
+Nothing in this PR introduces or presumes Timescale; it is deliberately confined to plain-Postgres
+changes that hold whichever way D1 goes.
+
+---
+
 ## 1. Decision register — reserved for the maintainer
 
 Nothing below gets decided by an implementer. Gate decisions block Phase 1 DDL; the rest block
@@ -212,9 +244,43 @@ tests, dedup, `usage_identities`), then #582/#583 run in parallel.
 | Slice | What | Size |
 |---|---|---|
 | **PR-1a** | **Infra: Timescale-capable image on the usage CNPG tenant** (#489's infra half — lands in ai-helm/ai-helm-values, per D1). Evidence: `timescaledb_information.hypertables` queryable in the target cluster. | infra |
-| **PR-1b** | **Request-grain rewrite** (#489 + #549, under #491): `usage_request_events` hypertable — PK includes the time column, `by_range(<time>, '1 day')` (note: `chunk_time_interval =>` is invalid with `by_range` in TS 2.17, verified), CUID2 `id TEXT`, `source TEXT NOT NULL`, `cost_micro_usd BIGINT NULL` (NULL = unknown, never 0), dedup `UNIQUE (observed_at, source, dedup_key)` (`x-request-id` / `client_request_id`), allowlisted attribute tail, **`duration_ms INTEGER` + `upstream_ms INTEGER` (D18 — no carried-forward `latency_ms DOUBLE PRECISION`; `latency_*` response fields and the `null`-never-`0.0` rule unchanged; rewrite `docs/lightbridge-query-api.md`'s latency section and `docs/usage-api.md:67` in the same PR)**, `usage_identities` side table (PII refs, single-UPDATE erasure, sentinels like `missing:<source>:<claim>` preserved as literals), compression at 7d segmented by scope columns, retention per D6. **No `EXCEPTION WHEN OTHERS`; sabotage test proves the migration fails loudly.** Ingest writes the new table; `spend_for_account` repointed with the wire contract byte-stable (`SpendQueryResponse { total_cost: Option<f64> }`, µUSD unscaled) — note SUM-over-NULL semantics now differ from SUM-over-`NOT NULL DEFAULT 0`; assert the existing spend it-tests pass unmodified. One-off space reclaim (`pg_repack`/`VACUUM FULL`) scheduled, not improvised. Hard cutover: `DROP TABLE usage_events` ships as the *last* migration in the sequence, only after ingest is live; backfill the `signal_type='log'` subset first (only historical billing record). | L |
+| **PR-1b** | **Request-grain rewrite** (#489 + #549, under #491): `usage_request_events` hypertable — PK includes the time column, `by_range(<time>, '1 day')` (note: `chunk_time_interval =>` is invalid with `by_range` in TS 2.17, verified), CUID2 `id TEXT`, `source TEXT NOT NULL`, `cost_micro_usd BIGINT NULL` (NULL = unknown, never 0), dedup `UNIQUE (observed_at, source, dedup_key)` (`x-request-id` / `client_request_id`), allowlisted attribute tail, **`duration_ms INTEGER` + `upstream_ms INTEGER` (D18 — no carried-forward `latency_ms DOUBLE PRECISION`; `latency_*` response fields and the `null`-never-`0.0` rule unchanged; rewrite `docs/lightbridge-query-api.md`'s latency section and `docs/usage-api.md:67` in the same PR)**, `usage_identities` side table (PII refs, single-UPDATE erasure, sentinels like `missing:<source>:<claim>` preserved as literals), **`azp TEXT` + `operation TEXT` + `billing_plan TEXT` (the #648 bridge dimensions — carried forward as first-class columns, not re-derived; see the interim-bridge note below for the derivation table that must be reused verbatim)**, compression at 7d segmented by scope columns, retention per D6. **No `EXCEPTION WHEN OTHERS`; sabotage test proves the migration fails loudly.** Ingest writes the new table; `spend_for_account` repointed with the wire contract byte-stable (`SpendQueryResponse { total_cost: Option<f64> }`, µUSD unscaled) — note SUM-over-NULL semantics now differ from SUM-over-`NOT NULL DEFAULT 0`; assert the existing spend it-tests pass unmodified. One-off space reclaim (`pg_repack`/`VACUUM FULL`) scheduled, not improvised. Hard cutover: `DROP TABLE usage_events` ships as the *last* migration in the sequence, only after ingest is live; backfill the `signal_type='log'` subset first (only historical billing record).The query contract the console is on by then must survive the cutover byte-for-byte: `group_by`/`filters` on `azp`/`operation`/`billing_plan`, the `operation_in` set-membership filter, and the three dimension echoes on `UsageSeriesPoint`. | L |
 | **PR-1c** | **#582 execution grain**: `usage_executions`/`usage_model_calls`/`usage_tool_calls` ported from governance's proven schema (donor: `governance-core/migrations/postgres/20260803000001_telemetry_models`); dedup on `(<time>, trace_id, span_id)`; identity via `usage_identities`; ADR-0038 exception justified in the migration header; sabotage + replay-idempotency + NULL-money round-trip tests. | L |
 | **PR-1d** | **#583 day/seat grain**: `usage_day_facts` keyed `(source, day, subject_kind, subject_id)` with `subject_kind ∈ {org,user,repo,user_team}` + `usage_seat_snapshots`; upsert on natural key; aggregate-only sources tagged in-row (Copilot's 5-seat floor), never averaged into per-user data; join rule: `provider_user_id`, never `user_login` (gov#185); **zero-DDL second-source demonstration in CI** (governance#167's criterion — fixture vs real M365 data is a sub-decision). Watch: governance's day tables have `net_cost_micro_usd NOT NULL` — the port must restore NULL-means-unknown. | M–L |
+
+#### Interim bridge (#648) — `azp` / `operation` / `billing_plan` on `usage_events`, and it dies with the table
+
+Owner ruling, 2026-09-02: **bridge now, do not wait for PR-1b.** Zero of this epic had landed and
+the console's `/admin/usage` area needed the dimensions immediately, so #648 added them to the
+*current* `usage_events` as three nullable `TEXT` columns
+(`migrations-usage/20260902000001..3`), a batched backfill from `attributes`, three
+`(<dimension>, observed_at DESC)` indexes, `UsageGroupBy`/`UsageQueryFilters` entries, an
+`operation_in` set filter, and a `usage:read-all` admin scope bypass in `handlers/query.rs`.
+
+**This is deliberately disposable and is expected to die with `DROP TABLE usage_events`** in
+PR-1b's sequence. What must NOT die with it is the contract the console will be built on by then —
+PR-1b carries the three columns (see its row above) and reuses this derivation table **verbatim**:
+
+| Source, first match wins | Column |
+|---|---|
+| `azp`, `x-oidc-azp`, `oauth.azp`, `client_id` | `azp` |
+| `billing_plan`, `x-billing-plan` | `billing_plan` |
+| path from `x-envoy-origin-path`, `http.route`, `url.path`, `route_name` | `operation`, per the prefix table below |
+
+| Path prefix | `operation` |
+|---|---|
+| `/v1/chat/completions` | `chat_completions` |
+| `/v1/responses` | `responses` |
+| `/v1/messages` | `messages` |
+| `/v1/embeddings` | `embeddings` |
+| anything else | `other` |
+| *no path key at all* | `NULL` (never `other`) |
+
+Prefix match, not equality (a real request target carries a query string). If PR-1b renames the
+column to this plan's earlier `operation_name`, or changes a vocabulary value, it must say so in
+the same change so the console's `dashboards.yaml` and `openapi/usage.backend.yaml` move with it —
+silence here is what turns a rename into a blank dashboard. Source: `#648`, and the owner comment
+on this issue dated 2026-09-02.
 
 ### Phase 2 — authenticated door (starts in parallel with Phase 1; **D8 ruled — #585 unblocked**)
 

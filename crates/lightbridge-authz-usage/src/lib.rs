@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 use lightbridge_authz_bearer::{BearerTokenService, BearerTokenServiceTrait};
 use lightbridge_authz_core::{
     Error, Result, async_trait,
+    build_info::log_build_info,
     config::{Database, Oauth2},
     db::{DbPool, DbPoolTrait, is_database_ready},
     server::{dev_cors_enabled, serve_tls},
@@ -18,6 +19,7 @@ pub mod config;
 pub mod handlers;
 pub mod instrumentation;
 pub mod models;
+pub mod normalizer;
 pub mod repo;
 pub mod routers;
 pub mod scope_authority;
@@ -90,11 +92,34 @@ impl UsageRepoTrait for StoreRepo {
     }
 }
 
-fn health_routes(readiness_pool: Arc<dyn DbPoolTrait>) -> Router<Arc<UsageState>> {
+/// Service names reported by `GET /version` and the `service.build` startup log line (#573).
+///
+/// The usage binary binds TWO listeners on two ports (#347) with different auth postures, so they
+/// report as two distinct services: a support engineer asking "which one am I hitting?" gets an
+/// answer, rather than one ambiguous `authz-usage` for both.
+pub const SERVICE_USAGE_INGEST: &str = "authz-usage";
+/// See [`SERVICE_USAGE_INGEST`]. The mTLS-required query listener.
+pub const SERVICE_USAGE_QUERY: &str = "authz-usage-query";
+
+/// `GET /version` (#573): the build stamp of the process answering, as JSON.
+///
+/// Unauthenticated for the same reason `/healthz` is (see `lightbridge-authz-rest`'s
+/// `probe_router`): it names the running build and nothing else. On the ingest listener that
+/// matters more than elsewhere — that listener has no auth gate at all beyond being ClusterIP-only,
+/// and a version string is exactly the kind of non-secret an operator needs from it.
+async fn version_handler(service: &'static str) -> Json<lightbridge_authz_core::BuildInfo> {
+    Json(lightbridge_authz_core::build_info(service))
+}
+
+fn health_routes(
+    readiness_pool: Arc<dyn DbPoolTrait>,
+    service: &'static str,
+) -> Router<Arc<UsageState>> {
     Router::new()
         .route("/", get(root_handler))
         .route("/healthz", get(health_handler))
         .route("/healthz/startup", get(startup_handler))
+        .route("/version", get(move || version_handler(service)))
         .route(
             "/healthz/ready",
             get(move || {
@@ -115,7 +140,7 @@ pub fn build_ingest_router(
     readiness_pool: Arc<dyn DbPoolTrait>,
     dev_cors: bool,
 ) -> Router {
-    let router = health_routes(readiness_pool)
+    let router = health_routes(readiness_pool, SERVICE_USAGE_INGEST)
         .merge(
             SwaggerUi::new("/usage/v1/usage/docs")
                 .url("/usage/v1/usage/openapi.json", UsageDoc::openapi()),
@@ -140,7 +165,7 @@ pub fn build_query_router(
     readiness_pool: Arc<dyn DbPoolTrait>,
     dev_cors: bool,
 ) -> Router {
-    let router = health_routes(readiness_pool)
+    let router = health_routes(readiness_pool, SERVICE_USAGE_QUERY)
         .merge(routers::query_router())
         .with_state(state);
 
@@ -185,6 +210,8 @@ pub async fn start_usage_server(
     let ingest_app = build_ingest_router(state.clone(), pool.clone(), dev_cors);
     let query_app = build_query_router(state, pool, dev_cors);
 
+    log_build_info(SERVICE_USAGE_INGEST);
+    log_build_info(SERVICE_USAGE_QUERY);
     info!(
         "starting usage ingest listener on {}:{}",
         &usage.address, usage.port
@@ -257,6 +284,7 @@ async fn readiness_handler(pool: Arc<dyn DbPoolTrait>) -> StatusCode {
             crate::models::UsageSeriesPoint,
             crate::models::UsageScope,
             crate::models::UsageGroupBy,
+            crate::models::UsageMetric,
             crate::models::SpendQueryRequest,
             crate::models::SpendQueryResponse
         )
@@ -343,6 +371,47 @@ mod tests {
         );
     }
 
+    /// The 2026-09-03 query-cost work: `metrics` is the console's lever for skipping the
+    /// latency percentiles, so both halves of the contract -- the request field and the response
+    /// echo -- are pinned in the published schema. A caller that cannot see the field cannot use
+    /// it, and a caller that cannot see the echo cannot tell "no latency samples" from "I did not
+    /// ask for percentiles".
+    #[test]
+    fn usage_openapi_should_publish_the_metrics_selection_contract() {
+        let doc = usage_openapi();
+
+        let metrics: Vec<&str> = doc["components"]["schemas"]["UsageMetric"]["enum"]
+            .as_array()
+            .expect("UsageMetric should publish an enum")
+            .iter()
+            .map(|v| v.as_str().expect("enum values are strings"))
+            .collect();
+        assert_eq!(metrics, vec!["totals", "latency_percentiles"]);
+
+        assert!(
+            doc["components"]["schemas"]["UsageQueryRequest"]["properties"]["metrics"].is_object(),
+            "expected UsageQueryRequest.metrics in the published schema"
+        );
+        let required: Vec<&str> = doc["components"]["schemas"]["UsageQueryRequest"]["required"]
+            .as_array()
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|value| value.as_str())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        assert!(
+            !required.contains(&"metrics"),
+            "metrics must stay optional -- every caller written before it existed omits it"
+        );
+
+        assert!(
+            doc["components"]["schemas"]["UsageQueryResponse"]["properties"]["metrics"].is_object(),
+            "expected UsageQueryResponse.metrics in the published schema"
+        );
+    }
+
     /// #578: pins `UsageQueryResponse.truncated` in the published schema, the same seam
     /// `usage_openapi_should_publish_the_latency_percentile_contract` above guards for the
     /// latency fields -- a client generated from `openapi/usage.backend.yaml` needs this field to
@@ -398,6 +467,62 @@ mod tests {
             responses.get("403").is_some(),
             "expected /usage/v1/spend/query to document a 403 response"
         );
+    }
+
+    /// #648: the same console-facing seam as the latency/truncation guards above, for the three
+    /// usage dimensions. `converse-frontends` hand-maintains `openapi/usage.backend.yaml` and
+    /// generates its typed client from it, so these enum values ARE the contract -- a rename here
+    /// that is not mirrored there turns "cost by channel" into a 400 nobody notices until a
+    /// dashboard is blank. Asserting the published document (not just the Rust enum) is what
+    /// makes that drift fail on this side first.
+    #[test]
+    fn usage_openapi_should_publish_the_usage_dimension_contract() {
+        let doc = usage_openapi();
+
+        let group_by: Vec<&str> = doc["components"]["schemas"]["UsageGroupBy"]["enum"]
+            .as_array()
+            .expect("UsageGroupBy should publish an enum")
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect();
+        assert_eq!(
+            group_by,
+            vec![
+                "account_id",
+                "project_id",
+                "api_key_id",
+                "user_id",
+                "user_name",
+                "model",
+                "metric_name",
+                "signal_type",
+                "source",
+                "azp",
+                "operation",
+                "billing_plan",
+            ],
+            "UsageGroupBy's published values are the console's client contract"
+        );
+
+        let filters = &doc["components"]["schemas"]["UsageQueryFilters"]["properties"];
+        for field in ["source", "azp", "operation", "billing_plan", "operation_in"] {
+            assert!(
+                filters.get(field).is_some(),
+                "expected UsageQueryFilters.{field} in the published schema"
+            );
+        }
+        assert_eq!(
+            filters["operation_in"]["items"]["type"], "string",
+            "operation_in must publish as an array of strings"
+        );
+
+        let point = &doc["components"]["schemas"]["UsageSeriesPoint"]["properties"];
+        for field in ["source", "azp", "operation", "billing_plan"] {
+            assert!(
+                point.get(field).is_some(),
+                "expected UsageSeriesPoint.{field} in the published schema"
+            );
+        }
     }
 
     #[test]

@@ -2,8 +2,15 @@
 
 Authentication is delegated to Keycloak; **authorization** is decided here. Every request to the
 CRUD API (`authz-api`) and the MCP server (`lightbridge-mcp`) is gated on a **permission**. This
-document describes how the roles Keycloak puts on a JWT become permissions, and which permission
-each operation requires.
+document describes how the roles on a JWT become permissions, which permission each operation
+requires, and — since ADR-0033 — **where those roles come from in the first place**.
+
+> **Roles are not a Keycloak fact.** On the human plane `authz-idp` is the issuer, and it stamps
+> the roles claim itself from data this deployment owns: the `project_members` roster, and
+> `platform_role_grants` (ADR-0033). Nothing is read back from Keycloak, ever, and nothing is
+> written to it — the ADR-0014 pattern. See
+> [Platform roles are a table](#platform-roles-are-a-table-adr-0033), which is the section to read
+> first if your question is "why is this person an admin".
 
 > Ownership still applies. RBAC is a *coarse capability* check (may this caller create projects at
 > all?). Account ownership (`accounts.id = sub`) and the per-row `project_members` roster still
@@ -12,7 +19,9 @@ each operation requires.
 
 ## How it works
 
-1. Keycloak issues a JWT carrying the caller's roles in a single, flat, top-level claim.
+1. The issuer mints a JWT carrying the caller's roles in a single, flat, top-level claim. On the
+   human plane that issuer is **`authz-idp`**, and the claim is assembled at mint time by
+   `oauth2.signing.claim_mappers` (see below) from this deployment's own tables.
 2. `lightbridge-authz-bearer` validates the JWT (JWKS) and reads that claim by name.
 3. Each role string is mapped to a set of permissions via configuration.
 4. The union of those permissions is attached to the request.
@@ -37,8 +46,24 @@ Enforcement is centralized, so the handlers/tools themselves contain no authoriz
   `CachedAuthProvider` caches the one resulting context and reuses it for every frame's dispatch), so
   it can no longer see an individual frame's op-id to authorize it here at all. See "Batch RPC:
   per-frame RBAC" below for where per-frame enforcement actually happens post-0.8.4.
-- **MCP** — `call_tool` maps the tool name to the required permission and checks it before
-  dispatching. It likewise fails closed (an unmapped tool name is rejected).
+- **MCP** (`lightbridge-mcp`) — `call_tool` resolves the tool name to its RPC `op_id` and asks
+  **the same `rpc_authorize::required_permission` map** the two gates above use
+  (`app/lightbridge-authz/src/mcp_rbac.rs`, lightbridge-authz#122 / #645). It is not a mirror of
+  that map and no longer a copy of it: the MCP surface holds only a `tool -> op_id` table, and the
+  permission comes from one place. It fails closed the same way — an unmapped tool name, or a tool
+  whose op-id the map denies unconditionally, is rejected — and honours the same
+  `AUTHENTICATED_ONLY_OP_IDS` exception (`get-my-access`, `get-build-info` need a live token and
+  nothing more). `app/lightbridge-authz/tests/mcp_parity_tests.rs` fails the build if any reachable
+  RPC op-id has no MCP tool, or if a tool's gate differs from its op-id's REST permission.
+
+  Since #670 the surface is **70 advertised tools**: all **68** reachable RPC op-ids (it was 31 of
+  68 before) plus the two MCP-only validation tools that have no RPC twin, enumerated in
+  `mcp_rbac::MCP_ONLY_TOOL_PERMISSIONS` (`app/lightbridge-authz/src/mcp_rbac.rs:92`) at
+  `apikey:validate`. `mcp_rbac::gated_tools()` (`:114`) is the one enumeration; three consumers now
+  derive from it rather than restating it, the third having been added by #672 after the *second*
+  hand-typed copy — `EXPECTED_MCP_TOOLS` in `.docker/it/servers_it.py`, a Python file that cannot
+  import the crate — turned `main` red on merge. That guard reads the Python file from the Rust
+  side and fails loudly (not vacuously) if the block is ever renamed or reshaped.
 
 ### Two gates on the CRUD surface, in order
 
@@ -205,9 +230,257 @@ Used when `oauth2.rbac.role_permissions` is not configured
 
 | Role                 | Grants                                | Effective permissions                              |
 | -------------------- | ------------------------------------- | -------------------------------------------------- |
-| `lightbridge-admin`  | `*`                                   | all permissions                                    |
-| `lightbridge-editor` | `account:create`, `account:read`, `project:*`, `apikey:*`, `session:revoke-own`, `budget:read-own` | self-provision own account; read accounts; full project + api-key lifecycle; log out own sessions; see own budget |
-| `lightbridge-viewer` | `account:create`, `account:read`, `project:read`, `apikey:read`, `session:revoke-own`, `budget:read-own` | self-provision own account; otherwise read-only, plus log out own sessions and see own budget |
+| `lightbridge-admin`  | `*`                                   | all permissions — including `rbac:manage`, i.e. the ability to grant `lightbridge-admin` to anyone, so this is the role to hand out deliberately and to nobody else by default (ADR-0033) |
+| `lightbridge-editor` | `account:create`, `account:read`, `project:*`, `apikey:*`, `session:read-own`, `session:revoke-own`, `budget:read-own` | self-provision own account; read accounts; full project + api-key lifecycle; list and log out own sessions; see own budget |
+| `lightbridge-viewer` | `account:create`, `account:read`, `project:read`, `apikey:read`, `session:read-own`, `session:revoke-own`, `budget:read-own` | self-provision own account; otherwise read-only, plus list and log out own sessions and see own budget |
+
+> **Divergence worth knowing about, found while adding `session:read-own` (#649):** the shipped
+> `config/default.yaml` and `.docker/authz/container.yaml` set `role_permissions` explicitly, which
+> REPLACES this default table entirely — and those files have never listed `session:revoke-own` for
+> either non-admin role (they do list `budget:self-refill` for the editor, which this table does
+> not). `session:read-own` was added to both files by #649, so listing your own sessions works out
+> of the box; revoking one still does not under the shipped config, and closing that gap is its own
+> change, not a silent widening inside a read story.
+
+## Platform roles are a table (ADR-0033)
+
+### The problem this closes
+
+Prod configured the roles mapper as `owner → ["lightbridge-admin"]`
+(`ai-helm-values/environments/prod/values/lightbridge-app.yaml:266-273`, repeated at 863 and 1172).
+`owner` is the claim source's value for "the acting subject owns the account this project belongs
+to" — and under [ADR-0026](adr/0026-one-identity-may-own-many-accounts.md) **every signed-in person
+owns an account**. So every authenticated user was minted `lightbridge-admin`, which the default map
+expands to `*`: every permission in the enum.
+
+That was never a bug in a line of code. It was a configuration whose meaning changed underneath it
+when ADR-0026 landed, with no YAML changing. Nothing could have flagged it, because nothing in the
+system knew that "who should be an admin" was a question anybody had answered. That is the real
+content of [#262](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/262) "full RBAC": **admin
+was a default, not a decision.**
+
+### The model
+
+`platform_role_grants` (migration `20260902000006`) makes a platform role a row somebody wrote:
+
+| Column       | Meaning                                                                             |
+| ------------ | ----------------------------------------------------------------------------------- |
+| `id`         | CUID2                                                                                |
+| `user_id`    | the **person** (`users.id`), not an account — a role follows the human across every account they own (ADR-0026) |
+| `role`       | a role name from `oauth2.rbac.role_permissions`; validated on write, not by a `CHECK` |
+| `granted_by` | the granting admin's `users.id`, or **NULL = CLI bootstrap**                          |
+| `granted_at` | database `now()`, never caller-supplied — an audit row cannot be backdated            |
+| `revoked_at` | NULL = active. Revocation is a soft delete: the history *is* the product              |
+| `reason`     | why. Write it down                                                                    |
+
+A **partial** unique index over `(user_id, role) WHERE revoked_at IS NULL` does two jobs: grant →
+revoke → grant is a normal history rather than a conflict, and `grantPlatformRole` is idempotent
+(`ON CONFLICT … DO NOTHING`, then read the existing row back — a repeat grant is not a new decision,
+so the original `reason` and `granted_by` stand).
+
+`role` is free TEXT with no `CHECK` and no enum on purpose: the role catalogue is operator
+configuration, so a database constraint would hard-code one deployment's config into the schema.
+Both writers refuse a role absent from the configured catalogue instead — a row for
+`lightbridge-admn` confers nothing while looking exactly like a successful grant, and the operator
+would find out only when the person it was for could not do anything.
+
+### How a grant becomes a claim
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Person as Person (browser/CLI)
+    participant IdP as authz-idp<br/>(oauth2_op/store.rs)
+    participant Mappers as claim_mappers.rs<br/>resolve_mapped_claims
+    participant DB as Postgres
+    participant API as authz-api<br/>rpc_authorize + auth_provider
+
+    Person->>IdP: POST /oauth2/token (exchange | refresh | authorization_code)
+    IdP->>Mappers: resolve_mapped_claims(project_id, acting_account, owning_account)
+    Mappers->>DB: project_member_role(project, account)  [ClaimSource::ProjectRole]
+    DB-->>Mappers: "owner" | "lead" | "member" | none
+    Mappers->>DB: resolve_user_id_for_account(account)  [ClaimSource::PlatformRoles]
+    DB-->>Mappers: users.id | none
+    Mappers->>DB: active_platform_roles_for_user(user)
+    DB-->>Mappers: ["lightbridge-admin", ...] | []
+    Note over Mappers: map + default per source,<br/>then UNION per claim name, deduped
+    alt any lookup errored
+        Mappers--x IdP: Err
+        IdP--xPerson: 500 server_error (fail-closed: NO token is issued)
+    else resolved (an empty grant set is a normal answer)
+        Mappers-->>IdP: lightbridge_api_roles = [...]
+        IdP-->>Person: access_token (+ refresh_token)
+    end
+
+    Person->>API: POST /rpc/<op_id> (Bearer)
+    API->>API: roles claim -> permissions_for_roles(compiled Rbac)
+    API-->>Person: 403 if the op's permission is absent, else dispatch
+```
+
+Two things in that diagram carry the whole design:
+
+**Fail-closed.** A lookup failure REFUSES the mint. Omitting the claim instead would produce a token
+whose roles are empty, which `permissions_for_roles` reads as "no permissions" — indistinguishable
+on the wire from a legitimately unprivileged user, turning a database blip into a silent
+authorization failure that looks like a policy decision. An **empty grant set is not a failure**: a
+person granted nothing mints normally with whatever the project mapper contributed.
+
+**Union, never overwrite.** Several mappers may name the same claim; their values MERGE,
+deduplicated, in mapper-declaration order. That is the mechanism by which the project-role default
+and the platform grants coexist on `lightbridge_api_roles`. Last-one-wins would make the roles claim
+depend on YAML ordering — a values-file edit must not be able to cause that class of silent
+authorization surprise.
+
+The two sources apply their `map` differently, deliberately:
+
+| Source           | Resolves to                       | Unmapped source value                        |
+| ---------------- | --------------------------------- | -------------------------------------------- |
+| `project_role`   | a roster POSITION (`owner`/`lead`/`member`) — not a role name, so it must be translated | falls through to `default` |
+| `platform_roles` | role NAMES already                | **contributes itself** — no mapping table to keep in sync with the grants you hand out |
+
+### The claim_mappers block to deploy
+
+Post-cutover, `oauth2.signing.claim_mappers` reads:
+
+```yaml
+oauth2:
+  signing:
+    claim_mappers:
+      - claim: lightbridge_api_roles
+        source: project_role
+        map:
+          owner: ["lightbridge-viewer"]
+          lead: ["lightbridge-editor"]
+          member: ["lightbridge-viewer"]
+        default: []
+      - claim: lightbridge_api_roles
+        source: platform_roles
+        default: []
+```
+
+**Account owners default to `lightbridge-viewer`** (owner's binding ruling, 2026-09-02): editor
+(`project:*`, `apikey:*`, `account:create`) is too broad to hand every signed-in human by default.
+An owner who needs more asks, somebody grants it, and there is a row saying who and why.
+
+> **Sequencing is not optional.** A `platform_roles` mapper configured before migration
+> `20260902000006` is live refuses **every** mint — that is the fail-closed contract working exactly
+> as designed, and it takes the whole human plane down. Deploy the image first, bootstrap the first
+> admins (`rbac grant`), *then* change the mapper. The full order is
+> A2 → A5 → B3 → B1 → C9; any other order locks every operator out of `/admin/*`.
+
+### A grant's lifecycle, and how long it takes to bite
+
+```mermaid
+stateDiagram-v2
+    [*] --> NoGrant: person exists in `users`
+
+    NoGrant --> Active: rbac grant (granted_by = NULL)
+    NoGrant --> Active: grantPlatformRole (granted_by = admin's users.id)
+    Active --> Active: repeat grant — idempotent, returns the SAME row,<br/>original reason/granter stand
+
+    Active --> InTokens: next mint (exchange | refresh | authorization_code)
+    InTokens --> InTokens: refresh re-resolves LIVE on every rotation
+
+    Active --> Revoked: revokePlatformRole / rbac revoke<br/>(stamps revoked_at, then revokes the person's sessions)
+    InTokens --> Revoked: same call — sessions closed, so no re-mint
+    Revoked --> Active: re-grant mints a NEW row<br/>(the partial index is over ACTIVE rows only)
+
+    Revoked --> Revoked: second revoke REFUSED —<br/>never re-stamps the original revoked_at
+
+    note right of InTokens
+        The only window: an access token minted
+        BEFORE the revoke keeps the role until it
+        expires. Bounded by oauth2.token_exchange
+        .access_ttl_seconds (900s in prod), not by
+        the session or the refresh chain.
+    end note
+
+    note left of NoGrant
+        There is deliberately NO "granted but inert"
+        state to draw. A role absent from
+        oauth2.rbac.role_permissions is refused at
+        WRITE time, in both writers, so the table can
+        never hold a grant that confers nothing --
+        the failure mode that would otherwise look
+        exactly like a successful grant.
+    end note
+```
+
+**Propagation is bounded by the access-token TTL.** A grant reaches a person's token at the next
+mint, not before — the same ADR-0014 property `budget_tier` already has. For a grant that is fine:
+gaining a capability a few minutes late is not a security event.
+
+For a **revocation** it is not fine on its own, so `revokePlatformRole` (and `rbac revoke`) also run
+the existing `revokeSubjectSessions` path for **every account the person owns**. Without that, the
+still-valid access token keeps carrying the role and — worse — a refresh keeps re-minting it from
+the same live session for as long as the refresh chain lives. With it, the worst case collapses to
+the remaining lifetime of one already-issued access token.
+
+### Bootstrap runbook (the first admin)
+
+`grantPlatformRole` requires `rbac:manage`, which comes from a role, which after the cutover nobody
+is minted by default. There is no admin to grant the first admin. The CLI breaks the cycle by
+writing the row directly:
+
+```bash
+# Inside a pod that already has CONFIG_PATH and database credentials --
+# a k8s Job or `kubectl exec`, exactly like `idp jwk rotate`.
+lightbridge-authz rbac grant \
+  --user selast@example.com \
+  --role lightbridge-admin \
+  --reason "platform owner, bootstrap 2026-09"
+
+lightbridge-authz rbac list --role lightbridge-admin
+# GRANT_ID   USER_ID   ROLE               GRANTED_BY   REASON
+# c1f...     kc-u...   lightbridge-admin  CLI          platform owner, bootstrap 2026-09
+
+lightbridge-authz rbac revoke --user selast@example.com --role lightbridge-admin --reason "offboarded"
+```
+
+- `--user` takes a `users.id` **or** an email. An email matching **more than one person is a hard
+  refusal**, never a pick: `federated_identities` is unique on `(issuer, subject)`, not on `email`,
+  so the same address logged in through two realms is two rows, two accounts, two `users` rows.
+  Choosing one would grant admin to the wrong human, silently. The error lists every candidate id.
+- `granted_by` is **always NULL** on this path. That is what distinguishes a bootstrap from a
+  console grant forever after, and it is the honest value even when the operator has a user id: an
+  operator with database credentials made this decision, not anybody in `users`.
+- Every failure exits non-zero, so a Job that reports success really did write the row.
+- The new role reaches the person's token only at their next mint — tell them to sign out and back
+  in if they cannot wait out the TTL.
+
+### The RPC surface
+
+| Procedure                                                                   | Permission                    |
+| --------------------------------------------------------------------------- | ----------------------------- |
+| `listPlatformRoleGrants({ userId?, role?, includeRevoked?, after?, limit? })` | `rbac:manage`                 |
+| `grantPlatformRole({ userId, role, reason? })`                               | `rbac:manage`                 |
+| `revokePlatformRole({ grantId, reason? })`                                   | `rbac:manage`                 |
+| `getMyAccess() → { userId, roles[], permissions[] }`                          | **none — any authenticated caller** |
+
+The three write/read-all procedures share ONE permission because a caller who can grant a role can
+trivially list who holds it (grant to themselves, read it back); splitting read from write would be
+granularity theatre. `rbac:manage` is its own permission rather than a reuse of `user:read` or any
+`account:*` grant because it is the one capability that can hand out every other capability:
+**whoever can write this table can make themselves `lightbridge-admin`.**
+
+`getMyAccess` is the deliberate opposite. It is one of two entries in
+`rpc_permission_map::AUTHENTICATED_ONLY_OP_IDS` (the other being `getBuildInfo`, #573 — see
+[docs/build-info.md](build-info.md)), the enumerated exception to the fail-closed
+"unmapped op-id is denied" rule — a list rather than a heuristic, precisely so that adding another
+is a conscious edit somebody reviews. Gating it would defeat its purpose (the console calls it to
+find out what it may render, so a permission requirement makes "you may not ask what you may do" a
+reachable state), and it discloses nothing: every value it returns is already derivable from the
+token the caller is holding.
+
+Both halves of its answer are **read back out of the auth context**, not re-derived: `roles` from
+the context's roles extension, `permissions` from the `auth().perm*` booleans `build_context`
+populated from the caller's real `TokenInfo::has_permission` verdicts. A console that
+re-implemented the role → permission map would drift from the server's, and the drift shows up as a
+screen offering an action the backend then refuses — or, worse, hiding one it would have allowed.
+
+`listPlatformRoleGrants` defaults to **active grants only**; `includeRevoked: true` is the audit
+view. Pages are newest-first, cursored on `grantedAt` (never on `id` — ADR-0039: CUID2 has no
+defined ordering), `limit` defaults to 50 and clamps at 200.
 
 ## Permissions and the operations they gate
 
@@ -215,6 +488,14 @@ Each permission is the canonical `resource:action` string used in config and gra
 API the operation is an RPC `op_id` (`POST /rpc/{op_id}`); the equivalent MCP tool requires the same
 permission. cratestack's `op_id` scheme is `model.<Model>.<verb>` (verb ∈ `list|get|create|update|
 delete`) for generated model CRUD and `procedure.<name>` for the hand-written procedures.
+
+There are **37** permissions, and the list that decides is
+`Permission::ALL` at `crates/lightbridge-authz-core/src/authz.rs:196` — not this page. Five of them
+arrived on 2026-09-02/03 (32 → 37): `budget:schedule-manage` (#653), `session:read` and
+`session:read-own` (#657), `user:read` (#655), `rbac:manage` (#656). If you are adding one, add the
+variant, its `ALL` entry, its `as_str`, its `perm…` boolean on the schema's `auth Principal` block
+and its op-id row in `rpc_permission_map` — the `.claude/skills/authz-procedure` skill walks the
+whole set, and `schema_policy_sync_tests` fails CI if the schema's `@allow` clauses drift from it.
 
 This table is the source of truth for `rpc_authorize::required_permission`. **Any RPC `op_id` not
 listed here is denied unconditionally (fail closed).**
@@ -224,7 +505,7 @@ listed here is denied unconditionally (fail closed).**
 `model.User.*` verb is denied unconditionally by the rule above; no new entry was needed here or
 in `rpc_authorize.rs`. `federated_identities` has no RPC surface either, and never will through the
 generated CRUD path — it is deliberately absent from `authz.cstack` entirely (see
-[`docs/architecture/data-model.md`](./architecture/data-model.md#users-and-federated-identities-adr-0024)).
+[`docs/architecture/data-model.md`](./architecture/data-model.md#users-and-federated-identities-adr-0024-corrected-2026-08-25)).
 
 **Every `budget:*` row below is served at `POST /budget/rpc/{op_id}` on the separate
 `authz-budget` service, not `POST /rpc/{op_id}` on `authz-api`** (hard cutover — see
@@ -251,33 +532,120 @@ scope for #401.
 | `account:provision` | `procedure.provisionAccount`                       | — (no MCP tool yet)                 |
 | `project:create`  | `model.Project.create`                               | `create-project`                    |
 | `project:read`    | `model.Project.list`, `model.Project.get`            | `list-projects`, `get-project`      |
-| `project:update`  | `model.Project.update`, `procedure.setDefaultProject`, `procedure.listModelCatalog`, `procedure.setProjectQuota`, `procedure.setProjectAllowedModels`, `procedure.setProjectModelPolicy` | `update-project`, `set-default-project`, `set-project-quota`, `set-project-allowed-models`, `set-project-model-policy` |
+| `project:update`  | `model.Project.update`, `procedure.setDefaultProject`, `procedure.listModelCatalog`, `procedure.setProjectQuota`, `procedure.setProjectAllowedModels`, `procedure.setProjectModelPolicy` | `update-project`, `set-default-project`, `list-model-catalog`, `set-project-quota`, `set-project-allowed-models`, `set-project-model-policy` |
 | `project:delete`  | `model.Project.delete`                               | `delete-project`                    |
 | `project:disable` | `procedure.disableProject`, `procedure.enableProject`| `disable-project`, `enable-project` |
 | `project:member`  | `procedure.listProjectRoster`, `procedure.addProjectMember`, `procedure.removeProjectMember`, `procedure.setProjectMemberRole`, `procedure.setProjectMemberQuotaTier` | `list-project-roster`, `add-project-member`, `remove-project-member`, `set-project-member-role`, `set-project-member-quota-tier` |
-| `apikey:create`   | `procedure.createApiKey`, `procedure.listBillingPlans` | `create-api-key`                  |
-| `apikey:read`     | `model.ApiKey.list`, `model.ApiKey.get`, `procedure.listMyExpiringApiKeys` | `list-api-keys`, `get-api-key` |
+| `apikey:create`   | `procedure.createApiKey`, `procedure.listBillingPlans` | `create-api-key`, `list-billing-plans` |
+| `apikey:read`     | `model.ApiKey.list`, `model.ApiKey.get`, `procedure.listMyExpiringApiKeys` | `list-api-keys`, `get-api-key`, `list-my-expiring-api-keys` |
 | `apikey:update`   | `model.ApiKey.update`                                | `update-api-key`                    |
 | `apikey:delete`   | `model.ApiKey.delete`                                | `delete-api-key`                    |
 | `apikey:revoke`   | `procedure.revokeApiKey`                             | `revoke-api-key`                    |
 | `apikey:rotate`   | `procedure.rotateApiKey`                             | `rotate-api-key`                    |
 | `apikey:validate` | — (OPA server, Basic-auth)                           | `validate-api-key`, `validate-authorino-api-key` |
-| `budget:policy-activate` | `procedure.activateBudgetPolicy`                | — (no MCP tool yet)                 |
-| `budget:policy-read`     | `procedure.getBudgetPolicyStatus`               | — (no MCP tool yet)                 |
-| `budget:policy-simulate` | `procedure.simulateBudgetPolicy`                | — (no MCP tool yet)                 |
-| `budget:self-refill`     | `procedure.requestBudgetRefill`, `procedure.getMyBudgetRefillLadder` | — (no MCP tool yet)   |
-| `budget:review`          | `procedure.listPendingAugmentationRequests`, `procedure.approveAugmentationRequest`, `procedure.rejectAugmentationRequest` | — (no MCP tool yet) |
-| `budget:read-own`        | `procedure.getMyBudgetBalance`, `procedure.listMyBudgetGrants`, `procedure.listMyAugmentationRequests` | — (no MCP tool yet) |
-| `budget:read`            | `procedure.getBudgetBalance`                    | — (no MCP tool yet)                 |
-| `budget:audit-read`      | `procedure.listBudgetGrants`                    | — (no MCP tool yet)                 |
-| `budget:grant`           | `procedure.grantBudget`                         | — (no MCP tool yet)                 |
-| `budget:revoke`          | `procedure.revokeBudgetGrant`                   | — (no MCP tool yet)                 |
-| `budget:policy-write`    | `procedure.createBudgetPolicyRevision`          | — (no MCP tool yet)                 |
-| `session:revoke-own`     | `procedure.revokeOwnSessions`                        | — (no MCP tool yet)                 |
-| `session:revoke`         | `procedure.revokeSubjectSessions`                    | — (no MCP tool yet)                 |
+| `budget:policy-activate` | `procedure.activateBudgetPolicy`                | `activate-budget-policy`            |
+| `budget:policy-read`     | `procedure.getBudgetPolicyStatus`               | `get-budget-policy-status`          |
+| `budget:policy-simulate` | `procedure.simulateBudgetPolicy`                | `simulate-budget-policy`            |
+| `budget:self-refill`     | `procedure.requestBudgetRefill`, `procedure.getMyBudgetRefillLadder` | `request-budget-refill`, `get-my-budget-refill-ladder` |
+| `budget:review`          | `procedure.listPendingAugmentationRequests`, `procedure.approveAugmentationRequest`, `procedure.rejectAugmentationRequest` | `list-pending-augmentation-requests`, `approve-augmentation-request`, `reject-augmentation-request` |
+| `budget:read-own`        | `procedure.getMyBudgetBalance`, `procedure.listMyBudgetGrants`, `procedure.listMyAugmentationRequests` | `get-my-budget-balance`, `list-my-budget-grants`, `list-my-augmentation-requests` |
+| `budget:read`            | `procedure.getBudgetBalance`, `procedure.getEffectiveResetSchedule` | `get-budget-balance`, `get-effective-reset-schedule` |
+| `budget:audit-read`      | `procedure.listBudgetGrants`                    | `list-budget-grants`                |
+| `budget:grant`           | `procedure.grantBudget`                         | `grant-budget`                      |
+| `budget:revoke`          | `procedure.revokeBudgetGrant`                   | `revoke-budget-grant`               |
+| `budget:policy-write`    | `procedure.createBudgetPolicyRevision`          | `create-budget-policy-revision`     |
+| `budget:schedule-manage` | `procedure.listBudgetResetSchedules`, `procedure.createBudgetResetSchedule`, `procedure.updateBudgetResetSchedule`, `procedure.deleteBudgetResetSchedule`, `procedure.runBudgetResetScheduleNow` | `list-budget-reset-schedules`, `create-budget-reset-schedule`, `update-budget-reset-schedule`, `delete-budget-reset-schedule`, `run-budget-reset-schedule-now` |
+| `session:read-own`       | `procedure.querySessions`                            | `query-sessions`                    |
+| `session:read`           | — (widens `procedure.querySessions`; see below)      | — (widens `query-sessions` the same way) |
+| `session:revoke-own`     | `procedure.revokeOwnSessions`, `procedure.revokeSession` | `revoke-own-sessions`, `revoke-session` |
+| `session:revoke`         | `procedure.revokeSubjectSessions` (and widens `procedure.revokeSession`; see below) | `revoke-subject-sessions` |
 | `usage:read-all`         | — (not an RPC op-id; see note below)                 | — (no MCP tool)                     |
+| `user:read`              | `procedure.resolveUserProfiles`, `procedure.searchUsers` (and widens `procedure.resolveActorLabels`; see below) | `resolve-user-profiles`, `search-users` |
+| `rbac:manage`            | `procedure.listPlatformRoleGrants`, `procedure.grantPlatformRole`, `procedure.revokePlatformRole` | `list-platform-role-grants`, `grant-platform-role`, `revoke-platform-role` |
+| **none** (any authenticated caller) | `procedure.getMyAccess`, `procedure.getBuildInfo`, `procedure.resolveActorLabels` — the three enumerated exceptions to "unmapped op-id is denied"; see [Platform roles are a table](#platform-roles-are-a-table-adr-0033), [docs/build-info.md](build-info.md) and [docs/admin-identity-resolution.md](admin-identity-resolution.md) | `get-my-access`, `get-build-info`, `resolve-actor-labels` |
 
 `read` covers both the list and get operations for a resource.
+
+### The MCP surface serves both halves, one scope per tool
+
+`lightbridge-mcp` is the one listener that serves the `crud` and `budget` op-id sets together. That
+is not a hole in the hard `authz-api`/`authz-budget` cutover described above — that split is about
+which *HTTP listener* answers `POST /rpc/{op_id}`, and MCP is not an RPC listener. What MCP must
+preserve is the `auth().rpcScope` clause every mapped op-id's schema policy checks, and it does:
+`LightbridgeMcpHandler::procedure_context` derives the scope **per tool** from
+`rpc_authorize::is_budget_op_id` — the identical predicate `RpcScope::permits` uses to split the two
+routers — so a budget tool's context carries `rpcScope == "budget"` and a crud tool's carries
+`"crud"`, and neither can satisfy the other's clause.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as MCP client
+    participant B as bearer_auth<br/>(middleware/mod.rs)
+    participant T as call_tool<br/>(mcp.rs)
+    participant G as tool_gate<br/>(mcp_rbac.rs)
+    participant M as required_permission<br/>(rpc_authorize.rs)
+    participant P as procedures::NAME::invoke_with_db<br/>(generated)
+    participant R as Procedures<br/>(lightbridge-authz-rest/src/lib.rs)
+
+    C->>B: POST /mcp tools/call {name, arguments}
+    B->>B: validate bearer -> TokenInfo
+    B->>T: request + TokenInfo extension
+    T->>G: tool_gate("get-my-budget-balance")
+    G->>G: op_id_for_tool -> "procedure.getMyBudgetBalance"
+    G->>M: required_permission(op_id)
+    M-->>G: Some(budget:read-own)
+    G-->>T: ToolGate::Permission(budget:read-own)
+    alt token lacks the permission
+        T-->>C: JSON-RPC error (invalid_request), body never runs
+    else token holds it
+        T->>T: procedure_context(op_id) -> RpcScope::Budget
+        T->>P: invoke_with_db(db, Args, ctx)
+        P->>P: @allow: auth().rpcScope == "budget" && auth().permBudgetReadOwn
+        P->>R: registry.get_my_budget_balance(db, ctx, args, Authorized)
+        R-->>P: Output
+        P-->>T: Output
+        T-->>C: {"result": Output} as structuredContent
+    end
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> Unauthenticated
+    Unauthenticated --> Rejected401: no / invalid bearer (bearer_auth)
+    Unauthenticated --> Authenticated: valid, active token
+
+    Authenticated --> UnknownTool: tool_gate -> None (name not in the table)
+    Authenticated --> FailClosed: tool_gate -> None (op-id unmapped in the REST map)
+    Authenticated --> Gated: tool_gate -> Permission(p)
+    Authenticated --> Admitted: tool_gate -> AuthenticatedOnly
+
+    Gated --> PermissionDenied: token lacks p
+    Gated --> Admitted: token holds p
+
+    Admitted --> ScopedCrud: is_budget_op_id == false
+    Admitted --> ScopedBudget: is_budget_op_id == true
+
+    ScopedCrud --> PolicyDenied: @allow fails (wrong scope / no membership)
+    ScopedBudget --> PolicyDenied: @allow fails (wrong scope / no membership)
+    ScopedCrud --> Dispatched: @allow passes
+    ScopedBudget --> Dispatched: @allow passes
+
+    Dispatched --> [*]: {"result": Output}
+    UnknownTool --> [*]
+    FailClosed --> [*]
+    PermissionDenied --> [*]
+    PolicyDenied --> [*]
+    Rejected401 --> [*]
+
+    note right of FailClosed
+        Unreachable from a registered tool: mcp_parity_tests
+        forbids a tool whose op-id the REST map denies.
+        Kept in the diagram because it is the state a
+        future drift would land in, not a dead branch.
+    end note
+```
+
 
 `usage:read-all` is the one permission in this table that never gates a `POST /rpc/{op_id}` call on
 `authz-api`/`authz-budget` at all — it exists purely for `lightbridge-authz-usage`'s own
@@ -289,6 +657,36 @@ still needs a `permUsageReadAll Boolean` field in `authz.cstack`'s `auth Princip
 comment) even though no `@allow`/`@@allow` clause reads it. Granted to `lightbridge-admin` via that
 role's default `*` grant; an operator restricting `role_permissions` explicitly must add
 `usage:read-all` (or `usage:*`) back to whichever role should keep estate-wide usage access.
+
+`user:read` (#647) is the estate-wide identity-resolution permission: it gates the admin
+procedures that turn opaque `users.id`/`accounts.id`/`projects.id` values into human labels
+(`resolveUserProfiles`, `searchUsers`, and the three estate-wide kinds of `resolveActorLabels`).
+Those reads apply **no ownership filter at all** — that is their purpose, and it is why this is its
+own permission rather than a reuse of `account:read`: they read `federated_identities` profile
+claims for subjects the caller has no relationship with. It is deliberately admin-only by default,
+granted to `lightbridge-admin` via that role's `*` and to neither `lightbridge-editor` nor
+`lightbridge-viewer`. The surface is bounded by design: batches are capped at 200 ids per kind and
+an over-cap batch is **rejected** rather than truncated, and free-text search requires a
+2-character minimum query and returns at most 50 rows (20 by default). An unresolvable id is simply
+absent from the result — no procedure here ever fabricates a placeholder identity; the console
+renders its own sentinel.
+
+`resolveActorLabels` is the one procedure whose op-id is **not** mapped to `user:read`, and the
+distinction is worth stating precisely because it looks like a loosening and is not. Since the
+owner's 2026-09-03 feedback it answers a fourth kind, `apiKeyIds`, whose labels are **not**
+estate-wide PII: an API key's name is a label the caller's own project already shows them, and the
+panel that needs it ("Spend by API key") is read by ordinary members. A coarse op-id gate cannot
+express "three of these lists need a permission, the fourth needs a row check", so:
+
+- the op-id sits in `AUTHENTICATED_ONLY_OP_IDS` (any live bearer token gets past the gate);
+- `userIds`/`accountIds`/`projectIds` still **refuse** a caller without `user:read`, now in the
+  handler, with a `403` that names the reason — they do not quietly answer empty, because an empty
+  list already means "no row for that id";
+- `apiKeyIds` is scoped **per row** through `ApiKey`'s own `@@allow("read", …)` clause, read
+  through the generated `db.api_key()` delegate (the `listMyExpiringApiKeys` idiom), so a key the
+  caller may not see is simply **absent** — never a `403`, which would make key existence probeable.
+
+See [docs/admin-identity-resolution.md](admin-identity-resolution.md) for the full contract.
 
 ### Read verbs filter, they do not refuse (`POST /rpc/batch` only) — #401
 
@@ -373,7 +771,40 @@ revocation takes effect on the very next refresh attempt:
 `session:revoke-own` is granted to every default role (including `lightbridge-viewer`) in
 `default_role_permissions` — logging yourself out everywhere is self-protective, not a write
 capability inconsistent with a read-only role, unlike `budget:self-refill` (which spends budget and
-so is withheld from `lightbridge-viewer`).
+so is withheld from `lightbridge-viewer`). `session:read-own` (#649) is granted the same way and
+for the same reason: "which devices am I signed in on" is self-service.
+
+### Reading sessions, and the per-session revoke (#649, ADR-0020 Follow-up 4)
+
+Two op-ids, and both are gated at the SELF-SERVICE permission in `rpc_authorize.rs` — that is the
+floor to call them at all, not the ceiling on what they return. The widening to other people's
+sessions is a **per-row** decision, and the two procedures place it differently on purpose. Full
+contract, with diagrams: `docs/sessions-api.md`.
+
+- **`procedure.querySessions`** (gated `session:read-own`) returns a filtered, cursor-paged list.
+  Which rows it can see is decided by the `Session` model's `@@allow("read", (auth().permSessionRead
+  == true || subject == auth().id) && auth().rpcScope == "crud")` clause, which cratestack compiles
+  into the SQL `WHERE` itself rather than into a pre-check. So `session:read` — admin-only, via
+  `lightbridge-admin`'s `*`, in no other default role — turns "my rows" into "every row", and a
+  caller holding only `session:read-own` gets an EMPTY page for a `subject` naming somebody else,
+  from the database, with no filter combination that gets around it and no handler-side clamp that
+  could be forgotten. This is the one permission pair in this document where the scope narrowing is
+  enforced entirely in the schema.
+- **`procedure.revokeSession`** (gated `session:revoke-own`) closes one session by id and revokes
+  the refresh chain hanging off it. Its own-vs-other check is in the handler
+  (`session_directory::revoke_session`): a session whose `subject` is not the caller's own — which
+  includes a session with a NULL `subject`, since that row belongs to nobody — requires
+  `session:revoke`. That check cannot move into the schema: `Session` carries no
+  `@@allow("update", ...)` and must not gain one (it would light up the generic
+  `model.Session.update` verb, i.e. a way to flip a revoked session back to `active`), and a
+  procedure `@allow` clause can only see `auth()`, never the row a caller-supplied id names.
+  An unknown id is `404`; someone else's session without `session:revoke` is `403`. Keeping those
+  distinct is safe because a session id is an opaque CUID2 nobody can enumerate.
+
+Every generic `model.Session.*` verb stays denied unconditionally — `model.Session.list`/`get`/
+`create`/`update`/`delete` have no entry in `MAPPED_OP_ID_PERMISSIONS`, and an op-id that map does
+not list is refused before dispatch. The `@@allow("read", ...)` clause above exists solely so that
+`querySessions`' internal `db.session()` read is scoped by it.
 
 ### Account provisioning
 
@@ -543,6 +974,27 @@ one procedure with an optional/defaulted target:
   (which bundles list + act into one permission). Neither default role holds these; only
   `lightbridge-admin` (via `*`) can read another account's budget.
 
+**Budget reset schedules (ADR-0032) are one permission, with one deliberate exception.**
+`budget:schedule-manage` gates all five management procedures — `listBudgetResetSchedules`,
+`createBudgetResetSchedule`, `updateBudgetResetSchedule`, `deleteBudgetResetSchedule`,
+`runBudgetResetScheduleNow`. Authoring a standing rule, editing it, deleting it and firing it by
+hand are the same capability with the same blast radius (a `global` schedule rewrites every
+account's balance on a timer), so splitting them would be granularity theatre — the same reasoning
+`budget:review` already applies to list-plus-act. `runBudgetResetScheduleNow` is gated there even
+for `dryRun: true`, because the dry run enumerates every matched account and its balance. Kept
+distinct from `budget:grant`, which is one amount to one account that a human typed out. No default
+role holds it; only `lightbridge-admin` (via `*`).
+
+The exception is **`procedure.getEffectiveResetSchedule`**, gated at **`budget:read`** — the
+permission a caller already needs for `getBudgetBalance`. It answers "which schedule governs this
+account, and when does it next fire", which is what a console budget card renders as "next reset:
+`<date>` → $2.00"; reading the standing rule is materially lower-risk than authoring one, and
+requiring schedule-management rights to draw a budget card would be exactly the conflation the
+`budget:read` / `budget:read-own` split above exists to avoid. Both directions are asserted in
+`crates/lightbridge-authz-rest/tests/budget_router_tests.rs`
+(`budget_schedule_manage_alone_reaches_the_five_and_no_other_budget_op`,
+`the_effective_schedule_read_rides_budget_read`).
+
 `listMyBudgetGrants`/`listBudgetGrants`/`listMyAugmentationRequests` paginate strictly by
 `createdAt`, never by id (ADR-0039 — CUID2 has no defined ordering): the response's `nextCursor` is
 the last entry's `createdAt`; a short page (fewer than the requested `limit`) means there is
@@ -564,6 +1016,15 @@ the negated amount, which nets the original grant out of `effective_budget_micro
 the original completely visible and unchanged. The correction's idempotency key is derived from the
 target `grantId` server-side, so calling `revokeBudgetGrant` twice for the same grant is idempotent
 rather than double-negating.
+
+**There is no `budget:grant` an unattended Job can hold.** `grantBudget`'s `@allow` needs
+`auth().permBudgetGrant`, which comes from a platform role on a *human* subject, and ADR-0030 mints
+`client_credentials` tokens with no `roles` claim at all — so a service token holds zero permissions
+against this op-id, as against every other. Funding an account from a Job therefore goes through the
+CLI, `lightbridge-authz budget grant`, which calls the *same* `BudgetRepo::grant` transaction rather
+than writing SQL around it. This is the [bootstrap-runbook](#bootstrap-runbook-the-first-admin)
+argument applied to money. Flags, refusals, the idempotency key, the Job manifest shape and the
+`$8`-vs-`$15` rule: [`docs/budget-cli.md`](./budget-cli.md).
 
 **Authoring a policy revision** (`procedure.createBudgetPolicyRevision`, gated at
 **`budget:policy-write`**) is deliberately kept separate from `activateBudgetPolicy`

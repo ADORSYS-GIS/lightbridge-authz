@@ -1,0 +1,210 @@
+suite: single-source config rendering
+templates:
+  - templates/common.yaml
+release:
+  name: lb
+tests:
+  - it: renders the operator's global.lightbridge.sharedConfig verbatim
+    set:
+      global.lightbridge.sharedConfig:
+        logging:
+          level: debug
+        oauth2:
+          rbac:
+            roles_claim: lightbridge_api_roles
+            role_permissions:
+              lightbridge-editor:
+                - "project:*"
+      configOverrides: {}
+      configOmit: []
+    documentSelector:
+      path: kind
+      value: ConfigMap
+    asserts:
+      - equal:
+          path: data["config.yaml"]
+          value: |
+            logging:
+              level: debug
+            oauth2:
+              rbac:
+                role_permissions:
+                  lightbridge-editor:
+                  - project:*
+                roles_claim: lightbridge_api_roles
+
+  - it: never leaks a chart-default placeholder once the operator supplies sharedConfig
+    set:
+      global.lightbridge.sharedConfig:
+        logging:
+          level: info
+    documentSelector:
+      path: kind
+      value: ConfigMap
+    asserts:
+      # `state_encryption_key: AAAA…` and the keycloak:9100 placeholders are this chart's
+      # local-dev defaults. A deep merge would have carried every key the operator did not
+      # restate into a production render; sharedConfig replaces, so none of them survive.
+      - notMatchRegex:
+          path: data["config.yaml"]
+          pattern: state_encryption_key
+      - notMatchRegex:
+          path: data["config.yaml"]
+          pattern: "keycloak:9100"
+
+  - it: merges configOverrides over sharedConfig — maps recursively, lists wholesale
+    set:
+      global.lightbridge.sharedConfig:
+        otel:
+          enabled: true
+          otlp_endpoint: http://collector:4317
+          service_name: shared-name
+        oauth2:
+          audience:
+            - lightbridge-api-key
+      configOverrides:
+        otel:
+          service_name: lightbridge-authz-idp
+        oauth2:
+          audience:
+            - only-this-one
+    documentSelector:
+      path: kind
+      value: ConfigMap
+    asserts:
+      - equal:
+          path: data["config.yaml"]
+          value: |
+            oauth2:
+              audience:
+              - only-this-one
+            otel:
+              enabled: true
+              otlp_endpoint: http://collector:4317
+              service_name: lightbridge-authz-idp
+
+  - it: configOmit deletes a whole block and a nested key after the merge
+    set:
+      global.lightbridge.sharedConfig:
+        redis:
+          url: rediss://example
+        oauth2:
+          type: self
+          rbac:
+            roles_claim: lightbridge_api_roles
+      configOmit:
+        - redis
+        - oauth2.rbac
+        - oauth2.does.not.exist
+    documentSelector:
+      path: kind
+      value: ConfigMap
+    asserts:
+      - equal:
+          path: data["config.yaml"]
+          value: |
+            oauth2:
+              type: self
+
+  - it: quotes every scalar carrying an env placeholder so a metacharacter in the secret cannot break the parse
+    set:
+      global.lightbridge.sharedConfig:
+        database:
+          url: ${DATABASE_URL}
+        redis:
+          url: rediss://:${REDIS_PASSWORD}@redis-ha-haproxy.redis-system.svc.cluster.local:6379
+        server:
+          opa:
+            basic_auth:
+              password: ${OPA_PASSWORD}
+        logging:
+          level: ${RUST_LOG:-info}
+        oauth2:
+          audience:
+            - ${AUDIENCE}
+    documentSelector:
+      path: kind
+      value: ConfigMap
+    asserts:
+      - equal:
+          path: data["config.yaml"]
+          value: |
+            database:
+              url: "${DATABASE_URL}"
+            logging:
+              level: "${RUST_LOG:-info}"
+            oauth2:
+              audience:
+              - "${AUDIENCE}"
+            redis:
+              url: "rediss://:${REDIS_PASSWORD}@redis-ha-haproxy.redis-system.svc.cluster.local:6379"
+            server:
+              opa:
+                basic_auth:
+                  password: "${OPA_PASSWORD}"
+
+  - it: resolves Helm expressions inside config values
+    set:
+      global.lightbridge.sharedConfig:
+        server:
+          api:
+            allowed_hosts:
+              - '{{ include "bjw-s.common.lib.chart.names.fullname" $ }}'
+    documentSelector:
+      path: kind
+      value: ConfigMap
+    asserts:
+      - equal:
+          path: data["config.yaml"]
+          value: |
+            server:
+              api:
+                allowed_hosts:
+                - 'lb-lightbridge-authz'
+
+  - it: ties the migrate Job's name to the RENDERED config, not to the values-level template
+    set:
+      global.lightbridge.sharedConfig:
+        logging:
+          level: info
+    documentSelector:
+      path: kind
+      value: Job
+    asserts:
+      - equal:
+          path: metadata.name
+          value: lb-lightbridge-authz-migrate-9d1c06c045
+
+  - it: mints a different migrate Job name when only the config changes
+    set:
+      global.lightbridge.sharedConfig:
+        logging:
+          level: debug
+    documentSelector:
+      path: kind
+      value: Job
+    asserts:
+      # Same image, different config ⇒ different Job name. Hashing
+      # `configMaps.config.data` raw (now a fixed one-liner) would have produced the SAME
+      # name here and re-run #480: a completed Job re-applied with a different, immutable
+      # spec.template, which fails ArgoCD's server-side diff for the WHOLE app.
+      - notEqual:
+          path: metadata.name
+          value: lb-lightbridge-authz-migrate-9d1c06c045
+
+  - it: still tracks a literal configMaps.config.data override, not just the shared object
+    set:
+      configMaps.config.data:
+        config.yaml: |
+          logging:
+            level: trace
+    documentSelector:
+      path: kind
+      value: Job
+    asserts:
+      # A deployment may still hand this chart a config.yaml string directly. The migrate Job's
+      # name has to follow the bytes that actually reach the pod either way, so the hash is taken
+      # over the rendered ConfigMap data rather than over `lightbridge.config.render` alone.
+      - notEqual:
+          path: metadata.name
+          value: lb-lightbridge-authz-migrate-9d1c06c045

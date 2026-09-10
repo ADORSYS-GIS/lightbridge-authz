@@ -321,6 +321,23 @@ enum PendingFlow {
 pub struct BrowserLoginTarget {
     pub project_id: Option<String>,
     pub resume_path: String,
+    /// The registered OAuth client whose `/authorize` request sent this browser to Keycloak --
+    /// the `azp` an operator reading `/admin/sessions` is looking for. Stamped onto the
+    /// `kind = "browser"` session row this login creates
+    /// (`migrations/20260903000001_sessions_browser_client_id.sql`).
+    ///
+    /// PROVENANCE, NOT SCOPE. It records which client caused the login; it never narrows which
+    /// clients may reuse the resulting session. ADR-0021 Decision 3's "a browser session is not
+    /// scoped to any one client" still holds verbatim -- the reuse branch in `authorize.rs` reads
+    /// `BrowserSessionContextRow`, which deliberately does not carry this field, so a second
+    /// client's `/authorize` still skips Keycloak exactly as before.
+    ///
+    /// Rides the encrypted `state` payload (see `encode_pending_flow`) rather than being
+    /// re-read at callback time, because by then the original `/authorize` request is gone.
+    /// Already validated by `authorize.rs` against the client registry before this value is ever
+    /// constructed: an unregistered `client_id` is refused before any login begins, so this is
+    /// never an attacker-chosen string reaching the database.
+    pub client_id: String,
 }
 
 impl KeycloakRelyingParty {
@@ -617,7 +634,15 @@ impl KeycloakRelyingParty {
                         id: cuid2(),
                         account_id: context.account_id,
                         project_id: context.project_id,
-                        client_id: None,
+                        // The client whose `/authorize` request started this login -- the `azp`
+                        // `/admin/sessions` shows in its Client column. Recorded since
+                        // `migrations/20260903000001_sessions_browser_client_id.sql` relaxed
+                        // `sessions_kind_client_id_check`; before it, this had to be `None` and
+                        // every browser row in the console read "None recorded" (owner feedback,
+                        // 2026-09-03). Descriptive only: nothing gates session reuse or logout
+                        // scope on a browser row's `client_id` -- see `BrowserLoginTarget`'s own
+                        // doc comment and the migration's for the full argument.
+                        client_id: Some(target.client_id),
                         kind: "browser".to_string(),
                         expires_at: Utc::now() + ChronoDuration::seconds(ttl),
                         subject: Some(identity.account_id),

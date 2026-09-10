@@ -584,6 +584,7 @@ fn offline_token_exchange_state(
         client_store,
         assertions,
         repo.clone(),
+        repo.clone(),
         repo,
         budget_repo,
         policy_engine,
@@ -2052,9 +2053,16 @@ mod db {
             address: "127.0.0.1".to_string(),
             port: 0,
             tls: bad_tls(),
+            snapshot_refresh_seconds: 15,
+            snapshot_active_window_minutes: 1440,
+            snapshot_slow_lane_minutes: 10,
+            snapshot_seed_lookback_days: 30,
+            snapshot_batch: 500,
+            snapshot_concurrency: 8,
         };
         let err = start_budget_server(
             &budget,
+            None,
             lazy_pool(),
             &oauth2,
             &billing,
@@ -2238,6 +2246,11 @@ mod db {
             budget_repo.clone(),
             augmentation_repo,
         ));
+        let reset_scheduler = Arc::new(lightbridge_authz_budget::ResetScheduler::new(
+            db_pool.clone(),
+            budget_repo.clone(),
+            Arc::new(lightbridge_authz_budget::UnavailableSpendReader),
+        ));
         let api_router = build_api_router(
             bearer,
             Arc::new(UnreachableResolver),
@@ -2246,6 +2259,10 @@ mod db {
             refill_service,
             review_service,
             budget_repo,
+            reset_scheduler,
+            std::sync::Arc::new(lightbridge_authz_core::platform_role::known_platform_roles(
+                &lightbridge_authz_core::authz::Rbac::default(),
+            )),
             cratestack_db,
             db_pool,
             idempotency_store,

@@ -320,24 +320,64 @@ erDiagram
   history of revisions and one active pointer at a time; activation is validated before the
   pointer moves, so a bad revision never displaces a good one.
 - **`budget_augmentation_requests`** is a *separate* ledger from `budget_grants` — decisions about
-  requests (including refusals), not money-granting events. See `budget.md` for the full
-  request lifecycle.
+  requests (including refusals), not money-granting events. It names both ends of the workflow:
+  `requested_by_user_id` (the submitting subject, #646; NULL for pre-migration rows, never
+  backfilled) and `reviewed_by` (the deciding admin). Neither has a foreign key into `users` —
+  they hold token subjects, and an audit column must never become a write barrier. See `budget.md`
+  for the full request lifecycle.
 
 Full behavior — the ledger's replay/correction discipline, the policy engine contract, and what's
 actually live versus merely implemented — is in [`budget.md`](./budget.md).
 
 ## The usage side: a separate database
 
-`usage_events` (`migrations-usage/`) is **not** in the schema above — it lives in its own
-Timescale-compatible database (`lightbridge-authz-usage`'s own `DATABASE_URL`, provisioned
-independently from the authz Postgres instance), ingested via unprotected OTLP/HTTP
-(`/v1/otel/traces`, `/v1/otel/metrics`, `/v1/otel/logs`) and queried via
-`/usage/v1/usage/query` (mTLS + Bearer JWT + ownership since #570/#603). It carries
-`account_id`/`project_id` as plain `TEXT` columns with no foreign key back into `accounts`/
-`projects` — there is no live referential relationship, only a shared convention of which id
-format each column holds. The budget domain reads spend directly from this table
+The usage database (`lightbridge-authz-usage`'s own `DATABASE_URL`) hosts one hypertable family per
+grain of ADR-0027's four-grain taxonomy, each with `source TEXT NOT NULL` as a
+filterable/group-by-able dimension column (ADR-0027 Decision 2 — grain partitions storage, vendor
+never does). The execution grain (#582) and the request-grain rewrite are their own stories:
+
+| Table | Grain | Partition column | Retention | Status |
+|---|---|---|---|---|
+| `usage_events` | request (legacy) | `observed_at TIMESTAMPTZ` | 30d (non-functional, #549) | **Disposable** — replaced by `usage_request_events` in PR-1b (#491) |
+| `usage_day_facts` | day | `day DATE` | 25 months | **Merged (#583)** — target-cluster `timescaledb_information.*` evidence pending PR-1a (#489 image) |
+| `usage_seat_snapshots` | seat | `snapshot_day DATE` | 25 months | **Merged (#583)** — target-cluster evidence pending as above |
+
+`usage_day_facts` and `usage_seat_snapshots` are the generalized replacements for the governance
+store's vendor-named `copilot_*_daily` tables. Adding a source requires no schema change — only a
+normalizer and a registry row (governance#167's acceptance criterion). Both are hypertables
+**asserted not assumed**: the migration calls `create_hypertable` with no `EXCEPTION WHEN OTHERS`
+fallback, and the DB-backed integration tests verify the tables appear in
+`timescaledb_information.hypertables`. Both carry **no surrogate id** — the natural key
+`(source, day[, subject_kind, subject_id[...]])` is the primary key and therefore the dedup/upsert
+target (ADR-0028 D22; ADR-0039 bans `gen_random_uuid()` defaults), and a D22 test proves a replay
+into an already-compressed chunk is still absorbed by it.
+
+All tables share no foreign keys back into `accounts`/`projects` — plain `TEXT` columns with
+the shared convention of which id format each holds. The budget domain reads spend directly
 (`crates/lightbridge-authz-budget/src/spend.rs`); see `budget.md`'s "spend dependency" section for
-what happens when this database is unavailable or unconfigured.
+what happens when this database is unavailable.
+
+The execution grain (#582) adds three further tables to the same usage database —
+`usage_executions`, `usage_model_calls`, `usage_tool_calls` — ported from
+`lightbridge-governance`'s proven `executions`/`model_calls`/`tool_calls` shape. Each carries a
+`source TEXT NOT NULL` origin dimension and an `observed_at` time column (the usage-store
+convention, matching `usage_events`), dedups on `(source, trace_id, span_id)` (bijective with the
+span-derived id, so a redelivery with a drifted timestamp is still absorbed), and stores money
+as nullable `BIGINT` micro-USD (`NULL` = unknown, never `0`; a genuine `0` is storable). `id` is
+the sole primary key (globally unique — it embeds `source`, `trace_id` and `span_id`, since an
+OTLP `span_id` is only unique within a trace and `trace_id` only within a source — so a join on
+`execution_id` is unambiguous); each model/tool call is its own OTLP span with its own `span_id`,
+so one execution can carry many children, and the child `execution_id` FK is `DEFERRABLE
+INITIALLY DEFERRED` for OTLP's child-before-parent export ordering. Because OTLP exports children
+before their parent, ingest mints a **stub** `usage_executions` row (id derived from the child's
+`source` + `trace_id` + `parent_span_id`, with `duration_ms`/`raw_schema_version` NULL) on first
+sight of a child, in the same transaction; the real execution span later fills the stub via the
+upsert — so `duration_ms` and `raw_schema_version` are nullable, and a stub whose execution never
+ends (agent killed mid-run) keeps its children while recording the execution as never-completed.
+Identity is a reference into the `usage_identities` side table, not an embedded email (ADR-0028
+D7). Like `usage_events`, these are plain Postgres tables today — TimescaleDB is not deployed on
+the usage tenant (see the
+migration headers).
 
 ## Two cross-cutting rules that have each already caused a production bug
 
@@ -392,6 +432,7 @@ scratch:
 | `exchange_refresh_tokens` | Refresh-token rotation is a compare-and-swap (`SELECT ... FOR UPDATE`), not a plain CRUD write. |
 | `federated_identities` (ADR-0024) | Carries a sealed credential (`token_envelope`); must be structurally unreachable from any generated read path, same class as `signing_keys` — modelling it, even `@@allow`-less, would still leave it reachable as a relation target. |
 | `lightbridge-authz-usage`'s `usage_events` queries | Dynamic `QueryBuilder`-assembled aggregates against the Timescale-backed table, driven by caller-selected dimensions/filters. |
+| `usage_day_facts` / `usage_seat_snapshots` (#583) | Same class as `usage_events`: TimescaleDB hypertables with upsert-on-natural-key semantics. Cratestack's generated CRUD cannot express `create_hypertable`, `add_retention_policy`, `add_compression_policy`, or `ON CONFLICT (composite, including partition column) DO UPDATE`. Justified in the migration headers as an ADR-0038 exception per the grain-partitioned time-series + CAS/upsert exception class. |
 
 This repo runs `cratestack-pg` 0.5.1; ADR-0038's own capability findings were verified against
 0.7.8 — re-verify any capability claim against 0.5.1 before relying on it here. The two-major

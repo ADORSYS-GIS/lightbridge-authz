@@ -62,6 +62,7 @@ async fn seed_pending_review(
             requested_tier: BudgetTier::B30,
             requested_amount_micros,
             idempotency_key: None,
+            requested_by_user_id: None,
         })
         .await
         .expect("seeding a fresh request must succeed");
@@ -158,6 +159,7 @@ async fn seed_pending_review_via_refill_service(pool: &PgPool, account_id: &str)
             idempotency_key: None,
             as_of: chrono::Utc::now(),
             requested_amount_micros: 30_000_000,
+            requested_by_user_id: None,
         })
         .await
         .expect("the exhausted-allowance refill must succeed, queued for review");

@@ -17,4 +17,6 @@ tracing-subscriber.workspace = true
 lightbridge-authz-core.workspace = true
 lightbridge-authz-usage-rest.workspace = true
 mimalloc.workspace = true
+# `version` prints the build stamp as JSON (#573).
+serde_json.workspace = true
 sqlx.workspace = true

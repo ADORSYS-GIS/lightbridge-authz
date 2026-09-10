@@ -114,7 +114,7 @@ impl RpcScope {
     /// binary is running is a deployment fact, the same for every frame in one `/rpc/batch` call,
     /// so caching it once per envelope (unlike a per-frame *permission* requirement) is correct,
     /// not a compromise.
-    pub(crate) const fn wire_str(self) -> &'static str {
+    pub const fn wire_str(self) -> &'static str {
         match self {
             RpcScope::Crud => "crud",
             RpcScope::Budget => "budget",
@@ -126,11 +126,11 @@ impl RpcScope {
 /// is built from. `resource()` on [`Permission`] is deliberately private to `authz.rs` (not part
 /// of its public API), so this reads the canonical `"budget:…"` wire string via the already-public
 /// [`Permission::as_str`] instead of exposing a second accessor just for this one caller.
-pub(crate) fn is_budget_op_id(op_id: &str) -> bool {
+pub fn is_budget_op_id(op_id: &str) -> bool {
     required_permission(op_id).is_some_and(|permission| permission.as_str().starts_with("budget:"))
 }
 
-pub(crate) fn required_permission(op_id: &str) -> Option<Permission> {
+pub fn required_permission(op_id: &str) -> Option<Permission> {
     use Permission::*;
     Some(match op_id {
         "procedure.createAccount" => AccountCreate,
@@ -260,6 +260,26 @@ pub(crate) fn required_permission(op_id: &str) -> Option<Permission> {
         "procedure.approveAugmentationRequest" => BudgetReview,
         "procedure.rejectAugmentationRequest" => BudgetReview,
 
+        // Session enumeration (#649 -- named `querySessions`, not `listSessions`: that name
+        // collides with the generated `model.Session.list` handler, see authz.cstack).
+        // Mapped to the NARROWER `session:read-own`, deliberately:
+        // this coarse gate decides who may CALL the procedure, and "list my own sessions" is
+        // self-service (both default non-admin roles hold it). Which ROWS come back is decided one
+        // layer down, by the `Session` model's `@@allow("read", ...)` clause -- `permSessionRead`
+        // (admin-only) widens it from "subject == auth().id" to every row, and cratestack folds
+        // that predicate into the SQL `WHERE` unconditionally. So an own-scope caller passing
+        // `subject: <someone else>` gets an empty page from the database itself, not from a
+        // handler that remembered to clamp the filter. See docs/sessions-api.md.
+        "procedure.querySessions" => SessionReadOwn,
+        // Per-session revoke (#649), same floor-plus-widening shape: `session:revoke-own` is what
+        // lets a caller revoke a session at all, and the handler additionally requires
+        // `session:revoke` when the target session's `subject` is not the caller's own. Unlike
+        // the read above this second check CANNOT live in the schema -- `Session` has no
+        // `@@allow("update", ...)` (and must not gain one: that would light up the generic
+        // `model.Session.update` verb), and a procedure `@allow` clause can only see `auth()`,
+        // never the row a caller-supplied id names. See `session_directory::revoke_session`.
+        "procedure.revokeSession" => SessionRevokeOwn,
+
         // Refresh-token session revocation (the offboarding kill switch). Same self/admin split
         // as the budget refill pair above -- see docs/rbac.md.
         "procedure.revokeOwnSessions" => SessionRevokeOwn,
@@ -284,135 +304,55 @@ pub(crate) fn required_permission(op_id: &str) -> Option<Permission> {
         // Authoring a new policy revision, kept distinct from `budget:policy-activate` (ADR-0007).
         "procedure.createBudgetPolicyRevision" => BudgetPolicyWrite,
 
+        // Budget reset schedules (ADR-0032). The four CRUD procedures and the manual fire share
+        // one permission: authoring a standing rule, editing it, deleting it and firing it by hand
+        // are the same capability with the same blast radius (a `global` schedule rewrites every
+        // account's balance), so splitting them would be granularity theatre. `runBudgetResetScheduleNow`
+        // is gated here even for `dryRun: true` -- the dry run enumerates the whole estate's
+        // accounts and their balances, which is not a read a non-manager should be able to make.
+        "procedure.listBudgetResetSchedules" => BudgetScheduleManage,
+        "procedure.createBudgetResetSchedule" => BudgetScheduleManage,
+        "procedure.updateBudgetResetSchedule" => BudgetScheduleManage,
+        "procedure.deleteBudgetResetSchedule" => BudgetScheduleManage,
+        "procedure.runBudgetResetScheduleNow" => BudgetScheduleManage,
+        // The one schedule procedure that is NOT `budget:schedule-manage`: reading which schedule
+        // governs one account (for a budget card's "next reset: <date>") is a read of that
+        // account's budget, gated exactly like `getBudgetBalance` beside it. See the schema doc
+        // comment on `getEffectiveResetSchedule`.
+        "procedure.getEffectiveResetSchedule" => BudgetRead,
+
+        // Admin identity resolution (#647). Both read the SAME estate-wide, ownership-filter-free
+        // PII surface -- display claims for subjects the caller has no relationship with -- so they
+        // share ONE permission rather than splitting "resolve" from "search": a caller who can
+        // batch-resolve arbitrary ids can already enumerate whatever a search would reveal.
+        //
+        // `resolveActorLabels` was the third member of this group and is deliberately NOT here any
+        // more: it is in `AUTHENTICATED_ONLY_OP_IDS`, because it now also answers a non-admin,
+        // row-scoped kind (`apiKeyIds`) that a coarse op-id gate cannot express. Its `user:read`
+        // requirement for the other three kinds moved into the handler, not away -- see that
+        // constant's doc comment and `identity_directory.rs`.
+        "procedure.resolveUserProfiles" => UserRead,
+        "procedure.searchUsers" => UserRead,
+
+        // Platform role grants (ADR-0033). All three share ONE permission for the same reason the
+        // identity trio above does: a caller who can grant a role can trivially list who holds it
+        // (grant to themselves, read it back), so splitting read from write here would be
+        // granularity theatre. `getMyAccess` is deliberately NOT here -- it is in
+        // `AUTHENTICATED_ONLY_OP_IDS` instead; see that constant's own doc comment.
+        "procedure.listPlatformRoleGrants" => RbacManage,
+        "procedure.grantPlatformRole" => RbacManage,
+        "procedure.revokePlatformRole" => RbacManage,
+
         _ => return None,
     })
 }
 
-/// Every op-id `required_permission` maps to a `Some`, paired with the expected permission —
-/// the single enumeration both `every_mapped_op_id_maps_to_the_documented_permission` (below) and
-/// `schema_policy_sync`'s codegen/drift-check walk, so there is exactly one hand-maintained list
-/// of "every mapped op-id" in this crate, not two that could silently diverge. Order matches
-/// `required_permission`'s own declaration order. `model.AccountSummary.{list,get}` are included
-/// even though that view has no live RPC dispatch arm today (see `authz.cstack`'s own doc comment
-/// on it) — its `@@allow` clause still exists and still deserves the same generated gate, forward-
-/// looking/defensive exactly as the view entry itself already is.
-pub const MAPPED_OP_ID_PERMISSIONS: &[(&str, Permission)] = &[
-    ("procedure.createAccount", Permission::AccountCreate),
-    ("procedure.provisionAccount", Permission::AccountProvision),
-    ("model.Account.list", Permission::AccountRead),
-    ("model.Account.get", Permission::AccountRead),
-    (
-        "procedure.updateAccountDefaultQuota",
-        Permission::AccountUpdate,
-    ),
-    ("procedure.updateAccountName", Permission::AccountUpdate),
-    ("procedure.disableAccount", Permission::AccountDisable),
-    ("procedure.enableAccount", Permission::AccountDisable),
-    (
-        "procedure.deleteAccountPermanently",
-        Permission::AccountDelete,
-    ),
-    ("model.Project.create", Permission::ProjectCreate),
-    ("model.Project.list", Permission::ProjectRead),
-    ("model.Project.get", Permission::ProjectRead),
-    ("model.Project.update", Permission::ProjectUpdate),
-    ("model.Project.delete", Permission::ProjectDelete),
-    ("procedure.disableProject", Permission::ProjectDisable),
-    ("procedure.enableProject", Permission::ProjectDisable),
-    ("procedure.setDefaultProject", Permission::ProjectUpdate),
-    ("procedure.setProjectQuota", Permission::ProjectUpdate),
-    (
-        "procedure.setProjectAllowedModels",
-        Permission::ProjectUpdate,
-    ),
-    ("procedure.setProjectModelPolicy", Permission::ProjectUpdate),
-    ("procedure.addProjectMember", Permission::ProjectMember),
-    ("procedure.removeProjectMember", Permission::ProjectMember),
-    ("procedure.listProjectRoster", Permission::ProjectMember),
-    ("procedure.setProjectMemberRole", Permission::ProjectMember),
-    (
-        "procedure.setProjectMemberQuotaTier",
-        Permission::ProjectMember,
-    ),
-    ("procedure.createApiKey", Permission::ApiKeyCreate),
-    ("procedure.listBillingPlans", Permission::ApiKeyCreate),
-    ("procedure.listModelCatalog", Permission::ProjectUpdate),
-    ("model.ApiKey.list", Permission::ApiKeyRead),
-    ("model.ApiKey.get", Permission::ApiKeyRead),
-    ("model.ApiKey.update", Permission::ApiKeyUpdate),
-    ("model.ApiKey.delete", Permission::ApiKeyDelete),
-    ("procedure.revokeApiKey", Permission::ApiKeyRevoke),
-    ("procedure.rotateApiKey", Permission::ApiKeyRotate),
-    ("procedure.listMyExpiringApiKeys", Permission::ApiKeyRead),
-    ("model.AccountSummary.list", Permission::AccountRead),
-    ("model.AccountSummary.get", Permission::AccountRead),
-    (
-        "procedure.activateBudgetPolicy",
-        Permission::BudgetPolicyActivate,
-    ),
-    (
-        "procedure.getBudgetPolicyStatus",
-        Permission::BudgetPolicyRead,
-    ),
-    (
-        "procedure.simulateBudgetPolicy",
-        Permission::BudgetPolicySimulate,
-    ),
-    (
-        "procedure.requestBudgetRefill",
-        Permission::BudgetSelfRefill,
-    ),
-    (
-        "procedure.getMyBudgetRefillLadder",
-        Permission::BudgetSelfRefill,
-    ),
-    (
-        "procedure.listPendingAugmentationRequests",
-        Permission::BudgetReview,
-    ),
-    (
-        "procedure.approveAugmentationRequest",
-        Permission::BudgetReview,
-    ),
-    (
-        "procedure.rejectAugmentationRequest",
-        Permission::BudgetReview,
-    ),
-    ("procedure.revokeOwnSessions", Permission::SessionRevokeOwn),
-    ("procedure.revokeSubjectSessions", Permission::SessionRevoke),
-    ("procedure.getMyBudgetBalance", Permission::BudgetReadOwn),
-    ("procedure.listMyBudgetGrants", Permission::BudgetReadOwn),
-    (
-        "procedure.listMyAugmentationRequests",
-        Permission::BudgetReadOwn,
-    ),
-    ("procedure.getBudgetBalance", Permission::BudgetRead),
-    ("procedure.listBudgetGrants", Permission::BudgetAuditRead),
-    ("procedure.grantBudget", Permission::BudgetGrant),
-    ("procedure.revokeBudgetGrant", Permission::BudgetRevoke),
-    (
-        "procedure.createBudgetPolicyRevision",
-        Permission::BudgetPolicyWrite,
-    ),
-];
-
-/// The `auth().<field>` name `CratestackAuthProvider` bakes each [`Permission`]'s boolean grant
-/// into, and every generated `@allow`/`@@allow` clause in `authz.cstack` reads. Mechanically
-/// derived from [`Permission::as_str`]'s canonical `resource:action` string (splitting further on
-/// `-` for hyphenated actions like `read-own`) rather than a second hand-typed list of 32 names —
-/// same single-source-of-truth reasoning as [`MAPPED_OP_ID_PERMISSIONS`] above. E.g.
-/// `"account:create"` -> `"permAccountCreate"`, `"budget:read-own"` -> `"permBudgetReadOwn"`.
-pub fn permission_field_name(permission: Permission) -> String {
-    let mut out = String::from("perm");
-    for part in permission.as_str().split([':', '-']) {
-        let mut chars = part.chars();
-        if let Some(first) = chars.next() {
-            out.extend(first.to_uppercase());
-            out.push_str(chars.as_str());
-        }
-    }
-    out
-}
+/// Re-exported from [`crate::rpc_permission_map`], which holds both items. Split out only to keep
+/// this file inside its LoC-gate baseline; see that module's own doc comment.
+pub use crate::rpc_permission_map::{
+    AUTHENTICATED_ONLY_OP_IDS, MAPPED_OP_ID_PERMISSIONS, is_authenticated_only_op_id,
+    permission_field_name,
+};
 
 /// Extract a bearer token from the `Authorization` header, tolerating `Bearer`/`bearer` casing and
 /// surrounding whitespace. Mirrors `auth_provider::extract_bearer` (kept local so this module does
@@ -504,9 +444,12 @@ pub async fn rpc_authorize(
         return deny(StatusCode::NOT_FOUND, "unknown RPC op");
     }
 
-    let Some(required) = required_permission(&op_id) else {
+    // Unmapped op-ids are denied unconditionally, EXCEPT the enumerated
+    // `AUTHENTICATED_ONLY_OP_IDS` (see that constant), which need a live token and nothing more.
+    let required = required_permission(&op_id);
+    if required.is_none() && !is_authenticated_only_op_id(&op_id) {
         return deny(StatusCode::FORBIDDEN, "operation not permitted");
-    };
+    }
 
     let Some(token) = extract_bearer(request.headers()) else {
         return deny(StatusCode::UNAUTHORIZED, "missing bearer token");
@@ -514,10 +457,10 @@ pub async fn rpc_authorize(
 
     match state.bearer.validate_bearer_token(&token).await {
         Ok(info) if info.active => {
-            if info.has_permission(required) {
-                next.run(request).await
-            } else {
+            if required.is_some_and(|required| !info.has_permission(required)) {
                 deny(StatusCode::FORBIDDEN, "insufficient permissions")
+            } else {
+                next.run(request).await
             }
         }
         // Invalid/inactive token or validation error -> uniform 401, never leaking which step failed.
@@ -738,6 +681,8 @@ mod tests {
                 "model.AccountSummary.get",
                 "procedure.revokeOwnSessions",
                 "procedure.revokeSubjectSessions",
+                "procedure.resolveUserProfiles",
+                "procedure.searchUsers",
             ])
             .collect();
         for op_id in all_mapped_op_ids {
