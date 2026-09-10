@@ -2490,6 +2490,7 @@ async fn provisioned_subject_completes_browser_sso_callback(pool: PgPool) {
         .begin_browser(BrowserLoginTarget {
             project_id: None,
             resume_path: "/browser".to_string(),
+            client_id: BROWSER_CLIENT_ID.to_string(),
         })
         .await
         .unwrap();

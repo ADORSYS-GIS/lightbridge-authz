@@ -53,18 +53,13 @@ impl AuthzStoreImpl {
         Ok(account)
     }
 
-    /// The admin-targets-an-arbitrary-subject account bootstrap (#720). Backs `provisionAccount` --
-    /// see `StoreRepo::provision_account`'s doc comment for the full incident/design rationale.
-    /// `email` is required (unlike `create_account`'s optional fields) because it becomes the
-    /// mandatory, `NOT NULL` `billing_identity` on the default project this also creates; validated
-    /// here rather than left to surface as a raw DB not-null violation, same "friendly error before
-    /// the write" precedent as `create_account`'s `default_quota` catalogue check above. `name`
-    /// gets the same blank-to-`None` normalization as `create_account`'s.
-    ///
-    /// Also books the starting grant (#697), same as `create_account` -- an admin-provisioned
-    /// account has exactly the same "reads remaining = 0 at the gateway until the next reset"
-    /// failure mode a self-service one would without it, and there is no reason a subject who
-    /// couldn't self-provision should additionally start out unfunded.
+    /// The admin-targets-an-arbitrary-subject account bootstrap (#720) -- backs `provisionAccount`;
+    /// see `StoreRepo::provision_account`'s doc comment for the full rationale. `email` is required
+    /// (unlike `create_account`'s optional fields), validated here rather than left to surface as a
+    /// raw DB not-null violation, because it becomes the default project's `NOT NULL`
+    /// `billing_identity`. `name` gets `create_account`'s own blank-to-`None` normalization, and the
+    /// starting grant (#697) is booked the same way too -- an admin-provisioned account must not
+    /// start out unfunded just because the subject couldn't self-provision.
     pub async fn provision_account(
         &self,
         subject: &str,
