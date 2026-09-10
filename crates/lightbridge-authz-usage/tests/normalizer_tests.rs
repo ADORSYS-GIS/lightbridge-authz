@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use axum::http::{HeaderMap, HeaderValue};
 use lightbridge_authz_core::Error;
 use lightbridge_authz_usage_rest::normalizer::{
-    KNOWN_SOURCES, REGISTRY, SpanMeta, resolve_source, usd_to_micros,
+    KNOWN_SOURCES, REGISTRY, SpanMeta, combine_token_total, resolve_source, usd_to_micros,
 };
 use serde_json::{Value, json};
 
@@ -406,4 +406,13 @@ fn test_every_known_source_has_a_registered_normalizer() {
              NormalizerRegistry::build() is missing an insert for it"
         );
     }
+}
+
+#[test]
+fn test_combine_token_total_covers_every_combination() {
+    assert_eq!(combine_token_total(Some(3), Some(4)), Some(7));
+    assert_eq!(combine_token_total(Some(3), None), Some(3));
+    assert_eq!(combine_token_total(None, Some(4)), Some(4));
+    assert_eq!(combine_token_total(None, None), None);
+    assert_eq!(combine_token_total(Some(i64::MAX), Some(1)), None);
 }

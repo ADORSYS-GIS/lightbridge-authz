@@ -963,15 +963,6 @@ fn summary_data_point_to_event(
     }
 }
 
-fn combine_token_total(prompt_tokens: Option<i64>, completion_tokens: Option<i64>) -> Option<i64> {
-    match (prompt_tokens, completion_tokens) {
-        (Some(prompt), Some(completion)) => prompt.checked_add(completion),
-        (Some(prompt), None) => Some(prompt),
-        (None, Some(completion)) => Some(completion),
-        (None, None) => None,
-    }
-}
-
 /// The token/cost merge every event-extraction function derives the same way: the normalizer's
 /// value wins when present, falling back to the generic attribute-extraction keys. Shared by
 /// `extract_log_events`, `extract_trace_events`, and all four `*_data_point_to_event` functions
@@ -997,7 +988,7 @@ fn merge_norm_tokens_and_cost(
     let total_tokens = norm
         .total_tokens
         .or_else(|| extract_i64(attrs, &TOTAL_TOKENS_KEYS))
-        .or_else(|| combine_token_total(prompt_tokens, completion_tokens));
+        .or_else(|| crate::normalizer::combine_token_total(prompt_tokens, completion_tokens));
     let total_cost = norm
         .cost_micros
         .map(|c| c as f64 / 1_000_000.0)
@@ -2309,15 +2300,6 @@ mod tests {
         );
         assert_eq!(non_empty(Some("   ".to_string())), None);
         assert_eq!(non_empty(None), None);
-    }
-
-    #[test]
-    fn combine_token_total_should_cover_every_combination() {
-        assert_eq!(combine_token_total(Some(3), Some(4)), Some(7));
-        assert_eq!(combine_token_total(Some(3), None), Some(3));
-        assert_eq!(combine_token_total(None, Some(4)), Some(4));
-        assert_eq!(combine_token_total(None, None), None);
-        assert_eq!(combine_token_total(Some(i64::MAX), Some(1)), None);
     }
 
     #[test]
