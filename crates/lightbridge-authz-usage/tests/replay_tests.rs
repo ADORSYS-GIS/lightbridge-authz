@@ -8,7 +8,8 @@
 //!     handler's `is_json_content` branch sees what the exporter originally sent;
 //!   * a non-2xx ingest response is an error, never silently dropped (fail loud);
 //!   * an unreachable ingest is an error, never silently dropped (fail loud);
-//!   * a batch replays in order and reports per-signal counts.
+//!   * a batch replays and reports per-signal counts, both sequentially and concurrently;
+//!   * a batch aborts on the first failure, even under concurrency.
 //!
 //! Idempotency (replay twice → counts unchanged) is a property of the grain-table dedup keys
 //! (#582/#583) that the ingest path writes to, not of this module — it is exercised by the
@@ -47,7 +48,7 @@ async fn replay_object_posts_to_the_signal_route_with_original_content_type() {
         b"raw-trace-bytes",
     );
 
-    replay_object(&client, &server.base_url(), &obj)
+    replay_object(&client, &server.base_url(), obj)
         .await
         .expect("replay should succeed");
 
@@ -73,7 +74,7 @@ async fn replay_object_preserves_otlp_json_content_type() {
         br#"{"resourceLogs":[]}"#,
     );
 
-    replay_object(&client, &server.base_url(), &obj)
+    replay_object(&client, &server.base_url(), obj)
         .await
         .expect("replay should succeed");
 
@@ -96,7 +97,7 @@ async fn replay_object_fails_loud_on_non_2xx_ingest_response() {
         b"metrics",
     );
 
-    let err = replay_object(&client, &server.base_url(), &obj)
+    let err = replay_object(&client, &server.base_url(), obj)
         .await
         .expect_err("a 500 must be an error, never silently dropped");
     let msg = err.to_string();
@@ -117,7 +118,7 @@ async fn replay_object_fails_loud_on_unreachable_ingest() {
         b"traces",
     );
 
-    let err = replay_object(&client, "http://127.0.0.1:1", &obj)
+    let err = replay_object(&client, "http://127.0.0.1:1", obj)
         .await
         .expect_err("an unreachable ingest must be an error, never silently dropped");
     assert!(
@@ -159,7 +160,7 @@ async fn replay_batch_replays_in_order_and_reports_per_signal_counts() {
         object("s2/2026/09/07/l-1", Signal::Logs, "application/json", b"{}"),
     ];
 
-    let summary: ReplaySummary = replay_batch(&client, &server.base_url(), &objects)
+    let summary: ReplaySummary = replay_batch(&client, &server.base_url(), objects, 1)
         .await
         .expect("batch succeeds");
 
@@ -170,6 +171,53 @@ async fn replay_batch_replays_in_order_and_reports_per_signal_counts() {
     assert_eq!(summary.traces, 1);
     assert_eq!(summary.metrics, 1);
     assert_eq!(summary.logs, 1);
+}
+
+#[tokio::test]
+async fn replay_batch_replays_all_objects_with_concurrency() {
+    let server = MockServer::start();
+    let traces = server.mock(|when, then| {
+        when.method(POST).path("/v1/otel/traces");
+        then.status(200);
+    });
+    let logs = server.mock(|when, then| {
+        when.method(POST).path("/v1/otel/logs");
+        then.status(200);
+    });
+
+    let client = reqwest::Client::new();
+    let objects = vec![
+        object(
+            "s1/2026/09/07/t-1",
+            Signal::Traces,
+            "application/x-protobuf",
+            b"t",
+        ),
+        object(
+            "s1/2026/09/07/t-2",
+            Signal::Traces,
+            "application/x-protobuf",
+            b"t",
+        ),
+        object(
+            "s1/2026/09/07/t-3",
+            Signal::Traces,
+            "application/x-protobuf",
+            b"t",
+        ),
+        object("s2/2026/09/07/l-1", Signal::Logs, "application/json", b"{}"),
+        object("s2/2026/09/07/l-2", Signal::Logs, "application/json", b"{}"),
+    ];
+
+    let summary: ReplaySummary = replay_batch(&client, &server.base_url(), objects, 4)
+        .await
+        .expect("batch succeeds");
+
+    traces.assert_calls(3);
+    logs.assert_calls(2);
+    assert_eq!(summary.objects, 5);
+    assert_eq!(summary.traces, 3);
+    assert_eq!(summary.logs, 2);
 }
 
 #[tokio::test]
@@ -196,10 +244,55 @@ async fn replay_batch_aborts_on_first_failure() {
         object("s1/2026/09/07/l-1", Signal::Logs, "application/json", b"{}"),
     ];
 
-    let err = replay_batch(&client, &server.base_url(), &objects)
+    let err = replay_batch(&client, &server.base_url(), objects, 1)
         .await
         .expect_err("a failing object must abort the batch");
     assert!(err.to_string().contains("503"), "got: {err}");
     ok.assert();
     fail.assert();
+}
+
+#[tokio::test]
+async fn replay_batch_aborts_on_first_failure_under_concurrency() {
+    let server = MockServer::start();
+    // A mix of successes and a failure; the batch must abort with the failure and not report a
+    // successful summary.
+    let ok = server.mock(|when, then| {
+        when.method(POST).path("/v1/otel/traces");
+        then.status(200);
+    });
+    let fail = server.mock(|when, then| {
+        when.method(POST).path("/v1/otel/logs");
+        then.status(503);
+    });
+
+    let client = reqwest::Client::new();
+    let objects = vec![
+        object(
+            "s1/2026/09/07/t-1",
+            Signal::Traces,
+            "application/x-protobuf",
+            b"t",
+        ),
+        object(
+            "s1/2026/09/07/t-2",
+            Signal::Traces,
+            "application/x-protobuf",
+            b"t",
+        ),
+        object("s1/2026/09/07/l-1", Signal::Logs, "application/json", b"{}"),
+        object("s1/2026/09/07/l-2", Signal::Logs, "application/json", b"{}"),
+    ];
+
+    let err = replay_batch(&client, &server.base_url(), objects, 4)
+        .await
+        .expect_err("a failing object must abort the batch under concurrency");
+    assert!(err.to_string().contains("503"), "got: {err}");
+    // Both trace objects succeed; at least one log object hits the failing route before the
+    // batch aborts (how many is nondeterministic under concurrency).
+    ok.assert_calls(2);
+    assert!(
+        fail.calls() >= 1,
+        "the failing route must be hit at least once"
+    );
 }

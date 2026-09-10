@@ -35,6 +35,7 @@ use lightbridge_authz_core::Result;
 use lightbridge_authz_usage_rest::replay::{ArchiveObject, Signal, replay_batch};
 use serde::Deserialize;
 use std::path::PathBuf;
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(
@@ -49,6 +50,15 @@ struct Cli {
     /// Override the ingest base URL from the manifest (e.g. for a local test server).
     #[arg(long)]
     ingest_base_url: Option<String>,
+
+    /// Per-request timeout for each ingest POST, in seconds. A hung ingest must not hang the
+    /// replay job forever.
+    #[arg(long, default_value_t = 30)]
+    timeout_secs: u64,
+
+    /// How many archive objects to replay concurrently. `1` replays strictly in order.
+    #[arg(long, default_value_t = 1)]
+    concurrency: usize,
 }
 
 #[derive(Deserialize)]
@@ -114,8 +124,14 @@ async fn main() -> Result<()> {
         });
     }
 
-    let client = reqwest::Client::new();
-    let summary = replay_batch(&client, &ingest_base_url, &objects).await?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(cli.timeout_secs))
+        .build()
+        .map_err(|e| {
+            lightbridge_authz_core::Error::Server(format!("failed to build HTTP client: {e}"))
+        })?;
+
+    let summary = replay_batch(&client, &ingest_base_url, objects, cli.concurrency).await?;
 
     println!(
         "replayed {} objects ({} traces, {} metrics, {} logs) through {}",
