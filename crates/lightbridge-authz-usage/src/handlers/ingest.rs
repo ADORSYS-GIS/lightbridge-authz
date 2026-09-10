@@ -1,34 +1,29 @@
-use std::{collections::HashMap, io::Read, sync::Arc};
-
+use crate::UsageState;
+use crate::models::IngestResponse;
+use crate::repo::UsageEvent;
+use axum::http::header::CONTENT_ENCODING;
 use axum::{
     Json,
     body::Bytes,
     extract::State,
-    http::{HeaderMap, StatusCode, header::CONTENT_ENCODING},
+    http::{HeaderMap, StatusCode},
 };
 use chrono::{DateTime, Utc};
 use lightbridge_authz_core::{Error, Result};
-use opentelemetry_proto::tonic::{
-    collector::{
-        logs::v1::ExportLogsServiceRequest, metrics::v1::ExportMetricsServiceRequest,
-        trace::v1::ExportTraceServiceRequest,
-    },
-    common::v1::{AnyValue, KeyValue, any_value},
-    metrics::v1::{
-        ExponentialHistogramDataPoint, HistogramDataPoint, NumberDataPoint, SummaryDataPoint,
-        metric::Data, number_data_point,
-    },
+use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
+use opentelemetry_proto::tonic::metrics::v1::{
+    ExponentialHistogramDataPoint, HistogramDataPoint, NumberDataPoint, SummaryDataPoint,
+    metric::Data, number_data_point,
 };
 use prost::Message;
 use serde_json::{Map, Value, json};
+use std::collections::HashMap;
+use std::io::Read;
+use std::sync::Arc;
 use tracing::{debug, instrument, warn};
-
-use crate::{
-    UsageState,
-    models::IngestResponse,
-    normalizer::{extract_f64, extract_i64, extract_string},
-    repo::UsageEvent,
-};
 
 const ACCOUNT_KEYS: [&str; 5] = [
     "account_id",
@@ -250,9 +245,8 @@ pub async fn ingest_traces(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<(StatusCode, Json<IngestResponse>)> {
-    let source = crate::normalizer::resolve_source(&headers)?;
-    let payload = decode_trace_request_async(headers.clone(), body.clone()).await?;
-    let events = extract_trace_events(payload, source);
+    let payload = decode_trace_request(&headers, &body)?;
+    let events = extract_trace_events(payload);
     let accepted_events = persist_events(&state, "trace", &events).await?;
 
     debug!("accepted {} trace events", accepted_events);
@@ -279,9 +273,8 @@ pub async fn ingest_metrics(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<(StatusCode, Json<IngestResponse>)> {
-    let source = crate::normalizer::resolve_source(&headers)?;
-    let payload = decode_metrics_request_async(headers.clone(), body.clone()).await?;
-    let events = extract_metric_events(payload, source);
+    let payload = decode_metrics_request(&headers, &body)?;
+    let events = extract_metric_events(payload);
     let accepted_events = persist_events(&state, "metric", &events).await?;
 
     debug!("accepted {} metric events", accepted_events);
@@ -308,9 +301,8 @@ pub async fn ingest_logs(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<(StatusCode, Json<IngestResponse>)> {
-    let source = crate::normalizer::resolve_source(&headers)?;
-    let payload = decode_logs_request_async(headers.clone(), body.clone()).await?;
-    let events = extract_log_events(payload, source);
+    let payload = decode_logs_request(&headers, &body)?;
+    let events = extract_log_events(payload);
     let accepted_events = persist_events(&state, "log", &events).await?;
 
     debug!("accepted {} log events", accepted_events);
@@ -319,33 +311,6 @@ pub async fn ingest_logs(
         StatusCode::ACCEPTED,
         Json(IngestResponse { accepted_events }),
     ))
-}
-
-async fn decode_logs_request_async(
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<ExportLogsServiceRequest> {
-    tokio::task::spawn_blocking(move || decode_logs_request(&headers, &body))
-        .await
-        .map_err(|e| Error::Server(format!("logs decode task failed: {e}")))?
-}
-
-async fn decode_trace_request_async(
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<ExportTraceServiceRequest> {
-    tokio::task::spawn_blocking(move || decode_trace_request(&headers, &body))
-        .await
-        .map_err(|e| Error::Server(format!("trace decode task failed: {e}")))?
-}
-
-async fn decode_metrics_request_async(
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<ExportMetricsServiceRequest> {
-    tokio::task::spawn_blocking(move || decode_metrics_request(&headers, &body))
-        .await
-        .map_err(|e| Error::Server(format!("metrics decode task failed: {e}")))?
 }
 
 fn decode_logs_request(headers: &HeaderMap, body: &[u8]) -> Result<ExportLogsServiceRequest> {
@@ -363,15 +328,6 @@ fn decode_logs_request(headers: &HeaderMap, body: &[u8]) -> Result<ExportLogsSer
     }
 }
 
-/// Bounds how much a single gzip-encoded request may inflate to. This PR extends gzip
-/// decompression from `/v1/otel/logs` (its original, single call site) to traces and metrics
-/// too, tripling the surface for a gzip-bomb: a few KB of compressed input can otherwise expand
-/// to gigabytes with no check before or during inflation. 64 MiB comfortably covers a large
-/// legitimate OTLP batch (this endpoint's payloads are per-export batches, not bulk uploads)
-/// while bounding the worst case; a body that needs more than this is rejected, not silently
-/// truncated.
-const MAX_DECOMPRESSED_BODY_BYTES: u64 = 64 * 1024 * 1024;
-
 fn decode_maybe_gzip(headers: &HeaderMap, body: &[u8]) -> Result<Vec<u8>> {
     let encoding = headers
         .get(CONTENT_ENCODING)
@@ -386,24 +342,12 @@ fn decode_maybe_gzip(headers: &HeaderMap, body: &[u8]) -> Result<Vec<u8>> {
         return Ok(body.to_vec());
     }
 
-    // Read one byte past the cap so an oversized body is distinguishable from one that lands
-    // exactly on the limit: `take(N)` never yields more than N bytes, so `out.len() >
-    // MAX_DECOMPRESSED_BODY_BYTES` can only happen by reading N+1 bytes as decoder's
-    // Read::take bound, one wider than the cap itself.
-    let decoder = flate2::read::GzDecoder::new(body);
-    let mut bounded = decoder.take(MAX_DECOMPRESSED_BODY_BYTES + 1);
+    let mut decoder = flate2::read::GzDecoder::new(body);
     let mut out = Vec::new();
-    bounded.read_to_end(&mut out).map_err(|e| {
+    decoder.read_to_end(&mut out).map_err(|e| {
         warn!("invalid gzip body: {e}");
         Error::BadRequest(format!("invalid gzip body: {e}"))
     })?;
-    if out.len() as u64 > MAX_DECOMPRESSED_BODY_BYTES {
-        let message = format!(
-            "gzip body exceeds the {MAX_DECOMPRESSED_BODY_BYTES}-byte decompressed size cap"
-        );
-        warn!("{message}");
-        return Err(Error::BadRequest(message));
-    }
     Ok(out)
 }
 
@@ -474,9 +418,8 @@ fn validate_events(events: &[UsageEvent]) -> Result<()> {
     Ok(())
 }
 
-fn extract_log_events(payload: ExportLogsServiceRequest, source: &str) -> Vec<UsageEvent> {
+fn extract_log_events(payload: ExportLogsServiceRequest) -> Vec<UsageEvent> {
     let mut events = Vec::new();
-    let normalizer = crate::normalizer::REGISTRY.get(source);
 
     for resource_logs in payload.resource_logs {
         let resource_attrs = resource_logs
@@ -497,48 +440,32 @@ fn extract_log_events(payload: ExportLogsServiceRequest, source: &str) -> Vec<Us
                     0
                 };
 
-                let span_meta = crate::normalizer::SpanMeta {
-                    trace_id: (!log_record.trace_id.is_empty())
-                        .then(|| hex::encode(&log_record.trace_id)),
-                    span_id: (!log_record.span_id.is_empty())
-                        .then(|| hex::encode(&log_record.span_id)),
-                    start_time_unix_nano: observed_nanos,
-                    end_time_unix_nano: observed_nanos,
-                    name: log_record.severity_text.clone(),
-                };
-                let norm = normalizer
-                    .map(|f| f(&attrs, &span_meta))
-                    .unwrap_or_default();
-
-                let NormalizedTokensAndCost {
-                    prompt_tokens,
-                    completion_tokens,
-                    total_tokens,
-                    total_cost,
-                } = merge_norm_tokens_and_cost(&norm, &attrs);
+                let prompt_tokens = extract_i64(&attrs, &PROMPT_TOKENS_KEYS);
+                let completion_tokens = extract_i64(&attrs, &COMPLETION_TOKENS_KEYS);
+                let total_tokens = extract_i64(&attrs, &TOTAL_TOKENS_KEYS)
+                    .or_else(|| combine_token_total(prompt_tokens, completion_tokens));
 
                 let usage_value = extract_f64(&attrs, &USAGE_VALUE_KEYS)
                     .or_else(|| total_tokens.map(|v| v as f64))
                     .unwrap_or(1.0);
 
-                let latency_ms = norm.latency_ms.or_else(|| extract_latency_ms(&attrs));
+                let total_cost = extract_f64(&attrs, &COST_KEYS);
 
                 events.push(UsageEvent {
                     observed_at: nanos_to_datetime(observed_nanos),
                     signal_type: "log".to_string(),
-                    source: Some(source.to_string()),
                     account_id: extract_string(&attrs, &ACCOUNT_KEYS),
                     project_id: extract_string(&attrs, &PROJECT_KEYS),
                     api_key_id: extract_string(&attrs, &API_KEY_KEYS),
                     user_id: extract_string(&attrs, &USER_KEYS),
                     user_name: extract_string(&attrs, &USER_NAME_KEYS),
-                    model: norm.model.or_else(|| extract_string(&attrs, &MODEL_KEYS)),
+                    model: extract_string(&attrs, &MODEL_KEYS),
                     azp: extract_string(&attrs, &AZP_KEYS),
                     operation: derive_operation(&attrs),
                     billing_plan: extract_string(&attrs, &BILLING_PLAN_KEYS),
                     metric_name: non_empty(Some(log_record.severity_text)),
                     usage_value,
-                    latency_ms,
+                    latency_ms: extract_latency_ms(&attrs),
                     request_count: 1,
                     prompt_tokens,
                     completion_tokens,
@@ -554,14 +481,13 @@ fn extract_log_events(payload: ExportLogsServiceRequest, source: &str) -> Vec<Us
 }
 
 fn decode_trace_request(headers: &HeaderMap, body: &[u8]) -> Result<ExportTraceServiceRequest> {
-    let body = decode_maybe_gzip(headers, body)?;
     if is_json_content(headers) {
-        serde_json::from_slice(&body).map_err(|e| {
+        serde_json::from_slice(body).map_err(|e| {
             warn!("invalid OTLP trace JSON payload: {e}");
             Error::BadRequest(format!("invalid OTLP trace JSON payload: {e}"))
         })
     } else {
-        ExportTraceServiceRequest::decode(body.as_slice()).map_err(|e| {
+        ExportTraceServiceRequest::decode(body).map_err(|e| {
             warn!("invalid OTLP trace protobuf payload: {e}");
             Error::BadRequest(format!("invalid OTLP trace protobuf payload: {e}"))
         })
@@ -569,14 +495,13 @@ fn decode_trace_request(headers: &HeaderMap, body: &[u8]) -> Result<ExportTraceS
 }
 
 fn decode_metrics_request(headers: &HeaderMap, body: &[u8]) -> Result<ExportMetricsServiceRequest> {
-    let body = decode_maybe_gzip(headers, body)?;
     if is_json_content(headers) {
-        serde_json::from_slice(&body).map_err(|e| {
+        serde_json::from_slice(body).map_err(|e| {
             warn!("invalid OTLP metrics JSON payload: {e}");
             Error::BadRequest(format!("invalid OTLP metrics JSON payload: {e}"))
         })
     } else {
-        ExportMetricsServiceRequest::decode(body.as_slice()).map_err(|e| {
+        ExportMetricsServiceRequest::decode(body).map_err(|e| {
             warn!("invalid OTLP metrics protobuf payload: {e}");
             Error::BadRequest(format!("invalid OTLP metrics protobuf payload: {e}"))
         })
@@ -590,9 +515,8 @@ fn is_json_content(headers: &HeaderMap) -> bool {
         .is_some_and(|value| value.contains("json"))
 }
 
-fn extract_trace_events(payload: ExportTraceServiceRequest, source: &str) -> Vec<UsageEvent> {
+fn extract_trace_events(payload: ExportTraceServiceRequest) -> Vec<UsageEvent> {
     let mut events = Vec::new();
-    let normalizer = crate::normalizer::REGISTRY.get(source);
 
     for resource_spans in payload.resource_spans {
         let resource_attrs = resource_spans
@@ -604,27 +528,16 @@ fn extract_trace_events(payload: ExportTraceServiceRequest, source: &str) -> Vec
             for span in scope_spans.spans {
                 let attrs = merge_attr_maps(&resource_attrs, &key_values_to_map(&span.attributes));
 
-                let span_meta = crate::normalizer::SpanMeta {
-                    trace_id: (!span.trace_id.is_empty()).then(|| hex::encode(&span.trace_id)),
-                    span_id: (!span.span_id.is_empty()).then(|| hex::encode(&span.span_id)),
-                    start_time_unix_nano: span.start_time_unix_nano,
-                    end_time_unix_nano: span.end_time_unix_nano,
-                    name: span.name.clone(),
-                };
-                let norm = normalizer
-                    .map(|f| f(&attrs, &span_meta))
-                    .unwrap_or_default();
-
-                let NormalizedTokensAndCost {
-                    prompt_tokens,
-                    completion_tokens,
-                    total_tokens,
-                    total_cost,
-                } = merge_norm_tokens_and_cost(&norm, &attrs);
+                let prompt_tokens = extract_i64(&attrs, &PROMPT_TOKENS_KEYS);
+                let completion_tokens = extract_i64(&attrs, &COMPLETION_TOKENS_KEYS);
+                let total_tokens = extract_i64(&attrs, &TOTAL_TOKENS_KEYS)
+                    .or_else(|| combine_token_total(prompt_tokens, completion_tokens));
 
                 let usage_value = extract_f64(&attrs, &USAGE_VALUE_KEYS)
                     .or_else(|| total_tokens.map(|v| v as f64))
                     .unwrap_or(1.0);
+
+                let total_cost = extract_f64(&attrs, &COST_KEYS);
 
                 let observed_nanos = if span.end_time_unix_nano > 0 {
                     span.end_time_unix_nano
@@ -634,19 +547,17 @@ fn extract_trace_events(payload: ExportTraceServiceRequest, source: &str) -> Vec
 
                 let latency_ms =
                     span_duration_ms(span.start_time_unix_nano, span.end_time_unix_nano)
-                        .or(norm.latency_ms)
                         .or_else(|| extract_latency_ms(&attrs));
 
                 events.push(UsageEvent {
                     observed_at: nanos_to_datetime(observed_nanos),
                     signal_type: "trace".to_string(),
-                    source: Some(source.to_string()),
                     account_id: extract_string(&attrs, &ACCOUNT_KEYS),
                     project_id: extract_string(&attrs, &PROJECT_KEYS),
                     api_key_id: extract_string(&attrs, &API_KEY_KEYS),
                     user_id: extract_string(&attrs, &USER_KEYS),
                     user_name: extract_string(&attrs, &USER_NAME_KEYS),
-                    model: norm.model.or_else(|| extract_string(&attrs, &MODEL_KEYS)),
+                    model: extract_string(&attrs, &MODEL_KEYS),
                     azp: extract_string(&attrs, &AZP_KEYS),
                     operation: derive_operation(&attrs),
                     billing_plan: extract_string(&attrs, &BILLING_PLAN_KEYS),
@@ -667,7 +578,7 @@ fn extract_trace_events(payload: ExportTraceServiceRequest, source: &str) -> Vec
     events
 }
 
-fn extract_metric_events(payload: ExportMetricsServiceRequest, source: &str) -> Vec<UsageEvent> {
+fn extract_metric_events(payload: ExportMetricsServiceRequest) -> Vec<UsageEvent> {
     let mut events = Vec::new();
 
     for resource_metrics in payload.resource_metrics {
@@ -690,7 +601,6 @@ fn extract_metric_events(payload: ExportMetricsServiceRequest, source: &str) -> 
                                     &metric_attrs,
                                     metric_name.clone(),
                                     point,
-                                    source,
                                 ));
                             }
                         }
@@ -700,7 +610,6 @@ fn extract_metric_events(payload: ExportMetricsServiceRequest, source: &str) -> 
                                     &metric_attrs,
                                     metric_name.clone(),
                                     point,
-                                    source,
                                 ));
                             }
                         }
@@ -710,7 +619,6 @@ fn extract_metric_events(payload: ExportMetricsServiceRequest, source: &str) -> 
                                     &metric_attrs,
                                     metric_name.clone(),
                                     point,
-                                    source,
                                 ));
                             }
                         }
@@ -720,7 +628,6 @@ fn extract_metric_events(payload: ExportMetricsServiceRequest, source: &str) -> 
                                     &metric_attrs,
                                     metric_name.clone(),
                                     point,
-                                    source,
                                 ));
                             }
                         }
@@ -730,7 +637,6 @@ fn extract_metric_events(payload: ExportMetricsServiceRequest, source: &str) -> 
                                     &metric_attrs,
                                     metric_name.clone(),
                                     point,
-                                    source,
                                 ));
                             }
                         }
@@ -747,10 +653,8 @@ fn number_data_point_to_event(
     metric_attrs: &HashMap<String, Value>,
     metric_name: Option<String>,
     point: NumberDataPoint,
-    source: &str,
 ) -> UsageEvent {
     let attrs = merge_attr_maps(metric_attrs, &key_values_to_map(&point.attributes));
-    let normalizer = crate::normalizer::REGISTRY.get(source);
 
     let value = match point.value {
         Some(number_data_point::Value::AsDouble(v)) => v,
@@ -758,40 +662,25 @@ fn number_data_point_to_event(
         None => 0.0,
     };
 
-    let span_meta = crate::normalizer::SpanMeta {
-        trace_id: None,
-        span_id: None,
-        start_time_unix_nano: point.start_time_unix_nano,
-        end_time_unix_nano: point.time_unix_nano,
-        name: metric_name.clone().unwrap_or_default(),
-    };
-    let norm = normalizer
-        .map(|f| f(&attrs, &span_meta))
-        .unwrap_or_default();
-
-    let NormalizedTokensAndCost {
-        prompt_tokens,
-        completion_tokens,
-        total_tokens,
-        total_cost,
-    } = merge_norm_tokens_and_cost(&norm, &attrs);
+    let total_cost = extract_f64(&attrs, &COST_KEYS);
+    let prompt_tokens = extract_i64(&attrs, &PROMPT_TOKENS_KEYS);
+    let completion_tokens = extract_i64(&attrs, &COMPLETION_TOKENS_KEYS);
+    let total_tokens = extract_i64(&attrs, &TOTAL_TOKENS_KEYS)
+        .or_else(|| combine_token_total(prompt_tokens, completion_tokens));
 
     UsageEvent {
         observed_at: nanos_to_datetime(point.time_unix_nano),
         signal_type: "metric".to_string(),
-        source: Some(source.to_string()),
         account_id: extract_string(&attrs, &ACCOUNT_KEYS),
         project_id: extract_string(&attrs, &PROJECT_KEYS),
         api_key_id: extract_string(&attrs, &API_KEY_KEYS),
         user_id: extract_string(&attrs, &USER_KEYS),
         user_name: extract_string(&attrs, &USER_NAME_KEYS),
-        model: norm.model.or_else(|| extract_string(&attrs, &MODEL_KEYS)),
+        model: extract_string(&attrs, &MODEL_KEYS),
         azp: extract_string(&attrs, &AZP_KEYS),
         operation: derive_operation(&attrs),
         billing_plan: extract_string(&attrs, &BILLING_PLAN_KEYS),
-        latency_ms: norm
-            .latency_ms
-            .or_else(|| extract_latency_ms(&attrs))
+        latency_ms: extract_latency_ms(&attrs)
             .or_else(|| duration_metric_value_to_ms(metric_name.as_deref(), value)),
         metric_name,
         usage_value: value,
@@ -808,53 +697,32 @@ fn histogram_data_point_to_event(
     metric_attrs: &HashMap<String, Value>,
     metric_name: Option<String>,
     point: HistogramDataPoint,
-    source: &str,
 ) -> UsageEvent {
     let attrs = merge_attr_maps(metric_attrs, &key_values_to_map(&point.attributes));
-    let normalizer = crate::normalizer::REGISTRY.get(source);
-
     let count = u64_to_i64(point.count);
     let usage_value = point.sum.unwrap_or(count as f64);
-
-    let span_meta = crate::normalizer::SpanMeta {
-        trace_id: None,
-        span_id: None,
-        start_time_unix_nano: point.start_time_unix_nano,
-        end_time_unix_nano: point.time_unix_nano,
-        name: metric_name.clone().unwrap_or_default(),
-    };
-    let norm = normalizer
-        .map(|f| f(&attrs, &span_meta))
-        .unwrap_or_default();
-
-    let NormalizedTokensAndCost {
-        prompt_tokens,
-        completion_tokens,
-        total_tokens,
-        total_cost,
-    } = merge_norm_tokens_and_cost(&norm, &attrs);
+    let total_cost = extract_f64(&attrs, &COST_KEYS);
 
     UsageEvent {
         observed_at: nanos_to_datetime(point.time_unix_nano),
         signal_type: "metric".to_string(),
-        source: Some(source.to_string()),
         account_id: extract_string(&attrs, &ACCOUNT_KEYS),
         project_id: extract_string(&attrs, &PROJECT_KEYS),
         api_key_id: extract_string(&attrs, &API_KEY_KEYS),
         user_id: extract_string(&attrs, &USER_KEYS),
         user_name: extract_string(&attrs, &USER_NAME_KEYS),
-        model: norm.model.or_else(|| extract_string(&attrs, &MODEL_KEYS)),
+        model: extract_string(&attrs, &MODEL_KEYS),
         azp: extract_string(&attrs, &AZP_KEYS),
         operation: derive_operation(&attrs),
         billing_plan: extract_string(&attrs, &BILLING_PLAN_KEYS),
         metric_name,
         usage_value,
         total_cost,
-        latency_ms: norm.latency_ms.or_else(|| extract_latency_ms(&attrs)),
+        latency_ms: extract_latency_ms(&attrs),
         request_count: count.max(1),
-        prompt_tokens,
-        completion_tokens,
-        total_tokens,
+        prompt_tokens: extract_i64(&attrs, &PROMPT_TOKENS_KEYS),
+        completion_tokens: extract_i64(&attrs, &COMPLETION_TOKENS_KEYS),
+        total_tokens: extract_i64(&attrs, &TOTAL_TOKENS_KEYS),
         attributes: Value::Object(attrs.into_iter().collect()),
     }
 }
@@ -863,53 +731,32 @@ fn exponential_histogram_data_point_to_event(
     metric_attrs: &HashMap<String, Value>,
     metric_name: Option<String>,
     point: ExponentialHistogramDataPoint,
-    source: &str,
 ) -> UsageEvent {
     let attrs = merge_attr_maps(metric_attrs, &key_values_to_map(&point.attributes));
-    let normalizer = crate::normalizer::REGISTRY.get(source);
-
     let count = u64_to_i64(point.count);
     let usage_value = point.sum.unwrap_or(count as f64);
-
-    let span_meta = crate::normalizer::SpanMeta {
-        trace_id: None,
-        span_id: None,
-        start_time_unix_nano: point.start_time_unix_nano,
-        end_time_unix_nano: point.time_unix_nano,
-        name: metric_name.clone().unwrap_or_default(),
-    };
-    let norm = normalizer
-        .map(|f| f(&attrs, &span_meta))
-        .unwrap_or_default();
-
-    let NormalizedTokensAndCost {
-        prompt_tokens,
-        completion_tokens,
-        total_tokens,
-        total_cost,
-    } = merge_norm_tokens_and_cost(&norm, &attrs);
+    let total_cost = extract_f64(&attrs, &COST_KEYS);
 
     UsageEvent {
         observed_at: nanos_to_datetime(point.time_unix_nano),
         signal_type: "metric".to_string(),
-        source: Some(source.to_string()),
         account_id: extract_string(&attrs, &ACCOUNT_KEYS),
         project_id: extract_string(&attrs, &PROJECT_KEYS),
         api_key_id: extract_string(&attrs, &API_KEY_KEYS),
         user_id: extract_string(&attrs, &USER_KEYS),
         user_name: extract_string(&attrs, &USER_NAME_KEYS),
-        model: norm.model.or_else(|| extract_string(&attrs, &MODEL_KEYS)),
+        model: extract_string(&attrs, &MODEL_KEYS),
         azp: extract_string(&attrs, &AZP_KEYS),
         operation: derive_operation(&attrs),
         billing_plan: extract_string(&attrs, &BILLING_PLAN_KEYS),
         metric_name,
         usage_value,
         total_cost,
-        latency_ms: norm.latency_ms.or_else(|| extract_latency_ms(&attrs)),
+        latency_ms: extract_latency_ms(&attrs),
         request_count: count.max(1),
-        prompt_tokens,
-        completion_tokens,
-        total_tokens,
+        prompt_tokens: extract_i64(&attrs, &PROMPT_TOKENS_KEYS),
+        completion_tokens: extract_i64(&attrs, &COMPLETION_TOKENS_KEYS),
+        total_tokens: extract_i64(&attrs, &TOTAL_TOKENS_KEYS),
         attributes: Value::Object(attrs.into_iter().collect()),
     }
 }
@@ -918,92 +765,41 @@ fn summary_data_point_to_event(
     metric_attrs: &HashMap<String, Value>,
     metric_name: Option<String>,
     point: SummaryDataPoint,
-    source: &str,
 ) -> UsageEvent {
     let attrs = merge_attr_maps(metric_attrs, &key_values_to_map(&point.attributes));
-    let normalizer = crate::normalizer::REGISTRY.get(source);
-
     let count = u64_to_i64(point.count);
-
-    let span_meta = crate::normalizer::SpanMeta {
-        trace_id: None,
-        span_id: None,
-        start_time_unix_nano: point.start_time_unix_nano,
-        end_time_unix_nano: point.time_unix_nano,
-        name: metric_name.clone().unwrap_or_default(),
-    };
-    let norm = normalizer
-        .map(|f| f(&attrs, &span_meta))
-        .unwrap_or_default();
-
-    let NormalizedTokensAndCost {
-        prompt_tokens,
-        completion_tokens,
-        total_tokens,
-        total_cost,
-    } = merge_norm_tokens_and_cost(&norm, &attrs);
+    let total_cost = extract_f64(&attrs, &COST_KEYS);
 
     UsageEvent {
         observed_at: nanos_to_datetime(point.time_unix_nano),
         signal_type: "metric".to_string(),
-        source: Some(source.to_string()),
         account_id: extract_string(&attrs, &ACCOUNT_KEYS),
         project_id: extract_string(&attrs, &PROJECT_KEYS),
         api_key_id: extract_string(&attrs, &API_KEY_KEYS),
         user_id: extract_string(&attrs, &USER_KEYS),
         user_name: extract_string(&attrs, &USER_NAME_KEYS),
-        model: norm.model.or_else(|| extract_string(&attrs, &MODEL_KEYS)),
+        model: extract_string(&attrs, &MODEL_KEYS),
         azp: extract_string(&attrs, &AZP_KEYS),
         operation: derive_operation(&attrs),
         billing_plan: extract_string(&attrs, &BILLING_PLAN_KEYS),
         metric_name,
         total_cost,
-        latency_ms: norm.latency_ms.or_else(|| extract_latency_ms(&attrs)),
+        latency_ms: extract_latency_ms(&attrs),
         usage_value: point.sum,
         request_count: count.max(1),
-        prompt_tokens,
-        completion_tokens,
-        total_tokens,
+        prompt_tokens: extract_i64(&attrs, &PROMPT_TOKENS_KEYS),
+        completion_tokens: extract_i64(&attrs, &COMPLETION_TOKENS_KEYS),
+        total_tokens: extract_i64(&attrs, &TOTAL_TOKENS_KEYS),
         attributes: Value::Object(attrs.into_iter().collect()),
     }
 }
 
-/// The token/cost merge every event-extraction function derives the same way: the normalizer's
-/// value wins when present, falling back to the generic attribute-extraction keys. Shared by
-/// `extract_log_events`, `extract_trace_events`, and all four `*_data_point_to_event` functions
-/// -- this ~10-line block used to be hand-copied six times, which is exactly the shape of drift
-/// risk a fix applied to one call site and not another produces silently.
-struct NormalizedTokensAndCost {
-    prompt_tokens: Option<i64>,
-    completion_tokens: Option<i64>,
-    total_tokens: Option<i64>,
-    total_cost: Option<f64>,
-}
-
-fn merge_norm_tokens_and_cost(
-    norm: &crate::normalizer::NormalizedRecord,
-    attrs: &HashMap<String, Value>,
-) -> NormalizedTokensAndCost {
-    let prompt_tokens = norm
-        .prompt_tokens
-        .or_else(|| extract_i64(attrs, &PROMPT_TOKENS_KEYS));
-    let completion_tokens = norm
-        .completion_tokens
-        .or_else(|| extract_i64(attrs, &COMPLETION_TOKENS_KEYS));
-    let total_tokens = norm
-        .total_tokens
-        .or_else(|| extract_i64(attrs, &TOTAL_TOKENS_KEYS))
-        .or_else(|| crate::normalizer::combine_token_total(prompt_tokens, completion_tokens));
-    let total_cost = norm
-        .cost_micros
-        .map(|c| c as f64 / 1_000_000.0)
-        .or_else(|| extract_f64(attrs, &COST_KEYS));
-
-    NormalizedTokensAndCost {
-        prompt_tokens,
-        completion_tokens,
-        total_tokens,
-        total_cost,
+fn combine_token_total(prompt_tokens: Option<i64>, completion_tokens: Option<i64>) -> Option<i64> {
+    match (prompt_tokens, completion_tokens) {
+        (Some(prompt), Some(completion)) => prompt.checked_add(completion),
+        (Some(prompt), None) => Some(prompt),
+        (None, Some(completion)) => Some(completion),
+        (None, None) => None,
     }
 }
 
@@ -1084,6 +880,39 @@ fn any_value_to_json(any: &AnyValue) -> Value {
         Some(any_value::Value::StringValueStrindex(_)) => Value::Null,
         None => Value::Null,
     }
+}
+
+fn extract_string(attrs: &HashMap<String, Value>, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        attrs.get(*key).and_then(|value| match value {
+            Value::String(v) if !v.is_empty() => Some(v.clone()),
+            Value::Number(v) => Some(v.to_string()),
+            Value::Bool(v) => Some(v.to_string()),
+            _ => None,
+        })
+    })
+}
+
+fn extract_i64(attrs: &HashMap<String, Value>, keys: &[&str]) -> Option<i64> {
+    keys.iter().find_map(|key| {
+        attrs.get(*key).and_then(|value| match value {
+            Value::Number(v) => v
+                .as_i64()
+                .or_else(|| v.as_u64().and_then(|u| i64::try_from(u).ok())),
+            Value::String(v) => v.parse::<i64>().ok(),
+            _ => None,
+        })
+    })
+}
+
+fn extract_f64(attrs: &HashMap<String, Value>, keys: &[&str]) -> Option<f64> {
+    keys.iter().find_map(|key| {
+        attrs.get(*key).and_then(|value| match value {
+            Value::Number(v) => v.as_f64(),
+            Value::String(v) => v.parse::<f64>().ok(),
+            _ => None,
+        })
+    })
 }
 
 /// Pulls a per-request duration out of OTLP attributes, normalised to milliseconds.
@@ -1210,7 +1039,7 @@ mod tests {
         }))
         .expect("valid trace payload");
 
-        let events = extract_trace_events(payload, "eaig");
+        let events = extract_trace_events(payload);
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -1229,14 +1058,13 @@ mod tests {
 
     #[test]
     fn extract_metric_events_should_capture_number_data_points() {
-        use opentelemetry_proto::tonic::{
-            common::v1::{InstrumentationScope, any_value::Value as AnyValueValue},
-            metrics::v1::{
-                AggregationTemporality, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics,
-                Sum, metric,
-            },
-            resource::v1::Resource,
+        use opentelemetry_proto::tonic::common::v1::InstrumentationScope;
+        use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueValue;
+        use opentelemetry_proto::tonic::metrics::v1::{
+            AggregationTemporality, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum,
+            metric,
         };
+        use opentelemetry_proto::tonic::resource::v1::Resource;
 
         let payload = ExportMetricsServiceRequest {
             resource_metrics: vec![ResourceMetrics {
@@ -1328,7 +1156,7 @@ mod tests {
             }],
         };
 
-        let events = extract_metric_events(payload, "eaig");
+        let events = extract_metric_events(payload);
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -1349,11 +1177,12 @@ mod tests {
 
     #[test]
     fn extract_log_events_should_capture_dimensions_and_tokens() {
-        use opentelemetry_proto::tonic::{
-            common::v1::{InstrumentationScope, any_value::Value as AnyValueValue},
-            logs::v1::{LogRecord, ResourceLogs, ScopeLogs, SeverityNumber},
-            resource::v1::Resource,
+        use opentelemetry_proto::tonic::common::v1::InstrumentationScope;
+        use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueValue;
+        use opentelemetry_proto::tonic::logs::v1::{
+            LogRecord, ResourceLogs, ScopeLogs, SeverityNumber,
         };
+        use opentelemetry_proto::tonic::resource::v1::Resource;
 
         let payload = ExportLogsServiceRequest {
             resource_logs: vec![ResourceLogs {
@@ -1448,7 +1277,7 @@ mod tests {
             }],
         };
 
-        let events = extract_log_events(payload, "eaig");
+        let events = extract_log_events(payload);
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -1469,11 +1298,12 @@ mod tests {
 
     #[test]
     fn extract_log_events_should_read_envoy_ai_gateway_custom_cost() {
-        use opentelemetry_proto::tonic::{
-            common::v1::{InstrumentationScope, any_value::Value as AnyValueValue},
-            logs::v1::{LogRecord, ResourceLogs, ScopeLogs, SeverityNumber},
-            resource::v1::Resource,
+        use opentelemetry_proto::tonic::common::v1::InstrumentationScope;
+        use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueValue;
+        use opentelemetry_proto::tonic::logs::v1::{
+            LogRecord, ResourceLogs, ScopeLogs, SeverityNumber,
         };
+        use opentelemetry_proto::tonic::resource::v1::Resource;
 
         // This test verifies that the cost written by the Envoy AI Gateway extproc
         // (io.envoy.ai_gateway.llm_custom_total_cost) is correctly extracted.
@@ -1519,13 +1349,11 @@ mod tests {
                                 }),
                                 key_strindex: 0,
                             },
-                            // The real wire attribute: the Envoy AI Gateway access-log mapping emits
-                            // micro-USD cost under `gen_ai.usage.custom_total_cost` (research doc
-                            // §2.1/§3.2), NOT the raw io.envoy.* dynamic-metadata operator name.
+                            // The key written by Envoy AI Gateway extproc
                             KeyValue {
-                                key: "gen_ai.usage.custom_total_cost".to_string(),
+                                key: "io.envoy.ai_gateway.llm_custom_total_cost".to_string(),
                                 value: Some(AnyValue {
-                                    value: Some(AnyValueValue::IntValue(1875)),
+                                    value: Some(AnyValueValue::DoubleValue(123.45)),
                                 }),
                                 key_strindex: 0,
                             },
@@ -1555,83 +1383,15 @@ mod tests {
             }],
         };
 
-        let events = extract_log_events(payload, "eaig");
+        let events = extract_log_events(payload);
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
-        // F1 test recipe (research doc §4): `gen_ai.usage.custom_total_cost = 1875` is micro-USD,
-        // so it must produce a spend of 1875 micro-USD = $0.001875, never 1,875,000,000 (F1).
-        assert_eq!(event.total_cost, Some(0.001875));
+        // This is the key assertion - the custom cost should now be extracted
+        assert_eq!(event.total_cost, Some(123.45));
         assert_eq!(event.prompt_tokens, Some(100));
         assert_eq!(event.completion_tokens, Some(50));
         assert_eq!(event.total_tokens, Some(150));
-    }
-
-    #[test]
-    fn extract_log_events_should_read_double_valued_micro_usd_custom_cost() {
-        // CEL-computed costs arrive as float-backed doubles on the wire, not integers. The eaig
-        // normalizer must read an integral double as micro-USD directly; otherwise the generic
-        // COST_KEYS fallback re-treats the micro-USD value as dollars (F1, 1,000,000x).
-        use opentelemetry_proto::tonic::{
-            common::v1::{InstrumentationScope, any_value::Value as AnyValueValue},
-            logs::v1::{LogRecord, ResourceLogs, ScopeLogs, SeverityNumber},
-            resource::v1::Resource,
-        };
-
-        let payload = ExportLogsServiceRequest {
-            resource_logs: vec![ResourceLogs {
-                resource: Some(Resource {
-                    attributes: vec![KeyValue {
-                        key: "account_id".to_string(),
-                        value: Some(AnyValue {
-                            value: Some(AnyValueValue::StringValue("acct_1".to_string())),
-                        }),
-                        key_strindex: 0,
-                    }],
-                    dropped_attributes_count: 0,
-                    entity_refs: vec![],
-                }),
-                scope_logs: vec![ScopeLogs {
-                    scope: Some(InstrumentationScope {
-                        name: "test-logger".to_string(),
-                        version: "1.0".to_string(),
-                        attributes: vec![],
-                        dropped_attributes_count: 0,
-                    }),
-                    log_records: vec![LogRecord {
-                        event_name: String::new(),
-                        time_unix_nano: 1_735_689_601_000_000_000,
-                        observed_time_unix_nano: 0,
-                        severity_number: SeverityNumber::Info as i32,
-                        severity_text: "INFO".to_string(),
-                        body: None,
-                        attributes: vec![KeyValue {
-                            key: "gen_ai.usage.custom_total_cost".to_string(),
-                            value: Some(AnyValue {
-                                value: Some(AnyValueValue::DoubleValue(1875.0)),
-                            }),
-                            key_strindex: 0,
-                        }],
-                        dropped_attributes_count: 0,
-                        flags: 0,
-                        trace_id: vec![],
-                        span_id: vec![],
-                    }],
-                    schema_url: String::new(),
-                }],
-                schema_url: String::new(),
-            }],
-        };
-
-        let events = extract_log_events(payload, "eaig");
-
-        assert_eq!(events.len(), 1);
-        let event = &events[0];
-        assert_eq!(
-            event.total_cost,
-            Some(0.001875),
-            "a double-valued 1875 micro-USD must read as $0.001875, not $1875 (F1)"
-        );
     }
 
     fn string_kv(key: &str, value: &str) -> KeyValue {
@@ -1676,7 +1436,7 @@ mod tests {
         }))
         .expect("valid log payload");
 
-        let events = extract_log_events(payload, "eaig");
+        let events = extract_log_events(payload);
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -1725,7 +1485,7 @@ mod tests {
         request.encode(&mut encoded).expect("should encode");
 
         let decoded = ExportLogsServiceRequest::decode(encoded.as_slice()).expect("should decode");
-        let events = extract_log_events(decoded, "eaig");
+        let events = extract_log_events(decoded);
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -1907,7 +1667,7 @@ mod tests {
         }))
         .expect("valid log payload");
 
-        let events = extract_log_events(payload, "eaig");
+        let events = extract_log_events(payload);
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -1955,7 +1715,7 @@ mod tests {
         }))
         .expect("valid trace payload");
 
-        let trace_events = extract_trace_events(traces, "eaig");
+        let trace_events = extract_trace_events(traces);
         assert_eq!(trace_events.len(), 1);
         assert_eq!(trace_events[0].azp.as_deref(), Some("cli"));
         assert_eq!(trace_events[0].billing_plan.as_deref(), Some("free"));
@@ -1991,7 +1751,7 @@ mod tests {
         }))
         .expect("valid metric payload");
 
-        let metric_events = extract_metric_events(metrics, "eaig");
+        let metric_events = extract_metric_events(metrics);
         assert_eq!(metric_events.len(), 1);
         assert_eq!(metric_events[0].azp.as_deref(), Some("batch-job"));
         assert_eq!(metric_events[0].billing_plan.as_deref(), Some("enterprise"));
@@ -2000,10 +1760,9 @@ mod tests {
 
     fn base_usage_event() -> UsageEvent {
         UsageEvent {
-            observed_at: nanos_to_datetime(1_600_000_000_000_000_000),
+            observed_at: Utc::now(),
             latency_ms: None,
-            signal_type: "log".to_string(),
-            source: Some("eaig".to_string()),
+            signal_type: "trace".to_string(),
             account_id: None,
             project_id: None,
             api_key_id: None,
@@ -2045,7 +1804,7 @@ mod tests {
         }))
         .expect("valid trace payload");
 
-        let events = extract_trace_events(payload, "eaig");
+        let events = extract_trace_events(payload);
 
         assert_eq!(events.len(), 1);
         assert_eq!(
@@ -2077,7 +1836,7 @@ mod tests {
         }))
         .expect("valid log payload");
 
-        let events = extract_log_events(payload, "eaig");
+        let events = extract_log_events(payload);
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -2115,7 +1874,7 @@ mod tests {
             }],
         };
 
-        let events = extract_metric_events(payload, "eaig");
+        let events = extract_metric_events(payload);
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].usage_value, 3.5);
@@ -2152,7 +1911,7 @@ mod tests {
             }],
         };
 
-        let events = extract_metric_events(payload, "eaig");
+        let events = extract_metric_events(payload);
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -2190,7 +1949,7 @@ mod tests {
             }],
         };
 
-        let events = extract_metric_events(payload, "eaig");
+        let events = extract_metric_events(payload);
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -2225,7 +1984,7 @@ mod tests {
             }],
         };
 
-        let events = extract_metric_events(payload, "eaig");
+        let events = extract_metric_events(payload);
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -2251,7 +2010,7 @@ mod tests {
             }],
         };
 
-        let events = extract_metric_events(payload, "eaig");
+        let events = extract_metric_events(payload);
 
         assert!(events.is_empty());
     }
@@ -2342,6 +2101,15 @@ mod tests {
         );
         assert_eq!(non_empty(Some("   ".to_string())), None);
         assert_eq!(non_empty(None), None);
+    }
+
+    #[test]
+    fn combine_token_total_should_cover_every_combination() {
+        assert_eq!(combine_token_total(Some(3), Some(4)), Some(7));
+        assert_eq!(combine_token_total(Some(3), None), Some(3));
+        assert_eq!(combine_token_total(None, Some(4)), Some(4));
+        assert_eq!(combine_token_total(None, None), None);
+        assert_eq!(combine_token_total(Some(i64::MAX), Some(1)), None);
     }
 
     #[test]
@@ -2497,9 +2265,9 @@ mod tests {
 
     #[test]
     fn decode_maybe_gzip_should_decompress_gzip_encoded_bodies() {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
         use std::io::Write;
-
-        use flate2::{Compression, write::GzEncoder};
 
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder
@@ -2524,54 +2292,6 @@ mod tests {
             .expect_err("invalid gzip body should be rejected");
 
         assert!(matches!(err, Error::BadRequest(m) if m.contains("invalid gzip body")));
-    }
-
-    #[test]
-    fn decode_maybe_gzip_should_reject_a_body_that_decompresses_past_the_cap() {
-        use std::io::Write;
-
-        use flate2::{Compression, write::GzEncoder};
-
-        // A gzip bomb: highly repetitive input compresses to a tiny payload but inflates far
-        // past MAX_DECOMPRESSED_BODY_BYTES. Sized at cap + 1 MiB so the test is unambiguous
-        // (never depends on the exact boundary byte) while staying fast -- all-zero input
-        // compresses to a few KB regardless of size.
-        let oversized_len = (MAX_DECOMPRESSED_BODY_BYTES + 1024 * 1024) as usize;
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
-        encoder
-            .write_all(&vec![0u8; oversized_len])
-            .expect("write should succeed");
-        let compressed = encoder.finish().expect("gzip encoding should succeed");
-
-        let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_ENCODING, "gzip".parse().unwrap());
-
-        let err = decode_maybe_gzip(&headers, &compressed)
-            .expect_err("a body exceeding the decompressed size cap must be rejected");
-
-        assert!(matches!(err, Error::BadRequest(m) if m.contains("decompressed size cap")));
-    }
-
-    #[test]
-    fn decode_maybe_gzip_should_accept_a_body_at_exactly_the_cap() {
-        use std::io::Write;
-
-        use flate2::{Compression, write::GzEncoder};
-
-        let exact_len = MAX_DECOMPRESSED_BODY_BYTES as usize;
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
-        encoder
-            .write_all(&vec![0u8; exact_len])
-            .expect("write should succeed");
-        let compressed = encoder.finish().expect("gzip encoding should succeed");
-
-        let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_ENCODING, "gzip".parse().unwrap());
-
-        let out = decode_maybe_gzip(&headers, &compressed)
-            .expect("a body exactly at the cap must not be rejected");
-
-        assert_eq!(out.len() as u64, MAX_DECOMPRESSED_BODY_BYTES);
     }
 
     #[test]
@@ -2743,7 +2463,7 @@ mod tests {
         }))
         .expect("valid trace payload");
 
-        let events = extract_trace_events(payload, "eaig");
+        let events = extract_trace_events(payload);
 
         assert_eq!(events[0].latency_ms, Some(412.0));
     }
@@ -2768,7 +2488,7 @@ mod tests {
         }))
         .expect("valid trace payload");
 
-        let events = extract_trace_events(payload, "eaig");
+        let events = extract_trace_events(payload);
 
         assert_eq!(events[0].latency_ms, Some(412.0));
     }
@@ -2792,7 +2512,7 @@ mod tests {
         }))
         .expect("valid trace payload");
 
-        let events = extract_trace_events(payload, "eaig");
+        let events = extract_trace_events(payload);
 
         assert_eq!(events[0].latency_ms, Some(51_042.0));
     }
@@ -2819,7 +2539,7 @@ mod tests {
             }],
         };
 
-        let events = extract_log_events(request, "eaig");
+        let events = extract_log_events(request);
 
         assert_eq!(events[0].latency_ms, Some(51_042.0));
     }
@@ -2843,7 +2563,7 @@ mod tests {
             }],
         };
 
-        let events = extract_log_events(request, "eaig");
+        let events = extract_log_events(request);
 
         assert_eq!(events[0].latency_ms, Some(50_011.0));
     }
@@ -2867,7 +2587,7 @@ mod tests {
             }],
         };
 
-        let events = extract_log_events(request, "eaig");
+        let events = extract_log_events(request);
 
         assert_eq!(events[0].latency_ms, None);
     }
@@ -2943,7 +2663,6 @@ mod tests {
             &HashMap::new(),
             Some("gen_ai.server.request.duration".to_string()),
             point,
-            "eaig",
         );
 
         assert_eq!(event.latency_ms, None);
@@ -2962,7 +2681,6 @@ mod tests {
             &HashMap::new(),
             Some("gen_ai.server.request.duration".to_string()),
             point,
-            "eaig",
         );
 
         assert_eq!(event.latency_ms, None);
@@ -2980,7 +2698,6 @@ mod tests {
             &HashMap::new(),
             Some("gen_ai.server.request.duration".to_string()),
             point,
-            "eaig",
         );
 
         assert_eq!(event.latency_ms, Some(412.0));
