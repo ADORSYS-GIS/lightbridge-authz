@@ -379,7 +379,10 @@ just seed-usage
 This brings up `timescaledb` + `authz-usage-migrate` + `authz-usage`, then runs
 `scripts/seed-usage-events.py`, which:
 
-- **Truncates `usage_events` first** — re-running never doubles figures (idempotent).
+- **Truncates `usage_events` first** — re-running never doubles figures (idempotent). The script
+  refuses to truncate anything that is not provably the local compose database
+  (`localhost`/`127.0.0.1`/`::1`): pointing `--db-url` at a shared or staging Postgres requires the
+  explicit `--i-understand-this-truncates` opt-in, because `TRUNCATE` is irrecoverable.
 - **Drives the real OTLP ingest endpoint** (`POST /v1/otel/traces`), so seeding exercises the true
   extraction + validation + insert write path, not a direct row insert.
 - **Spreads data over 14 days** (configurable via `--days`) so every bucket interval the query API
@@ -395,6 +398,9 @@ The script takes optional flags:
 ```bash
 python3 scripts/seed-usage-events.py --ingest-url https://localhost:13002 --days 7
 ```
+
+`--db-url` defaults to the compose `timescaledb` URL; any non-local host is refused unless
+`--i-understand-this-truncates` is passed.
 
 Requires `psycopg2` (`pip install psycopg2-binary`) for the truncate step.
 

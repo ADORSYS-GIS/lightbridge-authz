@@ -6,6 +6,7 @@ the true extraction + validation + insert write path, per lightbridge-authz#528.
 
 Usage:
     python3 scripts/seed-usage-events.py [--ingest-url URL] [--db-url URL] [--days N]
+                                       [--i-understand-this-truncates]
 
 Defaults:
     --ingest-url  https://localhost:13002
@@ -13,7 +14,9 @@ Defaults:
     --days        14
 
 The script truncates usage_events first (idempotency: re-running never doubles
-figures), then generates and POSTs OTLP trace payloads.
+figures), then generates and POSTs OTLP trace payloads. TRUNCATE is irrecoverable,
+so the script refuses to truncate anything that is not provably the local compose
+database (localhost/127.0.0.1/::1) unless --i-understand-this-truncates is passed.
 
 Costs are in micro-USD (the gateway's `llm_custom_total_cost` unit -- see
 `crates/lightbridge-authz-budget/src/spend_units.rs`, #488). Token counts are in
@@ -29,6 +32,7 @@ import random
 import ssl
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
@@ -69,8 +73,30 @@ MODEL_PRICING = {
 EVENTS_PER_HOUR_PER_PROJECT = 5
 
 
-def truncate_usage_events(db_url: str) -> None:
-    """Truncate usage_events so re-running never doubles figures."""
+def _is_local_host(host: str | None) -> bool:
+    """True for the loopback hostnames the compose stack binds."""
+    return host in ("localhost", "127.0.0.1", "::1")
+
+
+def _resolve_host(db_url: str) -> str | None:
+    """Extract the host from a libpq URL, or None when it cannot be parsed.
+
+    None means "not provably local" -- the caller must fail closed.
+    """
+    parsed = urllib.parse.urlparse(db_url)
+    if parsed.scheme and parsed.hostname:
+        return parsed.hostname
+    return None
+
+
+def truncate_usage_events(db_url: str, allow_non_local: bool) -> None:
+    """Truncate usage_events so re-running never doubles figures.
+
+    TRUNCATE is irrecoverable, so refuse to run against anything that is not
+    provably the local compose database unless --i-understand-this-truncates
+    was passed. A DSN that cannot be parsed as a URL is treated as non-local
+    (fail closed).
+    """
     try:
         import psycopg2
     except ImportError:
@@ -80,12 +106,22 @@ def truncate_usage_events(db_url: str) -> None:
             file=sys.stderr,
         )
         sys.exit(1)
+    host = _resolve_host(db_url)
+    if not allow_non_local and not _is_local_host(host):
+        print(
+            "error: refusing to TRUNCATE usage_events on a non-local database "
+            f"(resolved host: {host!r}). The seed truncates its target before "
+            "writing; pointing it at a shared or staging database would destroy "
+            "real rows. Pass --i-understand-this-truncates to override.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     conn = psycopg2.connect(db_url)
     try:
         with conn.cursor() as cur:
             cur.execute("TRUNCATE TABLE usage_events")
         conn.commit()
-        print("truncated usage_events")
+        print(f"truncated usage_events on {host}")
     finally:
         conn.close()
 
@@ -225,10 +261,15 @@ def main() -> None:
         default="postgres://postgres:postgres@localhost:5433/lightbridge_authz_usage",
     )
     parser.add_argument("--days", type=int, default=14)
+    parser.add_argument(
+        "--i-understand-this-truncates",
+        action="store_true",
+        help="allow TRUNCATE against a non-local --db-url host",
+    )
     args = parser.parse_args()
 
     now = datetime.now(timezone.utc)
-    truncate_usage_events(args.db_url)
+    truncate_usage_events(args.db_url, args.i_understand_this_truncates)
 
     spans = generate_events(args.days, now)
     print(f"generated {len(spans)} spans across {args.days} days")
