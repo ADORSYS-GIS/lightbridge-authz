@@ -520,6 +520,100 @@ impl StoreRepo {
         Ok(Self::to_account(account))
     }
 
+    /// The admin-targets-an-arbitrary-subject account bootstrap (#720). Unlike [`Self::create_account`]
+    /// above, `subject` is operator-supplied, not the caller's own identity -- this exists because
+    /// a Keycloak-authenticated subject with no `accounts` row can never complete `authz-idp`'s
+    /// `/idp/callback` (ADR-0024's 2026-08-25 correction removed the old mint-on-login branch), and
+    /// ADR-0025's `NoAccount` self-service bootstrap fallback is unreachable in production (`authz-api`'s
+    /// bearer middleware there validates against `authz-idp`'s own JWKS, not Keycloak's). Before this
+    /// method existed, the only remedy was a manual SQL `INSERT` against production.
+    ///
+    /// Always mints the subject's ANCHOR account (`id = subject`, never a minted CUID2) -- this
+    /// procedure only ever creates the FIRST account for a subject, so unlike `create_account`'s
+    /// ADR-0026 "several accounts per identity" contract, a second call for the same subject is
+    /// `Error::Conflict`, not a new row.
+    ///
+    /// Also creates the account's mandatory default `projects` row in the SAME transaction: an
+    /// account with no `is_default` project still dead-ends the browser SSO callback one step later
+    /// (`find_default_project_id`, `crates/lightbridge-authz-rest/src/relying_party.rs`), so
+    /// provisioning the account alone would not actually unblock sign-in. `email` becomes that
+    /// project's `billing_identity` (globally unique via `idx_projects_billing_identity`); a
+    /// collision is `Error::Conflict`, and -- since both inserts share one transaction -- never a
+    /// partial write (an orphaned account with no default project).
+    ///
+    /// `user_id` is left unbound on the `accounts` insert so `accounts_set_user`'s `BEFORE INSERT`
+    /// trigger provisions the `users` row and sets `user_id := id`, exactly as `create_account`'s
+    /// own bootstrap branch does. `projects.is_default` is likewise left for
+    /// `projects_set_is_default`'s `BEFORE INSERT` trigger to compute -- `true` here, since this is
+    /// the account's first (and, until a caller adds more via `model.Project.create`, only) project.
+    #[instrument(skip(self))]
+    pub async fn provision_account(
+        &self,
+        subject: &AccountId,
+        email: &str,
+        name: Option<&str>,
+    ) -> Result<Account> {
+        let now = Utc::now();
+        let mut tx = self.pool().begin().await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO accounts (id, name, created_at, updated_at)
+            VALUES ($1, $2, $3, $3)
+            "#,
+        )
+        .bind(subject.as_str())
+        .bind(name)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            if let sqlx::Error::Database(db_err) = &e
+                && db_err.code().as_deref() == Some("23505")
+            {
+                return Error::Conflict("account already exists for this subject".to_string());
+            }
+            Error::from(e)
+        })?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO projects (id, account_id, name, billing_plan, billing_identity, created_at, updated_at)
+            VALUES ($1, $2, 'Default Project', 'free', $3, $4, $4)
+            "#,
+        )
+        .bind(cuid2())
+        .bind(subject.as_str())
+        .bind(email)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            if let sqlx::Error::Database(db_err) = &e
+                && db_err.code().as_deref() == Some("23505")
+            {
+                return Error::Conflict(format!(
+                    "a project with billing identity '{email}' already exists"
+                ));
+            }
+            Error::from(e)
+        })?;
+
+        let account: AccountRow = sqlx::query_as(
+            r#"
+            SELECT id, default_quota, status, name, user_id, created_at, updated_at
+            FROM accounts
+            WHERE id = $1
+            "#,
+        )
+        .bind(subject.as_str())
+        .fetch_one(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(Self::to_account(account))
+    }
+
     /// Lists every account the caller OWNS (ADR-0026), not just the one that IS them.
     ///
     /// The owner is derived rather than passed: `accounts.user_id` is always the owner's

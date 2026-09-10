@@ -75,6 +75,7 @@ EXPECTED_MCP_TOOLS = {
     # Procedure tools (`app/lightbridge-authz/src/mcp_procedure_tools.rs`, #645) -- one per RPC
     # procedure the hand-written set above does not already cover, across BOTH the crud and the
     # budget halves of the RPC surface.
+    "provision-account",
     "list-billing-plans",
     "list-model-catalog",
     "list-my-expiring-api-keys",

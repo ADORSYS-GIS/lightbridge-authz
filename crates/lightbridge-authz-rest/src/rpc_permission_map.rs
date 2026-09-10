@@ -8,11 +8,10 @@
 //! touched but not grown — the same reason `lightbridge-authz-api-key`'s `session_revocation.rs`
 //! is separate from its `repo.rs`. Moved verbatim, and `rpc_authorize` re-exports both, so every
 //! existing `lightbridge_authz_rest::rpc_authorize::{MAPPED_OP_ID_PERMISSIONS,
-//! permission_field_name}` path (`schema_policy_sync_tests.rs`, `auth_provider.rs`) still
-//! resolves. The pairing with `required_permission` that
-//! `every_mapped_op_id_maps_to_the_documented_permission` enforces is unchanged: that test still
-//! walks this list against that match arm-for-arm, so the two cannot drift across the file
-//! boundary any more than they could within one file.
+//! permission_field_name}` path (`schema_policy_sync_tests.rs`, `auth_provider.rs`) still resolves.
+//! The pairing with `required_permission` that `every_mapped_op_id_maps_to_the_documented_permission`
+//! enforces is unchanged: that test still walks this list arm-for-arm, so the two cannot drift
+//! across the file boundary any more than they could within one file.
 
 use lightbridge_authz_core::Permission;
 
@@ -69,6 +68,7 @@ pub fn is_authenticated_only_op_id(op_id: &str) -> bool {
 /// looking/defensive exactly as the view entry itself already is.
 pub const MAPPED_OP_ID_PERMISSIONS: &[(&str, Permission)] = &[
     ("procedure.createAccount", Permission::AccountCreate),
+    ("procedure.provisionAccount", Permission::AccountProvision),
     ("model.Account.list", Permission::AccountRead),
     ("model.Account.get", Permission::AccountRead),
     (

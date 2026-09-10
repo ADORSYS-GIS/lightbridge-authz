@@ -879,6 +879,40 @@ impl schema::procedures::ProcedureRegistry for Procedures {
         }
     }
 
+    /// The admin-targets-an-arbitrary-subject account bootstrap (#720). Structurally shaped like
+    /// `revoke_subject_sessions` below, not like `create_account` above: the target subject comes
+    /// from `args`, not from `ctx` -- see `AuthzStoreImpl::provision_account`'s doc comment for the
+    /// full design rationale. Permission enforcement (`account:provision`) already ran in the
+    /// `rpc_authorize` middleware before dispatch reached this handler; `_caller` below is purely a
+    /// "someone authenticated is calling" null-check, same as `revoke_subject_sessions`'s own.
+    fn provision_account(
+        &self,
+        _db: &schema::Cratestack,
+        ctx: &CratestackContext,
+        args: schema::procedures::provision_account::Args,
+        _authorized: schema::procedures::provision_account::Authorized,
+    ) -> impl core::future::Future<
+        Output = std::result::Result<
+            schema::procedures::provision_account::Output,
+            CratestackError,
+        >,
+    > + Send {
+        let issuer = self.issuer.clone();
+        let caller = subject_from_ctx(ctx);
+        let target_subject = args.args.subject;
+        let email = args.args.email;
+        let name = args.args.name;
+        async move {
+            let _caller = caller
+                .ok_or_else(|| CratestackError::Unauthorized("missing subject".to_owned()))?;
+            let account = issuer
+                .provision_account(&target_subject, &email, name.as_deref())
+                .await
+                .map_err(to_cratestack_error)?;
+            Ok(to_schema_account(account))
+        }
+    }
+
     fn update_account_default_quota(
         &self,
         _db: &schema::Cratestack,

@@ -116,7 +116,7 @@ generated `Args` and returns its own `Output`, dispatched through the shared `Pr
 so shapes and `@allow` evaluation match the RPC surface by construction.
 
 MCP holds **no permission table of its own**: `mcp_rbac::tool_gate` resolves tool → op-id and asks
-`rpc_authorize::required_permission`. The surface is 70 tools = 68 reachable op-ids + 2 MCP-only
+`rpc_authorize::required_permission`. The surface is 71 tools = 69 reachable op-ids + 2 MCP-only
 validation tools.
 
 Then add the tool name to `.docker/it/servers_it.py`'s `EXPECTED_MCP_TOOLS`. **This is the copy that

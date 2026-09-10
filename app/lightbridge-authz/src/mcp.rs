@@ -3018,9 +3018,10 @@ mod tests {
         assert_eq!(tool_names, expected);
         assert_eq!(
             tool_names.len(),
-            70,
-            "the MCP surface should advertise 33 hand-written tools plus 37 procedure tools; \
-             update this count deliberately when the RPC surface grows"
+            71,
+            "the MCP surface should advertise 33 hand-written tools plus 38 procedure tools \
+             (#720 added provision-account); update this count deliberately when the RPC surface \
+             grows"
         );
     }
 

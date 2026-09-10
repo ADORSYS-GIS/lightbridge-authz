@@ -53,6 +53,41 @@ impl AuthzStoreImpl {
         Ok(account)
     }
 
+    /// The admin-targets-an-arbitrary-subject account bootstrap (#720) -- backs `provisionAccount`;
+    /// see `StoreRepo::provision_account`'s doc comment for the full rationale. `email` is required
+    /// (unlike `create_account`'s optional fields), validated here rather than left to surface as a
+    /// raw DB not-null violation, because it becomes the default project's `NOT NULL`
+    /// `billing_identity`. `name` gets `create_account`'s own blank-to-`None` normalization, and the
+    /// starting grant (#697) is booked the same way too -- an admin-provisioned account must not
+    /// start out unfunded just because the subject couldn't self-provision.
+    pub async fn provision_account(
+        &self,
+        subject: &str,
+        email: &str,
+        name: Option<&str>,
+    ) -> Result<Account> {
+        let email = email.trim();
+        if email.is_empty() {
+            return Err(Error::BadRequest(
+                "email must not be blank -- it becomes the default project's billing identity"
+                    .to_string(),
+            ));
+        }
+        let name = Self::normalize_account_name(name);
+        let account = self
+            .repo
+            .provision_account(&AccountId::assert_already_resolved(subject), email, name)
+            .await?;
+        tracing::info!(
+            operation = "provision_account",
+            subject = %subject,
+            account_id = %account.id,
+            "account provisioned by admin"
+        );
+        self.book_starting_grant(&account.id).await;
+        Ok(account)
+    }
+
     /// Books the new account's starting grant (#697) — one `automatic` grant for the current
     /// period, worth what the account's effective reset schedule would reset it to, idempotent on
     /// `budget-start-<period>-<account_id>`. Without it a brand-new account reads
