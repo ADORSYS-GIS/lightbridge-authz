@@ -343,9 +343,10 @@ fn test_microsoft_foundry_normalizer_ports_governance_contract() {
 
 #[test]
 fn test_eaig_normalizer_ports_governance_contract() {
-    // io.envoy.ai_gateway.llm_custom_total_cost is ALREADY micro-USD on the wire (ai-helm
-    // ADR-0051/ADR-0058; docs/research/2026-08-25-genai-usage-ingestion.md "F1: Cost is off by
-    // 1,000,000x") -- 1000 here means $0.001, not $1000. The normalizer must read it verbatim,
+    // The cost attribute is ALREADY micro-USD on the wire (ai-helm ADR-0051/ADR-0058;
+    // docs/research/2026-08-25-genai-usage-ingestion.md "F1: Cost is off by 1,000,000x"). The
+    // real wire key this deployment sends is `gen_ai.usage.custom_total_cost` (research doc
+    // §2.1/§3.2) -- 1000 here means $0.001, not $1000. The normalizer must read it verbatim,
     // never multiply it by 1_000_000 again.
     let normalizer = REGISTRY.get("eaig").expect("eaig should exist");
     let record = normalizer(
@@ -353,7 +354,7 @@ fn test_eaig_normalizer_ports_governance_contract() {
             ("model", json!("gpt-4")),
             ("llm.usage.prompt_tokens", json!(100)),
             ("llm.usage.completion_tokens", json!(50)),
-            ("io.envoy.ai_gateway.llm_custom_total_cost", json!(1000)),
+            ("gen_ai.usage.custom_total_cost", json!(1000)),
             ("duration", json!(25.0)),
         ]),
         &span_meta(),
@@ -366,7 +367,7 @@ fn test_eaig_normalizer_ports_governance_contract() {
     assert_eq!(
         record.cost_micros,
         Some(1000),
-        "llm_custom_total_cost is already micro-USD -- must pass through unchanged, not be \
+        "custom_total_cost is already micro-USD -- must pass through unchanged, not be \
          multiplied by 1_000_000 again (F1)"
     );
     assert_eq!(record.latency_ms, Some(25.0));

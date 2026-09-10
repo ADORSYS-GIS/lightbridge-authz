@@ -11,7 +11,16 @@ use super::{
 // ai-helm ADR-0051/ADR-0058), NOT dollars. Read it as an integer directly -- do NOT run it
 // through usd_to_micros, which would reproduce F1 by multiplying an already-micro value by
 // 1,000,000 a second time.
-pub const EAIG_COST_KEYS: [&str; 1] = ["io.envoy.ai_gateway.llm_custom_total_cost"];
+//
+// The attribute this deployment actually sends is `gen_ai.usage.custom_total_cost`: the Envoy
+// AI Gateway access-log mapping (research doc §2.1/§3.2) maps the raw `io.envoy.ai_gateway`
+// dynamic-metadata operator into that OTel semconv attribute. The raw key is kept as a
+// fallback, but the real wire key must lead or the micro-USD read never engages on the live
+// path and the generic COST_KEYS fallback re-treats the micro-USD value as dollars (F1).
+pub const EAIG_COST_KEYS: [&str; 2] = [
+    "gen_ai.usage.custom_total_cost",
+    "io.envoy.ai_gateway.llm_custom_total_cost",
+];
 pub const EAIG_MODEL_KEYS: [&str; 3] = ["model", "llm.model", "gen_ai.request.model"];
 pub const EAIG_PROMPT_TOKENS_KEYS: [&str; 4] = [
     "prompt_tokens",

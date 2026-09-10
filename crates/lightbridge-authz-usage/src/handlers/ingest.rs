@@ -23,7 +23,12 @@ use prost::Message;
 use serde_json::{Map, Value, json};
 use tracing::{debug, instrument, warn};
 
-use crate::{UsageState, models::IngestResponse, repo::UsageEvent};
+use crate::{
+    UsageState,
+    models::IngestResponse,
+    normalizer::{extract_f64, extract_i64, extract_string},
+    repo::UsageEvent,
+};
 
 const ACCOUNT_KEYS: [&str; 5] = [
     "account_id",
@@ -1081,39 +1086,6 @@ fn any_value_to_json(any: &AnyValue) -> Value {
     }
 }
 
-fn extract_string(attrs: &HashMap<String, Value>, keys: &[&str]) -> Option<String> {
-    keys.iter().find_map(|key| {
-        attrs.get(*key).and_then(|value| match value {
-            Value::String(v) if !v.is_empty() => Some(v.clone()),
-            Value::Number(v) => Some(v.to_string()),
-            Value::Bool(v) => Some(v.to_string()),
-            _ => None,
-        })
-    })
-}
-
-fn extract_i64(attrs: &HashMap<String, Value>, keys: &[&str]) -> Option<i64> {
-    keys.iter().find_map(|key| {
-        attrs.get(*key).and_then(|value| match value {
-            Value::Number(v) => v
-                .as_i64()
-                .or_else(|| v.as_u64().and_then(|u| i64::try_from(u).ok())),
-            Value::String(v) => v.parse::<i64>().ok(),
-            _ => None,
-        })
-    })
-}
-
-fn extract_f64(attrs: &HashMap<String, Value>, keys: &[&str]) -> Option<f64> {
-    keys.iter().find_map(|key| {
-        attrs.get(*key).and_then(|value| match value {
-            Value::Number(v) => v.as_f64(),
-            Value::String(v) => v.parse::<f64>().ok(),
-            _ => None,
-        })
-    })
-}
-
 /// Pulls a per-request duration out of OTLP attributes, normalised to milliseconds.
 ///
 /// Millisecond-named keys win over second-named ones only because they are tried first; a payload
@@ -1547,11 +1519,13 @@ mod tests {
                                 }),
                                 key_strindex: 0,
                             },
-                            // The key written by Envoy AI Gateway extproc
+                            // The real wire attribute: the Envoy AI Gateway access-log mapping emits
+                            // micro-USD cost under `gen_ai.usage.custom_total_cost` (research doc
+                            // §2.1/§3.2), NOT the raw io.envoy.* dynamic-metadata operator name.
                             KeyValue {
-                                key: "io.envoy.ai_gateway.llm_custom_total_cost".to_string(),
+                                key: "gen_ai.usage.custom_total_cost".to_string(),
                                 value: Some(AnyValue {
-                                    value: Some(AnyValueValue::DoubleValue(123.45)),
+                                    value: Some(AnyValueValue::IntValue(1875)),
                                 }),
                                 key_strindex: 0,
                             },
@@ -1585,8 +1559,9 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
-        // This is the key assertion - the custom cost should now be extracted
-        assert_eq!(event.total_cost, Some(123.45));
+        // F1 test recipe (research doc §4): `gen_ai.usage.custom_total_cost = 1875` is micro-USD,
+        // so it must produce a spend of 1875 micro-USD = $0.001875, never 1,875,000,000 (F1).
+        assert_eq!(event.total_cost, Some(0.001875));
         assert_eq!(event.prompt_tokens, Some(100));
         assert_eq!(event.completion_tokens, Some(50));
         assert_eq!(event.total_tokens, Some(150));
