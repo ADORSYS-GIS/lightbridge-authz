@@ -6,7 +6,7 @@ use std::sync::Arc;
 use axum::{
     Json,
     body::{Body, Bytes, to_bytes},
-    http::{HeaderMap, HeaderValue, Request, StatusCode, header},
+    http::{HeaderMap, Request, StatusCode, header},
 };
 use chrono::{Duration, Utc};
 use lightbridge_authz_core::{
@@ -810,19 +810,6 @@ async fn ingest_logs_rejects_missing_source_header() {
         Err(Error::BadRequest(message))
             if message.contains("missing x-source")
     ));
-}
-
-/// `resolve_source` now requires a known `X-Source` header on every ingest request (#584); these
-/// handler-level tests predate that requirement, so they need it added explicitly.
-///
-/// `HeaderValue::from_static` (not `"eaig".parse().unwrap()`) on purpose: it takes no `Result`,
-/// so it needs no `.unwrap()`/`.expect()` -- this is a free helper fn, not a `#[test]` body, so
-/// it falls outside clippy.toml's `allow-unwrap-in-tests` carve-out (that only recognizes
-/// `#[cfg(test)]` modules and `#[test]`/`#[tokio::test]` functions themselves).
-fn headers_with_source() -> HeaderMap {
-    let mut headers = HeaderMap::new();
-    headers.insert("x-source", HeaderValue::from_static("eaig"));
-    headers
 }
 
 fn encoded_log_request() -> Bytes {

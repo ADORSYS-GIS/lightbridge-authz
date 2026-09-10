@@ -67,10 +67,6 @@ struct UsageQueryRow {
     model: Option<String>,
     metric_name: Option<String>,
     signal_type: Option<String>,
-    #[expect(
-        dead_code,
-        reason = "source field is populated by SQLx FromRow but not yet projected in SELECT"
-    )]
     source: Option<String>,
     azp: Option<String>,
     operation: Option<String>,

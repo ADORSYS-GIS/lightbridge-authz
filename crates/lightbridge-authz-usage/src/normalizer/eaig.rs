@@ -75,4 +75,3 @@ pub fn normalize(attrs: &HashMap<String, Value>, meta: &SpanMeta) -> NormalizedR
         tool_name: None,
     }
 }
-

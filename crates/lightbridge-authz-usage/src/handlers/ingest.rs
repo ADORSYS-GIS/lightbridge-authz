@@ -487,7 +487,7 @@ fn apply_normalizer(
     let total_tokens = norm
         .total_tokens
         .or_else(|| extract_i64(attrs, &TOTAL_TOKENS_KEYS))
-        .or_else(|| combine_token_total(prompt_tokens, completion_tokens));
+        .or_else(|| crate::normalizer::combine_token_total(prompt_tokens, completion_tokens));
 
     let total_cost = norm
         .cost_micros
@@ -576,14 +576,6 @@ fn extract_log_events(payload: ExportLogsServiceRequest, source: &str) -> Vec<Us
     events
 }
 
-fn decode_trace_request(headers: &HeaderMap, body: &[u8]) -> Result<ExportTraceServiceRequest> {
-    decode_otlp_request(headers, body, "trace")
-}
-
-fn decode_metrics_request(headers: &HeaderMap, body: &[u8]) -> Result<ExportMetricsServiceRequest> {
-    decode_otlp_request(headers, body, "metrics")
-}
-
 fn is_json_content(headers: &HeaderMap) -> bool {
     headers
         .get(axum::http::header::CONTENT_TYPE)
@@ -624,9 +616,10 @@ fn extract_trace_events(payload: ExportTraceServiceRequest, source: &str) -> Vec
                     span.start_time_unix_nano
                 };
 
-                let latency_ms = span_duration_ms(span.start_time_unix_nano, span.end_time_unix_nano)
-                    .or(norm.latency_ms)
-                    .or_else(|| extract_latency_ms(&attrs));
+                let latency_ms =
+                    span_duration_ms(span.start_time_unix_nano, span.end_time_unix_nano)
+                        .or(norm.latency_ms)
+                        .or_else(|| extract_latency_ms(&attrs));
 
                 events.push(UsageEvent {
                     observed_at: nanos_to_datetime(observed_nanos),
@@ -926,45 +919,6 @@ fn summary_data_point_to_event(
         completion_tokens: norm.completion_tokens,
         total_tokens: norm.total_tokens,
         attributes: Value::Object(attrs.into_iter().collect()),
-    }
-}
-
-/// The token/cost merge every event-extraction function derives the same way: the normalizer's
-/// value wins when present, falling back to the generic attribute-extraction keys. Shared by
-/// `extract_log_events`, `extract_trace_events`, and all four `*_data_point_to_event` functions
-/// -- this ~10-line block used to be hand-copied six times, which is exactly the shape of drift
-/// risk a fix applied to one call site and not another produces silently.
-struct NormalizedTokensAndCost {
-    prompt_tokens: Option<i64>,
-    completion_tokens: Option<i64>,
-    total_tokens: Option<i64>,
-    total_cost: Option<f64>,
-}
-
-fn merge_norm_tokens_and_cost(
-    norm: &crate::normalizer::NormalizedRecord,
-    attrs: &HashMap<String, Value>,
-) -> NormalizedTokensAndCost {
-    let prompt_tokens = norm
-        .prompt_tokens
-        .or_else(|| extract_i64(attrs, &PROMPT_TOKENS_KEYS));
-    let completion_tokens = norm
-        .completion_tokens
-        .or_else(|| extract_i64(attrs, &COMPLETION_TOKENS_KEYS));
-    let total_tokens = norm
-        .total_tokens
-        .or_else(|| extract_i64(attrs, &TOTAL_TOKENS_KEYS))
-        .or_else(|| crate::normalizer::combine_token_total(prompt_tokens, completion_tokens));
-    let total_cost = norm
-        .cost_micros
-        .map(|c| c as f64 / 1_000_000.0)
-        .or_else(|| extract_f64(attrs, &COST_KEYS));
-
-    NormalizedTokensAndCost {
-        prompt_tokens,
-        completion_tokens,
-        total_tokens,
-        total_cost,
     }
 }
 
@@ -2343,7 +2297,8 @@ mod tests {
         );
 
         let payload =
-            decode_logs_request(&headers, body.as_bytes()).expect("json payload should decode");
+            decode_otlp_request::<ExportLogsServiceRequest>(&headers, body.as_bytes(), "logs")
+                .expect("json payload should decode");
 
         assert!(payload.resource_logs.is_empty());
     }
@@ -2356,7 +2311,7 @@ mod tests {
             "application/json".parse().unwrap(),
         );
 
-        let err = decode_logs_request(&headers, b"{not json")
+        let err = decode_otlp_request::<ExportLogsServiceRequest>(&headers, b"{not json", "logs")
             .expect_err("invalid json should be rejected");
 
         assert!(
@@ -2374,7 +2329,8 @@ mod tests {
         );
 
         let payload =
-            decode_trace_request(&headers, body.as_bytes()).expect("json payload should decode");
+            decode_otlp_request::<ExportTraceServiceRequest>(&headers, body.as_bytes(), "trace")
+                .expect("json payload should decode");
 
         assert!(payload.resource_spans.is_empty());
     }
@@ -2387,7 +2343,7 @@ mod tests {
             "application/json".parse().unwrap(),
         );
 
-        let err = decode_trace_request(&headers, b"{not json")
+        let err = decode_otlp_request::<ExportTraceServiceRequest>(&headers, b"{not json", "trace")
             .expect_err("invalid json should be rejected");
 
         assert!(
@@ -2397,8 +2353,12 @@ mod tests {
 
     #[test]
     fn decode_trace_request_should_reject_invalid_protobuf_payload() {
-        let err = decode_trace_request(&HeaderMap::new(), b"not protobuf")
-            .expect_err("invalid protobuf should be rejected");
+        let err = decode_otlp_request::<ExportTraceServiceRequest>(
+            &HeaderMap::new(),
+            b"not protobuf",
+            "trace",
+        )
+        .expect_err("invalid protobuf should be rejected");
 
         assert!(
             matches!(err, Error::BadRequest(m) if m.contains("invalid OTLP trace protobuf payload"))
@@ -2414,8 +2374,12 @@ mod tests {
             "application/json".parse().unwrap(),
         );
 
-        let payload =
-            decode_metrics_request(&headers, body.as_bytes()).expect("json payload should decode");
+        let payload = decode_otlp_request::<ExportMetricsServiceRequest>(
+            &headers,
+            body.as_bytes(),
+            "metrics",
+        )
+        .expect("json payload should decode");
 
         assert!(payload.resource_metrics.is_empty());
     }
@@ -2428,8 +2392,9 @@ mod tests {
             "application/json".parse().unwrap(),
         );
 
-        let err = decode_metrics_request(&headers, b"{not json")
-            .expect_err("invalid json should be rejected");
+        let err =
+            decode_otlp_request::<ExportMetricsServiceRequest>(&headers, b"{not json", "metrics")
+                .expect_err("invalid json should be rejected");
 
         assert!(
             matches!(err, Error::BadRequest(m) if m.contains("invalid OTLP metrics JSON payload"))
@@ -2438,8 +2403,12 @@ mod tests {
 
     #[test]
     fn decode_metrics_request_should_reject_invalid_protobuf_payload() {
-        let err = decode_metrics_request(&HeaderMap::new(), b"not protobuf")
-            .expect_err("invalid protobuf should be rejected");
+        let err = decode_otlp_request::<ExportMetricsServiceRequest>(
+            &HeaderMap::new(),
+            b"not protobuf",
+            "metrics",
+        )
+        .expect_err("invalid protobuf should be rejected");
 
         assert!(
             matches!(err, Error::BadRequest(m) if m.contains("invalid OTLP metrics protobuf payload"))
