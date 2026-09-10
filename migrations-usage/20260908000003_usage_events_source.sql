@@ -1,0 +1,13 @@
+-- The push-ingest normalizer registry (#584) keys every request-grain event by the TRUSTED
+-- source identity resolved from the authenticated channel (`X-Source` today, the collector
+-- processor after #585) and writes it onto the row so a source is a groupable/filterable
+-- dimension, not a payload-resource attribute a caller could spoof.
+--
+-- `source` is the canonical kebab-case token from the registry (ADR-0028 D4: closed at the
+-- registry, not a DB enum). NULL means "this signal carried no source identity" -- never
+-- "0"/"unknown source" -- the same honesty rule `total_cost` and `latency_ms` follow. Adding a
+-- source requires a registry row, never a migration.
+--
+-- Column is added nullable first (a catalog-only change, no table rewrite); request-grain rows
+-- are high volume but this carries no backfill -- a legacy row simply keeps NULL.
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS source TEXT;
