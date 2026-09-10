@@ -2864,6 +2864,8 @@ dependencies = [
  "lightbridge-authz-core",
  "lightbridge-authz-usage-rest",
  "mimalloc",
+ "reqwest 0.13.4",
+ "serde",
  "serde_json",
  "sqlx",
  "tokio",
