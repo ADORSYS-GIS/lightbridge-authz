@@ -2455,6 +2455,93 @@ async fn browser_sso_callback_persists_the_same_federated_identity(pool: PgPool)
     );
 }
 
+/// The regression test for #720: proves `StoreRepo::provision_account` alone -- with no separate
+/// `create_project` call -- is sufficient for a real `/idp/callback` browser flow to succeed.
+/// Before `provisionAccount` existed, an admin provisioning only the `accounts` row (the naive
+/// fix) would still have dead-ended sign-in one step later at `find_default_project_id`, since a
+/// browser-flow session needs a resolvable default project, not merely an existing account. A
+/// `303 SEE_OTHER` here is reachable ONLY if BOTH halves of the incident are actually fixed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn provisioned_subject_completes_browser_sso_callback(pool: PgPool) {
+    let keycloak = MockServer::start_async().await;
+    let key = generate_rs256_key().unwrap();
+    mock_discovery_and_jwks(&keycloak, &key).await;
+    let repo = repo(pool.clone());
+    let subject = "provisioned-browser-subject";
+    repo.provision_account(
+        &AccountId::assert_already_resolved(subject),
+        "provisioned-browser-subject@example.test",
+        None,
+    )
+    .await
+    .unwrap();
+    let rp = Arc::new(
+        KeycloakRelyingParty::new(
+            rp_config(&keycloak),
+            keycloak.base_url(),
+            keycloak.base_url(),
+            repo.clone(),
+            rate_limiter(),
+            None,
+        )
+        .unwrap(),
+    );
+    let (location, cookie) = rp
+        .begin_browser(BrowserLoginTarget {
+            project_id: None,
+            resume_path: "/browser".to_string(),
+            client_id: BROWSER_CLIENT_ID.to_string(),
+        })
+        .await
+        .unwrap();
+    let state = reqwest::Url::parse(&location)
+        .unwrap()
+        .query_pairs()
+        .find_map(|(key, value)| (key == "state").then(|| value.into_owned()))
+        .unwrap();
+    let decoded = OAuth2State::decrypt(&state, &state_key_bytes()).unwrap();
+    let token = sign_id_token(
+        &key,
+        subject,
+        &keycloak.base_url(),
+        decoded.nonce.as_deref().unwrap(),
+    );
+    keycloak
+        .mock_async(|when, then| {
+            when.method(POST).path("/token").body_includes("code=code");
+            then.status(200)
+                .json_body(rich_token_response(&token, "provisioned-browser-refresh"));
+        })
+        .await;
+    let response = router(rp.clone())
+        .oneshot(
+            Request::builder()
+                .uri(callback_uri(&state))
+                .header(header::COOKIE, cookie.to_string())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::SEE_OTHER,
+        "a provisioned account with its default project must complete browser SSO -- a status \
+         other than 303 here means find_default_project_id (or some earlier step) still failed"
+    );
+
+    let federation = repo
+        .find_federated_identity(&keycloak.base_url(), subject)
+        .await
+        .unwrap()
+        .expect("a federated identity row must exist after a successful browser SSO callback");
+    assert_eq!(
+        federation.account_id,
+        subject.to_string(),
+        "the provisioned account must have been adopted"
+    );
+}
+
 /// ADR-0024 Q2 already documents plaintext, queryable metadata sitting alongside the sealed
 /// envelope (`issuer`/`subject`/`scope`/the expiry columns); migration
 /// `20260830000001_federated_identities_add_profile_claims.sql` adds

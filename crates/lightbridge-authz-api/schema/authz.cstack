@@ -21,7 +21,7 @@ datasource db {
   url = env("DATABASE_URL")
 }
 
-// `rpcScope` + the 32 `perm*` booleans below are issue #383's fix, not part of the original
+// `rpcScope` + the 33 `perm*` booleans below are issue #383's fix, not part of the original
 // ADR-0003 migration. Background: cratestack 0.8.4 rewrote `POST /rpc/batch` to authenticate the
 // envelope exactly once (`CachedAuthProvider`), so `CratestackAuthProvider::authenticate` --
 // previously the sole per-frame RBAC enforcement point -- can no longer see an individual batch
@@ -85,6 +85,7 @@ auth Principal {
   permAccountUpdate Boolean
   permAccountDelete Boolean
   permAccountDisable Boolean
+  permAccountProvision Boolean
   permProjectCreate Boolean
   permProjectRead Boolean
   permProjectUpdate Boolean
@@ -687,6 +688,41 @@ type CreateAccountInput {
 
 mutation procedure createAccount(args: CreateAccountInput): Account
   @allow((auth() != null) && auth().rpcScope == "crud" && auth().permAccountCreate == true)
+
+// The account-bootstrap admin surface (#720): unlike `createAccount` above, the account this
+// mints is NOT for the caller -- `subject` is an operator-supplied Keycloak `sub` for a person who
+// cannot self-provision, because `authz-idp`'s `/idp/callback` refuses to complete sign-in for a
+// subject with no `accounts` row (ADR-0024's 2026-08-25 correction removed the old
+// mint-on-login branch), and ADR-0025's `NoAccount` self-service bootstrap fallback turns out to
+// be unreachable in production (`authz-api`'s bearer middleware there validates against
+// `authz-idp`'s own JWKS, not Keycloak's, so a brand-new subject's raw Keycloak token never
+// reaches that fallback). Before this procedure existed, the only remedy was a manual SQL INSERT
+// against production.
+//
+// Same shape as `revokeSubjectSessions`: no per-tenant ownership relation exists between an admin
+// and an arbitrary target subject for a schema `@@allow` to express, so the entire authorization
+// story is the RBAC permission gate (`account:provision`, `crates/lightbridge-authz-rest/src/rpc_authorize.rs`),
+// held only via `lightbridge-admin`'s `*` in the default role mapping -- never granted to
+// `lightbridge-editor`/`lightbridge-viewer`.
+//
+// Mints the subject's ANCHOR account (`id = subject`, matching the grandfather/first-account
+// invariant `federated_identities` adoption depends on -- see `createAccount`'s own doc comment
+// above) PLUS its mandatory default `projects` row in the same transaction: an account with no
+// `is_default` project still dead-ends the browser SSO callback one step later
+// (`find_default_project_id` in `crates/lightbridge-authz-rest/src/relying_party.rs`), so
+// provisioning the account alone does not actually unblock sign-in. `email` becomes the default
+// project's `billing_identity` (globally unique -- a collision is `Error::Conflict`, not a partial
+// write, since both inserts share one transaction). A second call for a subject that already has
+// an account is `Error::Conflict`, unlike `createAccount`'s ADR-0026 "several accounts per
+// identity" contract -- this procedure only ever creates the FIRST account for a subject.
+type ProvisionAccountInput {
+  subject String
+  email String
+  name String?
+}
+
+mutation procedure provisionAccount(args: ProvisionAccountInput): Account
+  @allow((auth() != null) && auth().rpcScope == "crud" && auth().permAccountProvision == true)
 
 // Updates `Account.defaultQuota` post-creation (#379, completing #177/#375):
 // `Account.defaultQuota` is `@readonly` above, and `model.Account.update` itself was removed
