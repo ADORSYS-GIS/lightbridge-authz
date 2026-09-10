@@ -42,7 +42,16 @@ pub const EAIG_TOTAL_TOKENS_KEYS: [&str; 3] = [
 pub const EAIG_LATENCY_MS_KEYS: [&str; 2] = ["duration", "x-envoy-upstream-service-time"];
 
 pub fn normalize(attrs: &HashMap<String, Value>, meta: &SpanMeta) -> NormalizedRecord {
-    let cost_micros = extract_i64(attrs, &EAIG_COST_KEYS);
+    // The micro-USD cost can arrive as an integer OR as an integral double (CEL-computed costs
+    // are float-backed), so try the integer read first and fall back to an integral double read
+    // rather than leaving `cost_micros` None. If we left it None, merge_norm_tokens_and_cost
+    // would fall back to the generic dollar-interpreted COST_KEYS and re-treat the micro-USD
+    // value as dollars (F1, off by 1,000,000x).
+    let cost_micros = extract_i64(attrs, &EAIG_COST_KEYS).or_else(|| {
+        extract_f64(attrs, &EAIG_COST_KEYS)
+            .filter(|value| value.is_finite() && *value >= 0.0 && value.fract() == 0.0)
+            .map(|value| value as i64)
+    });
 
     let prompt_tokens = extract_i64(attrs, &EAIG_PROMPT_TOKENS_KEYS);
     let completion_tokens = extract_i64(attrs, &EAIG_COMPLETION_TOKENS_KEYS);

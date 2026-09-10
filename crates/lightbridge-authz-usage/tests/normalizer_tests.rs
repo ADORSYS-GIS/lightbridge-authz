@@ -410,6 +410,40 @@ fn test_every_known_source_has_a_registered_normalizer() {
 }
 
 #[test]
+fn test_eaig_normalizer_reads_double_valued_micro_usd_cost() {
+    // CEL-computed costs arrive as float-backed doubles (research doc: the gateway's
+    // llm_custom_total_cost CEL emits micro-USD as a double). The normalizer must read an
+    // integral double as micro-USD directly, not leave cost_micros None -- if it did, the
+    // generic COST_KEYS fallback would re-treat the micro-USD value as dollars (F1, 1e6x).
+    let normalizer = REGISTRY.get("eaig").expect("eaig should exist");
+    let record = normalizer(
+        &attrs(&[
+            ("model", json!("gpt-4")),
+            ("gen_ai.usage.custom_total_cost", json!(1875.0)),
+        ]),
+        &span_meta(),
+    );
+
+    assert_eq!(record.cost_micros, Some(1875));
+}
+
+#[test]
+fn test_eaig_normalizer_refuses_fractional_micro_usd_cost() {
+    // A fractional double cannot be a valid integer micro-USD count; it must be treated as
+    // unknown (None), never rounded and never rescaled as dollars.
+    let normalizer = REGISTRY.get("eaig").expect("eaig should exist");
+    let record = normalizer(
+        &attrs(&[
+            ("model", json!("gpt-4")),
+            ("gen_ai.usage.custom_total_cost", json!(1875.5)),
+        ]),
+        &span_meta(),
+    );
+
+    assert_eq!(record.cost_micros, None);
+}
+
+#[test]
 fn test_combine_token_total_covers_every_combination() {
     assert_eq!(combine_token_total(Some(3), Some(4)), Some(7));
     assert_eq!(combine_token_total(Some(3), None), Some(3));

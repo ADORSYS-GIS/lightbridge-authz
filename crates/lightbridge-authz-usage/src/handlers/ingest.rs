@@ -1567,6 +1567,73 @@ mod tests {
         assert_eq!(event.total_tokens, Some(150));
     }
 
+    #[test]
+    fn extract_log_events_should_read_double_valued_micro_usd_custom_cost() {
+        // CEL-computed costs arrive as float-backed doubles on the wire, not integers. The eaig
+        // normalizer must read an integral double as micro-USD directly; otherwise the generic
+        // COST_KEYS fallback re-treats the micro-USD value as dollars (F1, 1,000,000x).
+        use opentelemetry_proto::tonic::{
+            common::v1::{InstrumentationScope, any_value::Value as AnyValueValue},
+            logs::v1::{LogRecord, ResourceLogs, ScopeLogs, SeverityNumber},
+            resource::v1::Resource,
+        };
+
+        let payload = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: Some(Resource {
+                    attributes: vec![KeyValue {
+                        key: "account_id".to_string(),
+                        value: Some(AnyValue {
+                            value: Some(AnyValueValue::StringValue("acct_1".to_string())),
+                        }),
+                        key_strindex: 0,
+                    }],
+                    dropped_attributes_count: 0,
+                    entity_refs: vec![],
+                }),
+                scope_logs: vec![ScopeLogs {
+                    scope: Some(InstrumentationScope {
+                        name: "test-logger".to_string(),
+                        version: "1.0".to_string(),
+                        attributes: vec![],
+                        dropped_attributes_count: 0,
+                    }),
+                    log_records: vec![LogRecord {
+                        event_name: String::new(),
+                        time_unix_nano: 1_735_689_601_000_000_000,
+                        observed_time_unix_nano: 0,
+                        severity_number: SeverityNumber::Info as i32,
+                        severity_text: "INFO".to_string(),
+                        body: None,
+                        attributes: vec![KeyValue {
+                            key: "gen_ai.usage.custom_total_cost".to_string(),
+                            value: Some(AnyValue {
+                                value: Some(AnyValueValue::DoubleValue(1875.0)),
+                            }),
+                            key_strindex: 0,
+                        }],
+                        dropped_attributes_count: 0,
+                        flags: 0,
+                        trace_id: vec![],
+                        span_id: vec![],
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+
+        let events = extract_log_events(payload, "eaig");
+
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(
+            event.total_cost,
+            Some(0.001875),
+            "a double-valued 1875 micro-USD must read as $0.001875, not $1875 (F1)"
+        );
+    }
+
     fn string_kv(key: &str, value: &str) -> KeyValue {
         KeyValue {
             key: key.to_string(),
