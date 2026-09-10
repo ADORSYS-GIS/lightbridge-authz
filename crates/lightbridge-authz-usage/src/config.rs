@@ -1,6 +1,7 @@
 use lightbridge_authz_core::Result;
 use lightbridge_authz_core::config::{Database, Logging, Oauth2, Otel, Tls, load_yaml_from_path};
 use serde::Deserialize;
+use std::collections::HashMap;
 use tracing::debug;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -22,7 +23,22 @@ pub struct UsageConfig {
     /// `oauth2` above is: this is the one thing that turns "we validated a bearer token" into "and
     /// this user actually owns what they're asking about."
     pub scope_authority: ScopeAuthorityConfig,
+    /// #585: authenticated ingest configuration. Optional — when absent, the
+    /// authenticated `/auth/v1/otel/*` routes are simply not mounted, and the
+    /// existing unauthenticated `/v1/otel/*` surface (the gateway exception, AC5)
+    /// continues to serve as the only ingest path.
+    #[serde(default)]
+    pub ingest_auth: Option<IngestAuthConfig>,
 }
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct IngestAuthConfig {
+    /// Strict mapping: JWT `sub` → the ONE `X-Source` value that principal may
+    /// assert. Any other `X-Source` from that principal → 403.
+    /// Example: { "svc:collector-claude-code": "claude-code" }
+    pub principals: HashMap<String, String>,
+}
+
 
 /// HTTP client config for calling `authz-opa`'s `POST /idp/v1/authorize-usage-scope` (#570).
 /// Mirrors `lightbridge_authz_core::config::UsageServiceClient` field-for-field (see that type's
@@ -85,7 +101,14 @@ pub struct UsageServer {
 
 pub fn load_from_path<P: AsRef<std::path::Path>>(path: P) -> Result<UsageConfig> {
     debug!("loading usage config from {:?}", path.as_ref());
-    let config = load_yaml_from_path(path)?;
+    let config: UsageConfig = load_yaml_from_path(path)?;
+    
+    if config.ingest_auth.as_ref().is_some_and(|auth| auth.principals.is_empty()) {
+        return Err(lightbridge_authz_core::Error::BadRequest(
+            "ingest_auth is present but principals mapping is empty".to_string(),
+        ));
+    }
+    
     debug!("loaded usage config successfully");
     Ok(config)
 }
@@ -274,6 +297,30 @@ otel:
         assert!(
             result.is_err(),
             "a config omitting scope_authority must fail to load, not silently degrade"
+        );
+    }
+
+    #[test]
+    fn config_with_empty_ingest_principals_fails_to_load() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be monotonic")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "usage-config-empty-principals-{unique}.yaml"
+        ));
+        let content = format!(
+            "{}\noauth2:\n  type: external\n  jwks_url: \"http://keycloak:9100/realms/dev/protocol/openid-connect/certs\"\nscope_authority:\n  base_url: \"https://authz-opa:3001\"\n  username: \"authorino\"\n  password: \"change-me\"\ningest_auth:\n  principals: {{}}\n",
+            valid_server_and_logging_block()
+        );
+        fs::write(&path, content).expect("temp config should be written");
+
+        let result = load_from_path(&path);
+        fs::remove_file(&path).expect("temp config should be removed");
+
+        assert!(
+            result.is_err(),
+            "a config with ingest_auth but empty principals must fail to load"
         );
     }
 }

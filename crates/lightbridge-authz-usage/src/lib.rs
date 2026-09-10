@@ -52,6 +52,8 @@ pub struct UsageState {
     pub bearer: Arc<dyn BearerTokenServiceTrait>,
     /// Ownership authority for `/usage/v1/usage/query`'s `account`/`project` scopes (#570).
     pub scope_authority: Arc<dyn ScopeAuthority>,
+    /// The strict mapping of JWT sub -> X-Source for authenticated ingest (#585).
+    pub ingest_principals: std::collections::HashMap<String, String>,
 }
 
 #[async_trait]
@@ -139,14 +141,20 @@ pub fn build_ingest_router(
     state: Arc<UsageState>,
     readiness_pool: Arc<dyn DbPoolTrait>,
     dev_cors: bool,
+    has_auth_ingest: bool,
 ) -> Router {
-    let router = health_routes(readiness_pool, SERVICE_USAGE_INGEST)
+    let mut app = health_routes(readiness_pool, SERVICE_USAGE_INGEST)
         .merge(
             SwaggerUi::new("/usage/v1/usage/docs")
                 .url("/usage/v1/usage/openapi.json", UsageDoc::openapi()),
         )
-        .merge(routers::ingest_router())
-        .with_state(state);
+        .merge(routers::ingest_router());
+
+    if has_auth_ingest {
+        app = app.merge(routers::auth_ingest_router());
+    }
+
+    let router = app.with_state(state);
 
     if dev_cors {
         router.layer(CorsLayer::permissive())
@@ -187,6 +195,7 @@ pub async fn start_usage_server(
     database: &Database,
     oauth2: &Oauth2,
     scope_authority: &ScopeAuthorityConfig,
+    ingest_auth: Option<&config::IngestAuthConfig>,
 ) -> Result<()> {
     let pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::new(database).await?);
     let repo: Arc<dyn UsageRepoTrait> = Arc::new(StoreRepo::new(pool.clone()));
@@ -196,10 +205,14 @@ pub async fn start_usage_server(
     );
     let scope_authority: Arc<dyn ScopeAuthority> =
         Arc::new(RemoteScopeAuthority::new(scope_authority)?);
+    let ingest_principals = ingest_auth
+        .map(|c| c.principals.clone())
+        .unwrap_or_default();
     let state = Arc::new(UsageState {
         repo,
         bearer,
         scope_authority,
+        ingest_principals,
     });
 
     let dev_cors = dev_cors_enabled();
@@ -207,7 +220,8 @@ pub async fn start_usage_server(
         warn!("AUTHZ_DEV_CORS is set — usage server allows any CORS origin (dev only)");
     }
 
-    let ingest_app = build_ingest_router(state.clone(), pool.clone(), dev_cors);
+    let has_auth_ingest = ingest_auth.is_some();
+    let ingest_app = build_ingest_router(state.clone(), pool.clone(), dev_cors, has_auth_ingest);
     let query_app = build_query_router(state, pool, dev_cors);
 
     log_build_info(SERVICE_USAGE_INGEST);

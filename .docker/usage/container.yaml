@@ -52,3 +52,10 @@ scope_authority:
   username: "authorino"
   password: "change-me"
   insecure_skip_verify: true
+ingest_auth:
+  principals:
+    "svc:collector-claude-code": "claude-code"
+    "svc:collector-codex": "codex"
+    "svc:collector-opencode": "opencode"
+    "svc:collector-github-copilot": "github-copilot"
+    "svc:collector-microsoft-foundry": "microsoft-foundry"

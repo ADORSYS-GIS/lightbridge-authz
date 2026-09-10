@@ -10,11 +10,24 @@ use std::sync::Arc;
 /// repo's deploy surface (`docs/usage-api.md`), which cannot be given a client certificate
 /// without a coordinated change to that caller -- out of #347's scope. Safe only under the
 /// existing ClusterIP-only/no-ingress condition (see `AGENTS.md`'s Security Notes).
+///
+/// The gateway's existing `/v1/otel/*` path is the one deliberate exception to the authenticated
+/// ingest requirement (#585 AC5). It remains unauthenticated, safe under the existing
+/// ClusterIP-only/no-ingress condition plus the deployment topology that pins its sole emitter
+/// (the AI gateway's Envoy access-log sink) to the same cluster. Its source is always `eaig`.
 pub fn ingest_router() -> Router<Arc<UsageState>> {
     Router::new()
         .route("/v1/otel/traces", post(ingest_traces))
         .route("/v1/otel/metrics", post(ingest_metrics))
         .route("/v1/otel/logs", post(ingest_logs))
+}
+
+pub fn auth_ingest_router() -> Router<Arc<UsageState>> {
+    use crate::handlers::auth_ingest::{auth_ingest_logs, auth_ingest_metrics, auth_ingest_traces};
+    Router::new()
+        .route("/auth/v1/otel/traces", post(auth_ingest_traces))
+        .route("/auth/v1/otel/metrics", post(auth_ingest_metrics))
+        .route("/auth/v1/otel/logs", post(auth_ingest_logs))
 }
 
 /// The internal query routes (#347): `/usage/v1/usage/query` and `/usage/v1/spend/query`, mounted
