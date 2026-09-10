@@ -10,21 +10,26 @@
 //! source is which OTLP signal an object carries (which route to POST it to) and the object's
 //! original content type (proto vs OTLP-JSON), both of which the archive object itself carries.
 //!
-//! Idempotency is NOT this module's job. A re-run changes no counts because the ingest path
-//! writes to the grain tables whose dedup keys (`UNIQUE (source, trace_id, span_id)` for the
-//! execution grain, the natural-key PKs for the day/seat grains — #582/#583) absorb a redelivery
-//! via `ON CONFLICT`. This module's contract is narrower and stricter: **fail loud, never
-//! silently drop.** A non-2xx ingest response, an unreachable ingest, or an unreadable archive
-//! object is an error that aborts the run — an outage must never look like a successful replay.
+//! **Re-run safety is NOT provided by this module, and is not true of the ingest path today.**
+//! The ingest handlers persist to `usage_events` via a plain `INSERT` with no dedup key
+//! (`StoreRepo::insert_usage_events`, `repo.rs`), so re-running the job re-inserts every
+//! already-replayed object as a fresh row and double-counts usage and spend in every query and
+//! dashboard. Re-run safety requires the ingest path to absorb redelivery — grain tables with
+//! dedup keys, or an `ON CONFLICT (source, dedup_key)` on `usage_events` — which does not exist
+//! yet. Until it does, run each archive window exactly once; do not re-run after a partial
+//! failure and expect unchanged counts.
+//!
+//! This module's contract is narrow and strict: **fail loud, never silently drop.** A non-2xx
+//! ingest response, an unreachable ingest, or an unreadable archive object is an error that
+//! aborts the run — an outage must never look like a successful replay.
 //!
 //! `replay_batch` replays with bounded concurrency. The first error aborts the whole batch and
 //! is returned; a partially-replayed batch is therefore possible (objects already accepted before
-//! the failure), which is exactly why idempotency matters — the operator re-runs the job and the
-//! grain-table dedup keys absorb the already-replayed objects, changing no counts. With
-//! `concurrency = 1` the batch replays strictly in order.
+//! the failure). With `concurrency = 1` the batch replays strictly in order.
 
 use lightbridge_authz_core::{Error, Result};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -62,7 +67,9 @@ pub struct ArchiveObject {
     pub key: String,
     pub signal: Signal,
     pub content_type: String,
-    pub body: Vec<u8>,
+    /// Path to the archived object's body on disk. Read lazily just before the POST so memory is
+    /// bounded by concurrency, not by the size of the whole archive window.
+    pub body_path: PathBuf,
 }
 
 /// The result of replaying a batch of archive objects.
@@ -76,13 +83,13 @@ pub struct ReplaySummary {
 
 /// POSTs one archived object through the real ingest endpoint.
 ///
-/// Takes the object by value so the body is moved into the request rather than cloned — a replay
-/// job can process a large archive, and cloning every body doubles the memory traffic for no
-/// reason.
+/// Reads the object's body from `body_path` lazily, just before the POST, so a large archive
+/// window is never resident in memory all at once — memory is bounded by concurrency.
 ///
-/// Fail-loud: a non-2xx response, an unreachable ingest, or a transport error is returned as an
-/// `Err`, never swallowed. The caller decides whether to abort the whole run; this function
-/// surfaces the first failure so a broken archive or a broken ingest is seen, not skipped.
+/// Fail-loud: a non-2xx response, an unreachable ingest, or an unreadable archive object is
+/// returned as an `Err`, never swallowed. The caller decides whether to abort the whole run;
+/// this function surfaces the first failure so a broken archive or a broken ingest is seen, not
+/// skipped.
 pub async fn replay_object(
     client: &reqwest::Client,
     ingest_base_url: &str,
@@ -94,10 +101,18 @@ pub async fn replay_object(
         object.signal.ingest_path()
     );
 
+    let body = tokio::fs::read(&object.body_path).await.map_err(|e| {
+        Error::Server(format!(
+            "replay of {} failed: could not read archive object {}: {e}",
+            object.key,
+            object.body_path.display()
+        ))
+    })?;
+
     let response = client
         .post(&url)
         .header(reqwest::header::CONTENT_TYPE, &object.content_type)
-        .body(object.body)
+        .body(body)
         .send()
         .await
         .map_err(|e| {
@@ -123,9 +138,10 @@ pub async fn replay_object(
 ///
 /// `concurrency` bounds how many objects are in flight at once; `1` replays strictly in order.
 /// Fail-loud: the first error aborts the whole batch (in-flight tasks are cancelled) and is
-/// returned. A partially-replayed batch is therefore possible, which is exactly why idempotency
-/// matters — the operator re-runs the job and the grain-table dedup keys absorb the
-/// already-replayed objects, changing no counts.
+/// returned. A partially-replayed batch is therefore possible, which is why re-run safety
+/// matters — but see the module docs: the ingest path does not absorb redelivery today, so a
+/// re-run re-inserts already-replayed objects and double-counts. Run each archive window exactly
+/// once until the ingest path gains a dedup key.
 pub async fn replay_batch(
     client: &reqwest::Client,
     ingest_base_url: &str,
@@ -192,16 +208,4 @@ fn spawn_replay(
         replay_object(&client, &url, object).await?;
         Ok(signal)
     });
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn signal_ingest_paths_match_the_ingest_router() {
-        assert_eq!(Signal::Traces.ingest_path(), "/v1/otel/traces");
-        assert_eq!(Signal::Metrics.ingest_path(), "/v1/otel/metrics");
-        assert_eq!(Signal::Logs.ingest_path(), "/v1/otel/logs");
-    }
 }

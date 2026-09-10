@@ -2898,6 +2898,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sqlx",
+ "tempfile",
  "thiserror",
  "tokio",
  "tower",

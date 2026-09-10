@@ -2,8 +2,7 @@
 //!
 //! Reads archived OTLP objects and POSTs each one through the real ingest endpoint
 //! (`/v1/otel/{traces,metrics,logs}`), so a field promoted to a column gets a historical
-//! backfill for every source. A re-run changes no counts because the ingest path writes to the
-//! grain tables whose dedup keys (#582/#583) absorb a redelivery via `ON CONFLICT`.
+//! backfill for every source.
 //!
 //! The archive leg (#589) writes raw OTLP to S3 under `<source>/<yyyy>/<mm>/<dd>/…`; the
 //! exporter lives in the governance repo, on the edge collector. This binary is deliberately
@@ -14,6 +13,11 @@
 //!
 //! Fail-loud: a non-2xx ingest response, an unreachable ingest, or an unreadable archive object
 //! aborts the run with a non-zero exit — an outage never looks like a successful replay.
+//!
+//! **Not idempotent today.** The ingest path writes `usage_events` via a plain `INSERT` with no
+//! dedup key, so re-running this job re-inserts every already-replayed object and double-counts
+//! usage and spend. Run each archive window exactly once until the ingest path absorbs
+//! redelivery (see `crates/lightbridge-authz-usage/src/replay.rs`).
 //!
 //! Manifest shape:
 //! ```json
@@ -107,20 +111,11 @@ async fn main() -> Result<()> {
 
     let mut objects = Vec::with_capacity(manifest.objects.len());
     for entry in manifest.objects {
-        let body = std::fs::read(&entry.body_path).map_err(|e| {
-            lightbridge_authz_core::Error::Io(std::io::Error::new(
-                e.kind(),
-                format!(
-                    "failed to read archive object {}: {e}",
-                    entry.body_path.display()
-                ),
-            ))
-        })?;
         objects.push(ArchiveObject {
             key: entry.key,
             signal: parse_signal(&entry.signal)?,
             content_type: entry.content_type,
-            body,
+            body_path: entry.body_path,
         });
     }
 
