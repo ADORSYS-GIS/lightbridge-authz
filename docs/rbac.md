@@ -529,7 +529,7 @@ scope for #401.
 | `account:update`  | `procedure.updateAccountDefaultQuota`, `procedure.updateAccountName` | `update-account`, `update-account-name` |
 | `account:delete`  | `procedure.deleteAccountPermanently`                 | `delete-account`                    |
 | `account:disable` | `procedure.disableAccount`, `procedure.enableAccount`| `disable-account`, `enable-account` |
-| `account:provision` | `procedure.provisionAccount`                       | — (no MCP tool yet)                 |
+| `account:provision` | `procedure.provisionAccount`                       | `provision-account`                 |
 | `project:create`  | `model.Project.create`                               | `create-project`                    |
 | `project:read`    | `model.Project.list`, `model.Project.get`            | `list-projects`, `get-project`      |
 | `project:update`  | `model.Project.update`, `procedure.setDefaultProject`, `procedure.listModelCatalog`, `procedure.setProjectQuota`, `procedure.setProjectAllowedModels`, `procedure.setProjectModelPolicy` | `update-project`, `set-default-project`, `list-model-catalog`, `set-project-quota`, `set-project-allowed-models`, `set-project-model-policy` |
