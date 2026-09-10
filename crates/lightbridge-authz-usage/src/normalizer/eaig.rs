@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 use super::{
-    NormalizedRecord, SpanMeta, combine_token_total, extract_f64, extract_i64, extract_string,
+    NormalizedRecord, SpanMeta, extract_f64, extract_i64, extract_string, extract_token_triple,
 };
 
 // This is already micro-USD on the wire (docs/research/2026-08-25-genai-usage-ingestion.md
@@ -53,10 +53,12 @@ pub fn normalize(attrs: &HashMap<String, Value>, meta: &SpanMeta) -> NormalizedR
             .map(|value| value as i64)
     });
 
-    let prompt_tokens = extract_i64(attrs, &EAIG_PROMPT_TOKENS_KEYS);
-    let completion_tokens = extract_i64(attrs, &EAIG_COMPLETION_TOKENS_KEYS);
-    let total_tokens = extract_i64(attrs, &EAIG_TOTAL_TOKENS_KEYS)
-        .or_else(|| combine_token_total(prompt_tokens, completion_tokens));
+    let (prompt_tokens, completion_tokens, total_tokens) = extract_token_triple(
+        attrs,
+        &EAIG_PROMPT_TOKENS_KEYS,
+        &EAIG_COMPLETION_TOKENS_KEYS,
+        &EAIG_TOTAL_TOKENS_KEYS,
+    );
 
     let latency_ms = extract_f64(attrs, &EAIG_LATENCY_MS_KEYS)
         .filter(|value| value.is_finite() && *value >= 0.0);

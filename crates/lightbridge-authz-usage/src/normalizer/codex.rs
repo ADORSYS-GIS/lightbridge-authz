@@ -1,6 +1,12 @@
-use super::{NormalizedRecord, SpanMeta, combine_token_total, extract_i64, extract_string};
-use serde_json::Value;
+// ⚠️ UNVERIFIED against a real Codex integration -- these keys use dotted forms
+// (`model.name`/`tokens.input`/`tokens.output`/`tool.name`) which review noted may not match
+// actual event schemas. Confirm against real Codex telemetry before relying on it.
+
 use std::collections::HashMap;
+
+use serde_json::Value;
+
+use super::{NormalizedRecord, SpanMeta, combine_token_total, extract_i64, extract_string};
 
 pub const CODEX_MODEL_KEYS: [&str; 2] = ["model.name", "gen_ai.request.model"];
 pub const CODEX_PROMPT_TOKENS_KEYS: [&str; 1] = ["tokens.input"];
@@ -19,7 +25,7 @@ pub fn normalize(attrs: &HashMap<String, Value>, meta: &SpanMeta) -> NormalizedR
         prompt_tokens,
         completion_tokens,
         total_tokens,
-        cost_micros: None, // Codex logs do not emit cost directly
+        cost_micros: None,
         latency_ms: None,
         tool_name: extract_string(attrs, &CODEX_TOOL_KEYS),
     }

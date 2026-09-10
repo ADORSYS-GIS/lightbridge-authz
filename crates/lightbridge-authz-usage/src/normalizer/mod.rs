@@ -157,3 +157,16 @@ pub fn combine_token_total(
         (None, None) => None,
     }
 }
+
+pub fn extract_token_triple(
+    attrs: &HashMap<String, Value>,
+    prompt_keys: &[&str],
+    completion_keys: &[&str],
+    total_keys: &[&str],
+) -> (Option<i64>, Option<i64>, Option<i64>) {
+    let prompt_tokens = extract_i64(attrs, prompt_keys);
+    let completion_tokens = extract_i64(attrs, completion_keys);
+    let total_tokens = extract_i64(attrs, total_keys)
+        .or_else(|| combine_token_total(prompt_tokens, completion_tokens));
+    (prompt_tokens, completion_tokens, total_tokens)
+}
