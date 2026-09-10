@@ -1,6 +1,8 @@
-use super::{NormalizedRecord, SpanMeta};
-use serde_json::Value;
 use std::collections::HashMap;
+
+use serde_json::Value;
+
+use super::{NormalizedRecord, SpanMeta};
 
 pub fn normalize(_attrs: &HashMap<String, Value>, meta: &SpanMeta) -> NormalizedRecord {
     // Copilot data arrives via the day-grain pull path, not the push OTLP path.

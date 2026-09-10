@@ -702,6 +702,12 @@ fn usage_scope_all_serializes_as_lowercase_all() {
     assert!(matches!(parsed, UsageScope::All));
 }
 
+fn headers_with_source(source: &str) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert("x-source", source.parse().expect("valid header value"));
+    headers
+}
+
 #[tokio::test]
 async fn ingest_logs_treats_noop_insert_as_success() {
     let state = Arc::new(UsageState {
@@ -717,7 +723,7 @@ async fn ingest_logs_treats_noop_insert_as_success() {
 
     let response = ingest_logs(
         axum::extract::State(state),
-        headers_with_source(),
+        headers_with_source("eaig"),
         encoded_log_request(),
     )
     .await
@@ -742,7 +748,7 @@ async fn ingest_logs_rejects_invalid_protobuf_as_bad_request() {
 
     let result = ingest_logs(
         axum::extract::State(state),
-        headers_with_source(),
+        headers_with_source("eaig"),
         Bytes::from_static(b"not protobuf"),
     )
     .await;
@@ -949,7 +955,7 @@ async fn ingest_traces_treats_noop_insert_as_success() {
 
     let response = ingest_traces(
         axum::extract::State(state),
-        headers_with_source(),
+        headers_with_source("eaig"),
         encoded_trace_request(),
     )
     .await
@@ -974,7 +980,7 @@ async fn ingest_traces_rejects_invalid_protobuf_as_bad_request() {
 
     let result = ingest_traces(
         axum::extract::State(state),
-        headers_with_source(),
+        headers_with_source("eaig"),
         Bytes::from_static(b"not protobuf"),
     )
     .await;
@@ -1031,7 +1037,7 @@ async fn ingest_metrics_treats_noop_insert_as_success() {
 
     let response = ingest_metrics(
         axum::extract::State(state),
-        headers_with_source(),
+        headers_with_source("eaig"),
         encoded_metrics_request(),
     )
     .await
@@ -1056,7 +1062,7 @@ async fn ingest_metrics_rejects_invalid_protobuf_as_bad_request() {
 
     let result = ingest_metrics(
         axum::extract::State(state),
-        headers_with_source(),
+        headers_with_source("eaig"),
         Bytes::from_static(b"not protobuf"),
     )
     .await;
@@ -1129,7 +1135,7 @@ async fn ingest_logs_accepts_json_content_type_payload() {
     })
     .to_string();
 
-    let mut headers = headers_with_source();
+    let mut headers = headers_with_source("eaig");
     headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
 
     let response = ingest_logs(
@@ -1167,7 +1173,7 @@ async fn ingest_logs_accepts_gzip_encoded_body() {
         .expect("write should succeed");
     let compressed = encoder.finish().expect("gzip encoding should succeed");
 
-    let mut headers = headers_with_source();
+    let mut headers = headers_with_source("eaig");
     headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
 
     let response = ingest_logs(
@@ -1180,6 +1186,40 @@ async fn ingest_logs_accepts_gzip_encoded_body() {
 
     assert_eq!(response.0, StatusCode::ACCEPTED);
     assert_eq!(response.1.0.accepted_events, 1);
+}
+
+#[tokio::test]
+async fn ingest_endpoints_reject_missing_or_unknown_x_source_header() {
+    let state = Arc::new(UsageState {
+        repo: Arc::new(MockUsageRepo {
+            points: vec![],
+            inserted_events: 0,
+            spend: None,
+            truncated: false,
+        }),
+        bearer: support::trust_no_one_bearer(),
+        scope_authority: support::refuse_everything_scope_authority(),
+    });
+
+    // Missing header
+    let err = ingest_logs(
+        axum::extract::State(Arc::clone(&state)),
+        HeaderMap::new(),
+        encoded_log_request(),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, Error::BadRequest(msg) if msg.contains("missing x-source header")));
+
+    // Unknown source header
+    let err = ingest_logs(
+        axum::extract::State(state),
+        headers_with_source("unknown-vendor"),
+        encoded_log_request(),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, Error::BadRequest(msg) if msg.contains("unknown source")));
 }
 
 #[tokio::test]

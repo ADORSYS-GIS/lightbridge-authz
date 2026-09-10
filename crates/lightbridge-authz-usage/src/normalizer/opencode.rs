@@ -3,14 +3,13 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 use super::{
-    NormalizedRecord, SpanMeta, combine_token_total, extract_f64, extract_i64, extract_string,
-    usd_to_micros,
+    NormalizedRecord, SpanMeta, extract_f64, extract_string, extract_token_triple, usd_to_micros,
 };
 
 pub const OPENCODE_MODEL_KEYS: [&str; 1] = ["gen_ai.request.model"];
 pub const OPENCODE_PROMPT_TOKENS_KEYS: [&str; 1] = ["gen_ai.usage.input_tokens"];
 pub const OPENCODE_COMPLETION_TOKENS_KEYS: [&str; 1] = ["gen_ai.usage.output_tokens"];
-pub const OPENCODE_TOTAL_TOKENS_KEYS: [&str; 1] = ["gen_ai.usage.total_tokens"]; // from histogram sum
+pub const OPENCODE_TOTAL_TOKENS_KEYS: [&str; 1] = ["gen_ai.usage.total_tokens"];
 pub const OPENCODE_COST_KEYS: [&str; 1] = ["opencode.cost.usage"];
 pub const OPENCODE_LATENCY_SECONDS_KEYS: [&str; 1] = ["gen_ai.client.operation.duration"];
 pub const OPENCODE_TOOL_KEYS: [&str; 1] = ["gen_ai.tool.name"];
@@ -18,10 +17,12 @@ pub const OPENCODE_TOOL_KEYS: [&str; 1] = ["gen_ai.tool.name"];
 pub fn normalize(attrs: &HashMap<String, Value>, meta: &SpanMeta) -> NormalizedRecord {
     let model = extract_string(attrs, &OPENCODE_MODEL_KEYS);
 
-    let prompt_tokens = extract_i64(attrs, &OPENCODE_PROMPT_TOKENS_KEYS);
-    let completion_tokens = extract_i64(attrs, &OPENCODE_COMPLETION_TOKENS_KEYS);
-    let total_tokens = extract_i64(attrs, &OPENCODE_TOTAL_TOKENS_KEYS)
-        .or_else(|| combine_token_total(prompt_tokens, completion_tokens));
+    let (prompt_tokens, completion_tokens, total_tokens) = extract_token_triple(
+        attrs,
+        &OPENCODE_PROMPT_TOKENS_KEYS,
+        &OPENCODE_COMPLETION_TOKENS_KEYS,
+        &OPENCODE_TOTAL_TOKENS_KEYS,
+    );
 
     let cost_usd = extract_f64(attrs, &OPENCODE_COST_KEYS).or_else(|| {
         let m = model.as_deref()?;
