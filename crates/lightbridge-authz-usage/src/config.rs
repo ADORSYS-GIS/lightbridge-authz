@@ -39,7 +39,6 @@ pub struct IngestAuthConfig {
     pub principals: HashMap<String, String>,
 }
 
-
 /// HTTP client config for calling `authz-opa`'s `POST /idp/v1/authorize-usage-scope` (#570).
 /// Mirrors `lightbridge_authz_core::config::UsageServiceClient` field-for-field (see that type's
 /// doc comments for the full `insecure_skip_verify`/`ca_bundle_path`/`client_cert_path`/
@@ -102,13 +101,17 @@ pub struct UsageServer {
 pub fn load_from_path<P: AsRef<std::path::Path>>(path: P) -> Result<UsageConfig> {
     debug!("loading usage config from {:?}", path.as_ref());
     let config: UsageConfig = load_yaml_from_path(path)?;
-    
-    if config.ingest_auth.as_ref().is_some_and(|auth| auth.principals.is_empty()) {
+
+    if config
+        .ingest_auth
+        .as_ref()
+        .is_some_and(|auth| auth.principals.is_empty())
+    {
         return Err(lightbridge_authz_core::Error::BadRequest(
             "ingest_auth is present but principals mapping is empty".to_string(),
         ));
     }
-    
+
     debug!("loaded usage config successfully");
     Ok(config)
 }
@@ -306,9 +309,8 @@ otel:
             .duration_since(UNIX_EPOCH)
             .expect("time should be monotonic")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "usage-config-empty-principals-{unique}.yaml"
-        ));
+        let path =
+            std::env::temp_dir().join(format!("usage-config-empty-principals-{unique}.yaml"));
         let content = format!(
             "{}\noauth2:\n  type: external\n  jwks_url: \"http://keycloak:9100/realms/dev/protocol/openid-connect/certs\"\nscope_authority:\n  base_url: \"https://authz-opa:3001\"\n  username: \"authorino\"\n  password: \"change-me\"\ningest_auth:\n  principals: {{}}\n",
             valid_server_and_logging_block()

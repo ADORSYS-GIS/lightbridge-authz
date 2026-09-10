@@ -25,7 +25,10 @@ struct MockUsageRepo {
 
 #[async_trait]
 impl UsageRepoTrait for MockUsageRepo {
-    async fn insert_usage_events(&self, events: &[UsageEvent]) -> lightbridge_authz_core::Result<usize> {
+    async fn insert_usage_events(
+        &self,
+        events: &[UsageEvent],
+    ) -> lightbridge_authz_core::Result<usize> {
         let count = events.len();
         *self.inserted_events.lock().unwrap() += count;
         Ok(count)
@@ -119,11 +122,9 @@ fn build_router(
         scope_authority: support::refuse_everything_scope_authority(),
         ingest_principals: principals,
     });
-    
+
     build_ingest_router(state, Arc::new(DummyDbPool), false, true)
 }
-
-
 
 struct CustomBearer {
     token: String,
@@ -142,7 +143,11 @@ impl lightbridge_authz_bearer::BearerTokenServiceTrait for CustomBearer {
     }
 }
 
-fn custom_bearer(token: &str, sub: &str, caller_kind: Option<&str>) -> Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait> {
+fn custom_bearer(
+    token: &str,
+    sub: &str,
+    caller_kind: Option<&str>,
+) -> Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait> {
     Arc::new(CustomBearer {
         token: token.to_string(),
         info: Some(TokenInfo {
@@ -162,7 +167,7 @@ fn custom_bearer(token: &str, sub: &str, caller_kind: Option<&str>) -> Arc<dyn l
 #[tokio::test]
 async fn missing_bearer_token_returns_401() {
     let router = build_router(support::trust_no_one_bearer(), HashMap::new());
-    
+
     let request = Request::builder()
         .method("POST")
         .uri("/auth/v1/otel/logs")
@@ -176,7 +181,7 @@ async fn missing_bearer_token_returns_401() {
 #[tokio::test]
 async fn invalid_bearer_token_returns_401() {
     let router = build_router(support::trust_no_one_bearer(), HashMap::new());
-    
+
     let request = Request::builder()
         .method("POST")
         .uri("/auth/v1/otel/logs")
@@ -191,7 +196,7 @@ async fn invalid_bearer_token_returns_401() {
 #[tokio::test]
 async fn bearer_validation_failure_returns_401() {
     let router = build_router(support::trust_no_one_bearer(), HashMap::new());
-    
+
     let request = Request::builder()
         .method("POST")
         .uri("/auth/v1/otel/logs")
@@ -205,12 +210,16 @@ async fn bearer_validation_failure_returns_401() {
 
 #[tokio::test]
 async fn disallowed_principal_returns_403() {
-    let bearer = custom_bearer("valid-token", "svc:unknown-collector", Some(SERVICE_CALLER_KIND));
+    let bearer = custom_bearer(
+        "valid-token",
+        "svc:unknown-collector",
+        Some(SERVICE_CALLER_KIND),
+    );
     let mut principals = HashMap::new();
     principals.insert("svc:known-collector".to_string(), "claude-code".to_string());
-    
+
     let router = build_router(bearer, principals);
-    
+
     let request = Request::builder()
         .method("POST")
         .uri("/auth/v1/otel/logs")
@@ -226,12 +235,19 @@ async fn disallowed_principal_returns_403() {
 
 #[tokio::test]
 async fn principal_wrong_source_returns_403() {
-    let bearer = custom_bearer("valid-token", "svc:collector-claude", Some(SERVICE_CALLER_KIND));
+    let bearer = custom_bearer(
+        "valid-token",
+        "svc:collector-claude",
+        Some(SERVICE_CALLER_KIND),
+    );
     let mut principals = HashMap::new();
-    principals.insert("svc:collector-claude".to_string(), "claude-code".to_string());
-    
+    principals.insert(
+        "svc:collector-claude".to_string(),
+        "claude-code".to_string(),
+    );
+
     let router = build_router(bearer, principals);
-    
+
     let request = Request::builder()
         .method("POST")
         .uri("/auth/v1/otel/logs")
@@ -247,12 +263,19 @@ async fn principal_wrong_source_returns_403() {
 
 #[tokio::test]
 async fn missing_x_source_returns_400() {
-    let bearer = custom_bearer("valid-token", "svc:collector-claude", Some(SERVICE_CALLER_KIND));
+    let bearer = custom_bearer(
+        "valid-token",
+        "svc:collector-claude",
+        Some(SERVICE_CALLER_KIND),
+    );
     let mut principals = HashMap::new();
-    principals.insert("svc:collector-claude".to_string(), "claude-code".to_string());
-    
+    principals.insert(
+        "svc:collector-claude".to_string(),
+        "claude-code".to_string(),
+    );
+
     let router = build_router(bearer, principals);
-    
+
     let request = Request::builder()
         .method("POST")
         .uri("/auth/v1/otel/logs")
@@ -268,12 +291,19 @@ async fn missing_x_source_returns_400() {
 
 #[tokio::test]
 async fn unknown_x_source_returns_400() {
-    let bearer = custom_bearer("valid-token", "svc:collector-claude", Some(SERVICE_CALLER_KIND));
+    let bearer = custom_bearer(
+        "valid-token",
+        "svc:collector-claude",
+        Some(SERVICE_CALLER_KIND),
+    );
     let mut principals = HashMap::new();
-    principals.insert("svc:collector-claude".to_string(), "claude-code".to_string());
-    
+    principals.insert(
+        "svc:collector-claude".to_string(),
+        "claude-code".to_string(),
+    );
+
     let router = build_router(bearer, principals);
-    
+
     let request = Request::builder()
         .method("POST")
         .uri("/auth/v1/otel/logs")
@@ -289,12 +319,19 @@ async fn unknown_x_source_returns_400() {
 
 #[tokio::test]
 async fn valid_auth_and_source_returns_202() {
-    let bearer = custom_bearer("valid-token", "svc:collector-claude", Some(SERVICE_CALLER_KIND));
+    let bearer = custom_bearer(
+        "valid-token",
+        "svc:collector-claude",
+        Some(SERVICE_CALLER_KIND),
+    );
     let mut principals = HashMap::new();
-    principals.insert("svc:collector-claude".to_string(), "claude-code".to_string());
-    
+    principals.insert(
+        "svc:collector-claude".to_string(),
+        "claude-code".to_string(),
+    );
+
     let router = build_router(bearer, principals);
-    
+
     let request = Request::builder()
         .method("POST")
         .uri("/auth/v1/otel/logs")
@@ -310,12 +347,19 @@ async fn valid_auth_and_source_returns_202() {
 
 #[tokio::test]
 async fn payload_source_mismatch_still_accepts_but_warns() {
-    let bearer = custom_bearer("valid-token", "svc:collector-claude", Some(SERVICE_CALLER_KIND));
+    let bearer = custom_bearer(
+        "valid-token",
+        "svc:collector-claude",
+        Some(SERVICE_CALLER_KIND),
+    );
     let mut principals = HashMap::new();
-    principals.insert("svc:collector-claude".to_string(), "claude-code".to_string());
-    
+    principals.insert(
+        "svc:collector-claude".to_string(),
+        "claude-code".to_string(),
+    );
+
     let router = build_router(bearer, principals);
-    
+
     let request = Request::builder()
         .method("POST")
         .uri("/auth/v1/otel/logs")

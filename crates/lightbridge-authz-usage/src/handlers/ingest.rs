@@ -506,7 +506,10 @@ fn apply_normalizer(
     }
 }
 
-pub(crate) fn extract_log_events(payload: ExportLogsServiceRequest, source: &str) -> Vec<UsageEvent> {
+pub(crate) fn extract_log_events(
+    payload: ExportLogsServiceRequest,
+    source: &str,
+) -> Vec<UsageEvent> {
     let mut events = Vec::new();
     let normalizer = crate::normalizer::REGISTRY.get(source);
 
@@ -583,7 +586,10 @@ fn is_json_content(headers: &HeaderMap) -> bool {
         .is_some_and(|value| value.contains("json"))
 }
 
-pub(crate) fn extract_trace_events(payload: ExportTraceServiceRequest, source: &str) -> Vec<UsageEvent> {
+pub(crate) fn extract_trace_events(
+    payload: ExportTraceServiceRequest,
+    source: &str,
+) -> Vec<UsageEvent> {
     let mut events = Vec::new();
     let normalizer = crate::normalizer::REGISTRY.get(source);
 
@@ -651,7 +657,10 @@ pub(crate) fn extract_trace_events(payload: ExportTraceServiceRequest, source: &
     events
 }
 
-pub(crate) fn extract_metric_events(payload: ExportMetricsServiceRequest, source: &str) -> Vec<UsageEvent> {
+pub(crate) fn extract_metric_events(
+    payload: ExportMetricsServiceRequest,
+    source: &str,
+) -> Vec<UsageEvent> {
     let mut events = Vec::new();
     let normalizer = crate::normalizer::REGISTRY.get(source);
 

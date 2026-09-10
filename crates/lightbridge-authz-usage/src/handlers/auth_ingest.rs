@@ -8,8 +8,7 @@ use axum::{
 use lightbridge_authz_bearer::SERVICE_CALLER_KIND;
 use lightbridge_authz_core::Error;
 use opentelemetry_proto::tonic::collector::{
-    logs::v1::ExportLogsServiceRequest,
-    metrics::v1::ExportMetricsServiceRequest,
+    logs::v1::ExportLogsServiceRequest, metrics::v1::ExportMetricsServiceRequest,
     trace::v1::ExportTraceServiceRequest,
 };
 use prost::Message;
@@ -78,7 +77,10 @@ async fn authenticate_and_authorize(
     let allowed_source = state.ingest_principals.get(&token_info.sub);
     match allowed_source {
         Some(allowed) if allowed == source => {
-            debug!("principal {} authorized for source {}", token_info.sub, source);
+            debug!(
+                "principal {} authorized for source {}",
+                token_info.sub, source
+            );
         }
         Some(allowed) => {
             debug!(
@@ -88,7 +90,10 @@ async fn authenticate_and_authorize(
             return Err(forbidden());
         }
         None => {
-            debug!("principal {} is not authorized for any source", token_info.sub);
+            debug!(
+                "principal {} is not authorized for any source",
+                token_info.sub
+            );
             return Err(forbidden());
         }
     }
@@ -132,7 +137,13 @@ pub async fn auth_ingest_traces(
     let events = extract_trace_events(payload, &source);
     check_payload_identity_mismatch(&events, &source);
     match persist_events(&state, "trace", &events).await {
-        Ok(inserted) => (StatusCode::ACCEPTED, Json(IngestResponse { accepted_events: inserted })).into_response(),
+        Ok(inserted) => (
+            StatusCode::ACCEPTED,
+            Json(IngestResponse {
+                accepted_events: inserted,
+            }),
+        )
+            .into_response(),
         Err(e) => e.into_response(),
     }
 }
@@ -155,7 +166,13 @@ pub async fn auth_ingest_metrics(
     let events = extract_metric_events(payload, &source);
     check_payload_identity_mismatch(&events, &source);
     match persist_events(&state, "metric", &events).await {
-        Ok(inserted) => (StatusCode::ACCEPTED, Json(IngestResponse { accepted_events: inserted })).into_response(),
+        Ok(inserted) => (
+            StatusCode::ACCEPTED,
+            Json(IngestResponse {
+                accepted_events: inserted,
+            }),
+        )
+            .into_response(),
         Err(e) => e.into_response(),
     }
 }
@@ -178,7 +195,13 @@ pub async fn auth_ingest_logs(
     let events = extract_log_events(payload, &source);
     check_payload_identity_mismatch(&events, &source);
     match persist_events(&state, "log", &events).await {
-        Ok(inserted) => (StatusCode::ACCEPTED, Json(IngestResponse { accepted_events: inserted })).into_response(),
+        Ok(inserted) => (
+            StatusCode::ACCEPTED,
+            Json(IngestResponse {
+                accepted_events: inserted,
+            }),
+        )
+            .into_response(),
         Err(e) => e.into_response(),
     }
 }
