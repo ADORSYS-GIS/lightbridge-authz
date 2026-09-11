@@ -2,11 +2,22 @@
 //! Integration tests for the day-grain (`usage_day_facts`) and seat-grain (`usage_seat_snapshots`)
 //! tables introduced in #583.
 //!
-//! These tests run against a real Timescale-enabled Postgres via `#[sqlx::test]` (migrations are
-//! applied fresh per test). They prove:
+//! All tests apply the real `migrations-usage/` directory fresh per test via `#[sqlx::test]`.
+//! Only FOUR of them (#1, #2, #9 below) need the migration's `create_hypertable`/
+//! `add_compression_policy`/`add_retention_policy` calls to have actually fired, which only
+//! happens against a real Timescale-enabled Postgres (production and CI both run plain Postgres
+//! today -- #549 Finding 2, #581 D1 pending); those four carry `#[ignore]` so CI's plain-Postgres
+//! run reports them as ignored, not silently passing or failing, and they run for real with
+//! `cargo test -p lightbridge-authz-usage-rest --features it-tests --test day_seat_grain_it_tests
+//! -- --ignored` against `timescale/timescaledb`. The other fifteen need no Timescale-specific
+//! behavior at all (natural-key upsert, CHECK constraints, and NULL-vs-zero discipline are plain
+//! Postgres properties) and run in CI unconditionally (2026-09-09 review, #714 follow-up).
 //!
-//! 1. Both tables exist as hypertables in `timescaledb_information.hypertables`.
+//! They prove:
+//!
+//! 1. Both tables exist as hypertables in `timescaledb_information.hypertables`. [ignored in CI]
 //! 2. Retention and compression policies are present in `timescaledb_information.jobs`.
+//!    [ignored in CI]
 //! 3. Upsert on the natural key **is the primary key** — replaying a day changes no counts.
 //! 4. Money columns survive a NULL round-trip exactly as NULL, never 0.
 //! 5. A second source (`m365-copilot`) lands with zero DDL changes (governance#167's criterion).
@@ -15,7 +26,7 @@
 //!    SQL CHECK constraints, the serde names, and `SubjectKind` must keep).
 //! 8. Seat-state columns round-trip (AC1: seat *state* and *activity* columns).
 //! 9. D22's compressed-chunk replay: a row replayed into a chunk that has already been compressed
-//!    is absorbed by the PK conflict — still exactly one row, never a duplicate.
+//!    is absorbed by the PK conflict — still exactly one row, never a duplicate. [ignored in CI]
 
 use chrono::NaiveDate;
 use lightbridge_authz_usage_rest::models::day_seat::SubjectKind;
@@ -36,6 +47,9 @@ fn m365_day() -> NaiveDate {
 /// never drops a chunk. The sabotage condition: comment out `SELECT create_hypertable(...)` in
 /// the migration and run this test — it must go red for this exact assertion.
 #[sqlx::test(migrations = "../../migrations-usage")]
+#[ignore = "needs a real Timescale-enabled Postgres (timescale/timescaledb); CI runs plain \
+            Postgres (#549 Finding 2, #581 D1 pending) -- run with `cargo test -- --ignored` \
+            against a Timescale container locally"]
 async fn both_grain_tables_are_hypertables(pool: PgPool) {
     for table in ["usage_day_facts", "usage_seat_snapshots"] {
         let count: i64 = sqlx::query_scalar(
@@ -61,6 +75,7 @@ async fn both_grain_tables_are_hypertables(pool: PgPool) {
 /// A retention policy that was never successfully attached is indistinguishable from no policy —
 /// storage grows forever and the F2 lesson repeats.
 #[sqlx::test(migrations = "../../migrations-usage")]
+#[ignore = "needs a real Timescale-enabled Postgres; see both_grain_tables_are_hypertables"]
 async fn both_tables_have_retention_policies(pool: PgPool) {
     for table in ["usage_day_facts", "usage_seat_snapshots"] {
         let count: i64 = sqlx::query_scalar(
@@ -84,6 +99,7 @@ async fn both_tables_have_retention_policies(pool: PgPool) {
 
 /// Asserts that both tables have a compression policy attached (ADR-0028 D6: 30 days).
 #[sqlx::test(migrations = "../../migrations-usage")]
+#[ignore = "needs a real Timescale-enabled Postgres; see both_grain_tables_are_hypertables"]
 async fn both_tables_have_compression_policies(pool: PgPool) {
     for table in ["usage_day_facts", "usage_seat_snapshots"] {
         let count: i64 = sqlx::query_scalar(
@@ -621,6 +637,7 @@ async fn seat_state_round_trips_verbatim(pool: PgPool) {
 /// the chunk holding the past month is compressed manually, then one fact is re-sent through the
 /// upsert and the table still holds the original row count with the replayed values.
 #[sqlx::test(migrations = "../../migrations-usage")]
+#[ignore = "needs a real Timescale-enabled Postgres; see both_grain_tables_are_hypertables"]
 async fn dedup_holds_when_replaying_into_a_compressed_chunk(pool: PgPool) {
     let day = NaiveDate::from_ymd_opt(2026, 1, 15).expect("valid date");
 
