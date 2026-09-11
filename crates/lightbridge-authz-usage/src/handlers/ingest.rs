@@ -567,7 +567,6 @@ fn extract_log_events(payload: ExportLogsServiceRequest, source: &str) -> Vec<Us
                     completion_tokens: norm.completion_tokens,
                     total_tokens: norm.total_tokens,
                     total_cost: norm.total_cost,
-                    attributes: Value::Object(attrs.into_iter().collect()),
                 });
             }
         }
@@ -642,7 +641,6 @@ fn extract_trace_events(payload: ExportTraceServiceRequest, source: &str) -> Vec
                     prompt_tokens: norm.prompt_tokens,
                     completion_tokens: norm.completion_tokens,
                     total_tokens: norm.total_tokens,
-                    attributes: Value::Object(attrs.into_iter().collect()),
                 });
             }
         }
@@ -781,7 +779,6 @@ fn number_data_point_to_event(
         completion_tokens: norm.completion_tokens,
         total_tokens: norm.total_tokens,
         total_cost: norm.total_cost,
-        attributes: Value::Object(attrs.into_iter().collect()),
     }
 }
 
@@ -827,7 +824,6 @@ fn histogram_data_point_to_event(
         prompt_tokens: norm.prompt_tokens,
         completion_tokens: norm.completion_tokens,
         total_tokens: norm.total_tokens,
-        attributes: Value::Object(attrs.into_iter().collect()),
     }
 }
 
@@ -873,7 +869,6 @@ fn exponential_histogram_data_point_to_event(
         prompt_tokens: norm.prompt_tokens,
         completion_tokens: norm.completion_tokens,
         total_tokens: norm.total_tokens,
-        attributes: Value::Object(attrs.into_iter().collect()),
     }
 }
 
@@ -918,7 +913,6 @@ fn summary_data_point_to_event(
         prompt_tokens: norm.prompt_tokens,
         completion_tokens: norm.completion_tokens,
         total_tokens: norm.total_tokens,
-        attributes: Value::Object(attrs.into_iter().collect()),
     }
 }
 
@@ -1794,9 +1788,9 @@ mod tests {
 
     /// #648, end to end over the real wire shape: a gateway access-log record carrying the exact
     /// attribute names `ai-helm`'s `charts/core-gateway/templates/envoy-proxy.yaml` emits must
-    /// come out of `extract_log_events` with all three dimensions populated as COLUMNS -- not
-    /// merely surviving inside the `attributes` blob, which is what they already did before this
-    /// story and is precisely the state it exists to end.
+    /// come out of `extract_log_events` with all three dimensions populated as COLUMNS. (The
+    /// `attributes` blob is no longer written at ingest -- #549 AC1 -- so the columns are the only
+    /// place these dimensions live.)
     #[test]
     fn extract_log_events_should_promote_azp_billing_plan_and_operation_to_columns() {
         let payload: ExportLogsServiceRequest = serde_json::from_value(json!({
@@ -1832,11 +1826,6 @@ mod tests {
             event.operation.as_deref(),
             Some("chat_completions"),
             "x-envoy-origin-path must beat route_name"
-        );
-        assert_eq!(
-            event.attributes.get("azp").and_then(Value::as_str),
-            Some("converse-console"),
-            "promoting a dimension to a column must not strip it from the attributes blob"
         );
     }
 
@@ -1935,7 +1924,6 @@ mod tests {
             completion_tokens: None,
             total_tokens: None,
             total_cost: None,
-            attributes: Value::Null,
         }
     }
 
@@ -2622,6 +2610,10 @@ mod tests {
             ) -> Result<Option<f64>> {
                 Ok(None)
             }
+
+            async fn last_purge_cutoff(&self) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+                Ok(None)
+            }
         }
 
         struct RefuseEverythingBearer;
@@ -2653,6 +2645,7 @@ mod tests {
             repo: Arc::new(PartialInsertRepo { persisted: 1 }),
             bearer: Arc::new(RefuseEverythingBearer),
             scope_authority: Arc::new(RefuseEverythingScopeAuthority),
+            raw_days: Some(90),
         };
         let events = vec![base_usage_event(), base_usage_event()];
 

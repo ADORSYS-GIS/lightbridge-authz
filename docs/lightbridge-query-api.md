@@ -268,6 +268,18 @@ bucket), and every surviving bucket keeps its FULL series set, never an arbitrar
 means every matching bucket is present. See `docs/usage-api.md`'s "Response shape and truncation"
 for the known mid-bucket-cut caveat (#586).
 
+#### Query horizon (#549)
+
+`/usage/v1/usage/query` reads the raw `usage_events` table only. The retention job (#549) rolls
+rows older than `retention.raw_days` (default **90**) out of `usage_events` into the
+`usage_events_daily` rollup, which does **not** carry latency percentiles -- so this endpoint
+cannot serve data older than the raw window at the granularity it promises. A request whose
+`start_time` is older than the raw window returns only the data that still exists, and the handler
+sets `truncated: true` for such a range (the data older than the window is dropped) -- so the API
+never reports `truncated: false` for a range it cannot answer. The dashboard's maximum range is 90
+days, so every in-tree caller is within the window; a caller that needs longer-horizon data must
+reconcile with the retention configuration.
+
 #### Point fields
 
 Each point is an aggregate across matching `usage_events` rows for:

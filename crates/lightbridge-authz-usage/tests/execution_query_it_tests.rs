@@ -459,6 +459,7 @@ fn app_with_authority(
         repo,
         bearer,
         scope_authority,
+        raw_days: Some(90),
     });
     build_query_router(state, readiness_pool, false)
 }

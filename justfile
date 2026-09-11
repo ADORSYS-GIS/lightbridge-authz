@@ -180,14 +180,14 @@ load-test:
 # assertions) -- they report as ignored here, not passed or failed; the other 15 need no
 # Timescale-specific behavior and run for real.
 # The usage it-tests guard is PER-BINARY (each of repo_it_tests/spend_query_it_tests/
-# scope_ownership_it_tests/seed_it_tests/execution_grain_it_tests/execution_query_it_tests/
-# day_seat_grain_it_tests must
-# itself report >0 passed), not an aggregate total -- an aggregate
-# would hide one binary silently reporting "0 tests, exit 0" as long as the other two still pass
-# a nonzero count, the same "a skipped test is not a passing test" failure mode AGENTS.md warns
-# about, just moved one level up from an individual test to an individual binary.
+# scope_ownership_it_tests/retention_it_tests/seed_it_tests/execution_grain_it_tests/
+# execution_query_it_tests/day_seat_grain_it_tests must itself report >0 passed), not an aggregate
+# total -- an aggregate would hide one binary silently reporting "0 tests, exit 0" as long as the
+# other two still pass a nonzero count, the same "a skipped test is not a passing test" failure
+# mode AGENTS.md warns about, just moved one level up from an individual test to an individual
+# binary.
 it-tests:
-	@bash -ec 'set -euo pipefail; cmd="docker compose -p lightbridge-authz -f compose.yaml"; ${cmd} up -d postgresql redis; ${cmd} up authz-migrate --exit-code-from authz-migrate; trap "${cmd} down postgresql redis authz-migrate" EXIT; sleep 2; export DATABASE_URL="postgres://postgres:postgres@localhost:5432/lightbridge_authz"; export AUTHZ_REDIS_URL="redis://127.0.0.1:6379"; cargo test -p lightbridge-authz-api-key --features it-tests --tests; cargo test -p lightbridge-authz-budget --features it-tests --tests; cargo test -p lightbridge-authz-rest --features it-tests; cargo test -p lightbridge-authz --features it-tests --test mcp_tool_it_tests; check_binary() { log_file=$(mktemp); cargo test -p lightbridge-authz-usage-rest --features it-tests --test "$1" 2>&1 | tee "${log_file}"; passed=$(grep -oE "[0-9]+ passed" "${log_file}" | grep -oE "^[0-9]+" | tail -1 || true); echo "$1 passed: ${passed:-0}"; if [ -z "${passed}" ] || [ "${passed}" -eq 0 ]; then echo "$1 reported 0 passed tests -- a skip is not a pass"; exit 1; fi; }; check_binary repo_it_tests; check_binary spend_query_it_tests; check_binary scope_ownership_it_tests; check_binary seed_it_tests; check_binary execution_grain_it_tests; check_binary execution_query_it_tests; check_binary day_seat_grain_it_tests'
+	@bash -ec 'set -euo pipefail; cmd="docker compose -p lightbridge-authz -f compose.yaml"; ${cmd} up -d postgresql redis; ${cmd} up authz-migrate --exit-code-from authz-migrate; trap "${cmd} down postgresql redis authz-migrate" EXIT; sleep 2; export DATABASE_URL="postgres://postgres:postgres@localhost:5432/lightbridge_authz"; export AUTHZ_REDIS_URL="redis://127.0.0.1:6379"; cargo test -p lightbridge-authz-api-key --features it-tests --tests; cargo test -p lightbridge-authz-budget --features it-tests --tests; cargo test -p lightbridge-authz-rest --features it-tests; cargo test -p lightbridge-authz --features it-tests --test mcp_tool_it_tests; check_binary() { log_file=$(mktemp); cargo test -p lightbridge-authz-usage-rest --features it-tests --test "$1" 2>&1 | tee "${log_file}"; passed=$(grep -oE "[0-9]+ passed" "${log_file}" | grep -oE "^[0-9]+" | tail -1 || true); echo "$1 passed: ${passed:-0}"; if [ -z "${passed}" ] || [ "${passed}" -eq 0 ]; then echo "$1 reported 0 passed tests -- a skip is not a pass"; exit 1; fi; }; check_binary repo_it_tests; check_binary spend_query_it_tests; check_binary scope_ownership_it_tests; check_binary retention_it_tests; check_binary seed_it_tests; check_binary execution_grain_it_tests; check_binary execution_query_it_tests; check_binary day_seat_grain_it_tests'
 
 all-checks:
 	@echo "Running Rust formatting, lint, and checks"

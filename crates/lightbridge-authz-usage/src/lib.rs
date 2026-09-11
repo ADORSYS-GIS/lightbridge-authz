@@ -1,8 +1,7 @@
 use axum::{Json, Router, http::StatusCode, routing::get};
-use chrono::{DateTime, Utc};
 use lightbridge_authz_bearer::{BearerTokenService, BearerTokenServiceTrait};
 use lightbridge_authz_core::{
-    Error, Result, async_trait,
+    Error, Result,
     build_info::log_build_info,
     config::{Database, Oauth2},
     db::{DbPool, DbPoolTrait, is_database_ready},
@@ -21,13 +20,17 @@ pub mod instrumentation;
 pub mod models;
 pub mod normalizer;
 pub mod repo;
+pub mod retention;
+pub mod retention_config;
+pub mod retention_loop;
+pub mod rollup_sql;
 pub mod routers;
 pub mod scope_authority;
+pub mod spend;
+pub mod state;
 
-pub use config::{ScopeAuthorityConfig, UsageConfig, UsageServer, load_from_path};
-use models::execution::{ExecutionQueryRequest, ExecutionSeriesPoint};
-use models::{UsageQueryRequest, UsageSeriesPoint};
-use repo::{StoreRepo, UsageEvent};
+pub use config::{RetentionConfig, ScopeAuthorityConfig, UsageConfig, UsageServer, load_from_path};
+use repo::StoreRepo;
 use scope_authority::{RemoteScopeAuthority, ScopeAuthority};
 
 #[derive(Serialize, Deserialize)]
@@ -36,76 +39,7 @@ struct RootResponse {
     message: String,
 }
 
-/// Shared between both listeners `start_usage_server` binds (#347): the unauthenticated ingest
-/// listener (`UsageServerGroup::usage`) and the mTLS-required query listener
-/// (`UsageServerGroup::query`, `/usage/v1/usage/query` + `/usage/v1/spend/query`).
-///
-/// The ingest listener carries no auth gate of its own beyond the ClusterIP-only mitigation
-/// (`AGENTS.md`'s Security Notes) -- it never reads `bearer`/`scope_authority`. The query
-/// listener's mTLS requirement is enforced at the TLS layer (`Tls::client_ca_bundle_path`) before
-/// any handler here runs, but `/usage/v1/usage/query` additionally requires and validates an
-/// end-user bearer token (#570, `handlers::query::query_usage`) -- `bearer`/`scope_authority`
-/// below back that check. `/usage/v1/spend/query` (`handlers::spend::query_spend`) stays exempt
-/// (mTLS-only, no bearer -- it is `authz-budget`'s legitimate cross-account service reader).
-pub struct UsageState {
-    pub repo: Arc<dyn UsageRepoTrait>,
-    /// Validates the end-user bearer token `/usage/v1/usage/query` requires (#570).
-    pub bearer: Arc<dyn BearerTokenServiceTrait>,
-    /// Ownership authority for `/usage/v1/usage/query`'s `account`/`project` scopes (#570).
-    pub scope_authority: Arc<dyn ScopeAuthority>,
-}
-
-#[async_trait]
-pub trait UsageRepoTrait: Send + Sync {
-    async fn insert_usage_events(&self, events: &[UsageEvent]) -> Result<usize>;
-    /// Returns `(points, truncated)` -- see `StoreRepo::query_usage`'s doc comment for the #578
-    /// truncation contract `truncated` documents.
-    async fn query_usage(&self, input: &UsageQueryRequest)
-    -> Result<(Vec<UsageSeriesPoint>, bool)>;
-    /// Returns `(points, truncated)` for the execution grain (#726) -- see
-    /// `StoreRepo::query_executions`'s doc comment for the #578 truncation contract `truncated`
-    /// documents.
-    async fn query_executions(
-        &self,
-        input: &ExecutionQueryRequest,
-    ) -> Result<(Vec<ExecutionSeriesPoint>, bool)>;
-    async fn spend_for_account(
-        &self,
-        account_id: &str,
-        start: DateTime<Utc>,
-        end: DateTime<Utc>,
-    ) -> Result<Option<f64>>;
-}
-
-#[async_trait]
-impl UsageRepoTrait for StoreRepo {
-    async fn insert_usage_events(&self, events: &[UsageEvent]) -> Result<usize> {
-        StoreRepo::insert_usage_events(self, events).await
-    }
-
-    async fn query_usage(
-        &self,
-        input: &UsageQueryRequest,
-    ) -> Result<(Vec<UsageSeriesPoint>, bool)> {
-        StoreRepo::query_usage(self, input).await
-    }
-
-    async fn query_executions(
-        &self,
-        input: &ExecutionQueryRequest,
-    ) -> Result<(Vec<ExecutionSeriesPoint>, bool)> {
-        StoreRepo::query_executions(self, input).await
-    }
-
-    async fn spend_for_account(
-        &self,
-        account_id: &str,
-        start: DateTime<Utc>,
-        end: DateTime<Utc>,
-    ) -> Result<Option<f64>> {
-        StoreRepo::spend_for_account(self, account_id, start, end).await
-    }
-}
+pub use crate::state::{UsageRepoTrait, UsageState};
 
 /// Service names reported by `GET /version` and the `service.build` startup log line (#573).
 ///
@@ -202,8 +136,25 @@ pub async fn start_usage_server(
     database: &Database,
     oauth2: &Oauth2,
     scope_authority: &ScopeAuthorityConfig,
+    retention: &RetentionConfig,
 ) -> Result<()> {
     let pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::new(database).await?);
+
+    // Assert deploy sequencing: the rollup schema (migration 20260903000004) must exist before we
+    // serve traffic. Since SQLx handles queries dynamically, failing here prevents obscure runtime
+    // errors later. The error is propagated (not collapsed to "table missing") so a real failure --
+    // pool exhaustion, a connection blip, wrong credentials -- is reported as what it is, per this
+    // store's fail-loud migration doctrine.
+    sqlx::query("SELECT 1 FROM usage_events_daily LIMIT 1")
+        .fetch_optional(pool.pool())
+        .await
+        .map_err(|e| {
+            Error::Database(format!(
+                "usage_events_daily precondition check failed (ensure migration 20260903000004 \
+                 has run before starting): {e}"
+            ))
+        })?;
+
     let repo: Arc<dyn UsageRepoTrait> = Arc::new(StoreRepo::new(pool.clone()));
     let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(
         BearerTokenService::new(oauth2.clone())
@@ -215,7 +166,16 @@ pub async fn start_usage_server(
         repo,
         bearer,
         scope_authority,
+        raw_days: retention.enabled.then_some(retention.raw_days),
     });
+
+    // #549 AC2: the retention/rollup background job. It owns its own `PgPool` clone (the shared
+    // pool is behind a `dyn DbPoolTrait`), and runs independently of both listeners -- a retention
+    // failure is logged and retried, never fatal.
+    tokio::spawn(retention::run_retention_loop(
+        Arc::new(pool.pool().clone()),
+        retention.clone(),
+    ));
 
     let dev_cors = dev_cors_enabled();
     if dev_cors {

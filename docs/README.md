@@ -20,9 +20,9 @@ without reading everything.
 - **`authz-idp`** — the OIDC broker for the human plane (browser SSO, RFC 8628 device flow, RFC 8693 token exchange). Renders no HTML of its own.
 - **`authz-budget`** — the budget domain's RPC procedures (policy lifecycle, self-service refill, admin review queue).
 - **`lightbridge-mcp`** — the authz surface re-exposed as MCP tools over streamable HTTP.
-- **`lightbridge-authz-usage`** — OTEL/OTLP ingest plus Timescale-backed usage/spend analytics.
+- **`lightbridge-authz-usage`** — OTEL/OTLP ingest plus usage/spend analytics on a plain Postgres store (retention/rollup via `usage_events_daily`, #549).
 
-All but the usage service share one Postgres database (`authz`); usage has its own Timescale store.
+All but the usage service share one Postgres database (`authz`); usage has its own Postgres store.
 `authz-api`, `authz-idp`, and `authz-budget` require Redis. Keycloak is the OIDC provider.
 
 ---
