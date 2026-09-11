@@ -133,7 +133,7 @@ impl StoreRepo {
                 .push_bind(event.prompt_tokens)
                 .push_bind(event.completion_tokens)
                 .push_bind(event.total_tokens)
-                .push_bind(event.total_cost.unwrap_or(0.0))
+                .push_bind(event.total_cost)
                 .push_bind(event.latency_ms)
                 .push_bind(&event.attributes);
         });
@@ -266,7 +266,7 @@ impl StoreRepo {
                 billing_plan: row.billing_plan,
                 requests: row.requests.unwrap_or(0),
                 usage_value: row.usage_value.unwrap_or(0.0),
-                total_cost: row.total_cost.unwrap_or(0.0),
+                total_cost: row.total_cost,
                 prompt_tokens: row.prompt_tokens.unwrap_or(0),
                 completion_tokens: row.completion_tokens.unwrap_or(0),
                 total_tokens: row.total_tokens.unwrap_or(0),

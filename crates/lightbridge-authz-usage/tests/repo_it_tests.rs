@@ -141,7 +141,7 @@ async fn query_usage_aggregates_inserted_events_by_group(pool: PgPool) {
     assert_eq!(point.account_id, None);
     assert_eq!(point.requests, 2);
     assert_eq!(point.usage_value, 20.0);
-    assert_eq!(point.total_cost, 0.1);
+    assert_eq!(point.total_cost, Some(0.1));
     assert_eq!(point.prompt_tokens, 12);
     assert_eq!(point.completion_tokens, 8);
     assert_eq!(point.total_tokens, 20);
@@ -163,6 +163,29 @@ async fn query_usage_without_group_by_collapses_into_a_single_bucket(pool: PgPoo
     assert_eq!(points.len(), 1);
     assert_eq!(points[0].model, None);
     assert_eq!(points[0].requests, 1);
+}
+
+/// governance#188: a bucket whose rows carry no cost must surface `total_cost: None` (wire
+/// `null`), never `0.0` -- "cost unknown" and "cost was zero" are different facts. Regression
+/// for the `unwrap_or(0.0)` collapse in `query_usage`'s point mapping (and the matching
+/// `unwrap_or(0.0)` on the ingest path, which used to store unknown cost as 0).
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn query_usage_preserves_null_total_cost(pool: PgPool) {
+    let repo = build_repo(pool);
+    let now = Utc::now();
+    let mut event = sample_event(now);
+    event.total_cost = None;
+    repo.insert_usage_events(&[event])
+        .await
+        .expect("insert should succeed");
+
+    let (points, _truncated) = repo
+        .query_usage(&base_query(now))
+        .await
+        .expect("query should succeed");
+
+    assert_eq!(points.len(), 1);
+    assert_eq!(points[0].total_cost, None);
 }
 
 #[sqlx::test(migrations = "../../migrations-usage")]

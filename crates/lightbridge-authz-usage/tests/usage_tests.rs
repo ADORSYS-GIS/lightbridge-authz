@@ -364,7 +364,7 @@ async fn query_usage_returns_timeseries_points_when_query_is_valid() {
                 operation: Some("chat_completions".to_string()),
                 billing_plan: Some("pro".to_string()),
                 requests: 3,
-                total_cost: 42.0,
+                total_cost: Some(42.0),
                 usage_value: 120.0,
                 prompt_tokens: 80,
                 completion_tokens: 40,
@@ -395,6 +395,75 @@ async fn query_usage_returns_timeseries_points_when_query_is_valid() {
     assert_eq!(payload.points.len(), 1);
     assert_eq!(payload.points[0].project_id.as_deref(), Some("proj_1"));
     assert!(!payload.truncated);
+}
+
+/// governance#188: a point whose bucket carried no cost must serialize `total_cost` as `null`,
+/// never `0.0`. This is the wire-level regression test for the `unwrap_or(0.0)` collapse in
+/// both the INSERT path (`repo.rs:136`) and the query mapping (`repo.rs:269`).
+#[tokio::test]
+async fn query_usage_serializes_null_total_cost_as_null_not_zero() {
+    let state = Arc::new(UsageState {
+        repo: Arc::new(MockUsageRepo {
+            points: vec![UsageSeriesPoint {
+                bucket_start: Utc::now(),
+                account_id: None,
+                project_id: None,
+                api_key_id: None,
+                user_id: None,
+                user_name: None,
+                model: None,
+                metric_name: None,
+                signal_type: None,
+                source: None,
+                azp: None,
+                operation: None,
+                billing_plan: None,
+                requests: 1,
+                total_cost: None,
+                usage_value: 1.0,
+                prompt_tokens: 1,
+                completion_tokens: 0,
+                total_tokens: 1,
+                latency_samples: 0,
+                latency_p50_ms: None,
+                latency_p95_ms: None,
+                latency_p99_ms: None,
+            }],
+            inserted_events: 0,
+            spend: None,
+            truncated: false,
+        }),
+        bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
+        scope_authority: Arc::new(support::FakeScopeAuthority::new().authorizing(
+            TEST_ISSUER,
+            TEST_SUBJECT,
+            &UsageScope::Project,
+            "proj_1",
+        )),
+    });
+
+    let response = call_query_usage(state, authorized_headers(), base_request()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = body_json(response).await;
+    let point = body["points"][0]
+        .as_object()
+        .expect("points[0] must be an object");
+    // `Map::get` (unlike serde_json's `Index`) returns `None` for a MISSING key, so this
+    // distinguishes "serialized as an explicit null" from "omitted entirely". A future
+    // `#[serde(skip_serializing_if = "Option::is_none")]` on `total_cost` would silently drop
+    // the field -- reverting the wire contract this PR introduces -- and must fail here, not
+    // pass as a null.
+    assert_eq!(
+        point.get("total_cost"),
+        Some(&serde_json::Value::Null),
+        "total_cost must be present and serialize as null on the wire, not 0.0"
+    );
+
+    let payload: UsageQueryResponse =
+        serde_json::from_value(body).expect("response body must decode as UsageQueryResponse");
+    assert_eq!(payload.points.len(), 1);
+    assert!(payload.points[0].total_cost.is_none());
 }
 
 /// #570: no `Authorization` header at all -- 401, no data.
@@ -505,7 +574,7 @@ async fn query_usage_refuses_when_scope_authority_declines() {
                 operation: None,
                 billing_plan: None,
                 requests: 1,
-                total_cost: 1.0,
+                total_cost: Some(1.0),
                 usage_value: 1.0,
                 prompt_tokens: 0,
                 completion_tokens: 0,
