@@ -174,6 +174,24 @@ fn usage_openapi_should_publish_spend_endpoint_forbidden_response() {
     );
 }
 
+/// #732 (review follow-up): pins the 401/403 responses the execution query endpoint documents,
+/// mirroring `usage_openapi_should_publish_query_endpoint_auth_responses` for the legacy
+/// endpoint -- a silent regression back to "no auth check documented" fails here first.
+#[test]
+fn usage_openapi_should_publish_execution_query_auth_responses() {
+    let doc = usage_openapi();
+    let responses = &doc["paths"]["/usage/v1/usage/executions/query"]["post"]["responses"];
+
+    assert!(
+        responses.get("401").is_some(),
+        "expected /usage/v1/usage/executions/query to document a 401 response"
+    );
+    assert!(
+        responses.get("403").is_some(),
+        "expected /usage/v1/usage/executions/query to document a 403 response"
+    );
+}
+
 /// #648: the same console-facing seam as the latency/truncation guards above, for the three
 /// usage dimensions. `converse-frontends` hand-maintains `openapi/usage.backend.yaml` and
 /// generates its typed client from it, so these enum values ARE the contract -- a rename here
@@ -281,6 +299,24 @@ fn usage_openapi_should_publish_execution_schema_with_nullable_total_cost() {
     assert!(
         !required.contains(&"total_cost"),
         "total_cost must stay optional (nullable) in the published schema, got {required:?}"
+    );
+
+    // Absence from `required` alone would also pass for a non-nullable field clients may omit --
+    // a different contract than "may be null". Pin the nullability marker itself (utoipa emits
+    // OpenAPI 3.1-style `type: ["integer", "null"]` for `Option<i64>`).
+    let cost_type: Vec<String> = match point["total_cost"]["type"].as_array() {
+        Some(values) => values
+            .iter()
+            .filter_map(|value| value.as_str().map(str::to_string))
+            .collect(),
+        None => point["total_cost"]["type"]
+            .as_str()
+            .map(|value| vec![value.to_string()])
+            .unwrap_or_default(),
+    };
+    assert!(
+        cost_type.contains(&"null".to_string()),
+        "total_cost must publish as nullable (type contains \"null\"), got {cost_type:?}"
     );
 }
 

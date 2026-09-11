@@ -443,12 +443,22 @@ fn app(
     pool: PgPool,
     bearer: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait>,
 ) -> axum::Router {
+    app_with_authority(pool, bearer, support::refuse_everything_scope_authority())
+}
+
+/// Same as [`app`], but with an explicit scope authority -- tests that must prove a refusal comes
+/// from the ownership gate itself (not from a refusing authority) pass an authorizing one.
+fn app_with_authority(
+    pool: PgPool,
+    bearer: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait>,
+    scope_authority: Arc<dyn lightbridge_authz_usage_rest::scope_authority::ScopeAuthority>,
+) -> axum::Router {
     let readiness_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool.clone()));
     let repo = Arc::new(StoreRepo::new(Arc::new(DbPool::from_pool(pool))));
     let state = Arc::new(UsageState {
         repo,
         bearer,
-        scope_authority: support::refuse_everything_scope_authority(),
+        scope_authority,
     });
     build_query_router(state, readiness_pool, false)
 }
@@ -523,6 +533,11 @@ async fn own_user_scope_returns_200_with_seeded_executions(pool: PgPool) {
 
 /// Two-tenant 403 (fail-first per the epic): a caller asking for a DIFFERENT subject's
 /// `scope=user` data is refused with 403 and no data.
+///
+/// The scope authority here is deliberately AUTHORIZING for exactly this `(sub-b, user, sub-a)`
+/// combination: if the authority were refusing, the 403 could come from it rather than the
+/// self-ownership gate. With an authorizing authority, the only thing that can still refuse is
+/// the ownership check itself -- which is the property under test.
 #[sqlx::test(migrations = "../../migrations-usage")]
 async fn other_subjects_user_scope_is_refused_with_403(pool: PgPool) {
     insert_identity(&pool, "identity-a", "sub-a").await;
@@ -538,9 +553,16 @@ async fn other_subjects_user_scope_is_refused_with_403(pool: PgPool) {
     )
     .await;
 
+    let authority =
+        support::FakeScopeAuthority::new().authorizing(ISSUER, "sub-b", &UsageScope::User, "sub-a");
     let bearer = support::bearer_with("token-b", ISSUER, "sub-b");
-    let (status, body) =
-        post_executions(app(pool, bearer), Some("Bearer token-b"), "user", "sub-a").await;
+    let (status, body) = post_executions(
+        app_with_authority(pool, bearer, Arc::new(authority)),
+        Some("Bearer token-b"),
+        "user",
+        "sub-a",
+    )
+    .await;
 
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(
