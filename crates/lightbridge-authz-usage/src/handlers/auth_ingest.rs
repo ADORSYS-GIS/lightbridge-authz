@@ -40,7 +40,7 @@ fn forbidden() -> Response {
 async fn authenticate_and_authorize(
     state: &UsageState,
     headers: &HeaderMap,
-) -> std::result::Result<String, Response> {
+) -> std::result::Result<String, Box<Response>> {
     // 1. Extract bearer token — RFC 7235 treats the scheme name as case-insensitive,
     //    so lowercase before matching and extract the token from the original string
     //    (same pattern as handlers/query.rs and lightbridge-authz-rest middleware).
@@ -52,7 +52,7 @@ async fn authenticate_and_authorize(
 
     let token = match auth_header {
         Some(token) if !token.is_empty() => token,
-        _ => return Err(unauthorized()),
+        _ => return Err(Box::new(unauthorized())),
     };
 
     // 2. Validate token
@@ -60,7 +60,7 @@ async fn authenticate_and_authorize(
         .bearer
         .validate_bearer_token(token)
         .await
-        .map_err(|_| unauthorized())?;
+        .map_err(|_| Box::new(unauthorized()))?;
 
     // 3. Check caller_kind
     if token_info.caller_kind.as_deref() != Some(SERVICE_CALLER_KIND) {
@@ -68,11 +68,12 @@ async fn authenticate_and_authorize(
             "rejecting token with caller_kind {:?} (expected service)",
             token_info.caller_kind
         );
-        return Err(forbidden());
+        return Err(Box::new(forbidden()));
     }
 
     // 4. Resolve X-Source
-    let source = crate::normalizer::resolve_source(headers).map_err(|e| e.into_response())?;
+    let source =
+        crate::normalizer::resolve_source(headers).map_err(|e| Box::new(e.into_response()))?;
 
     // 5. Enforce strict principal -> source mapping
     let allowed_source = state.ingest_principals.get(&token_info.sub);
@@ -88,14 +89,14 @@ async fn authenticate_and_authorize(
                 "principal {} is mapped to {}, but asserted source {}",
                 token_info.sub, allowed, source
             );
-            return Err(forbidden());
+            return Err(Box::new(forbidden()));
         }
         None => {
             debug!(
                 "principal {} is not authorized for any source",
                 token_info.sub
             );
-            return Err(forbidden());
+            return Err(Box::new(forbidden()));
         }
     }
 
@@ -127,7 +128,7 @@ pub async fn auth_ingest_traces(
 ) -> Response {
     let source = match authenticate_and_authorize(&state, &headers).await {
         Ok(s) => s,
-        Err(e) => return e,
+        Err(e) => return (*e).into_response(),
     };
 
     let payload = match decode_otlp_request_async::<ExportTraceServiceRequest>(
@@ -160,7 +161,7 @@ pub async fn auth_ingest_metrics(
 ) -> Response {
     let source = match authenticate_and_authorize(&state, &headers).await {
         Ok(s) => s,
-        Err(e) => return e,
+        Err(e) => return (*e).into_response(),
     };
 
     let payload =
@@ -192,7 +193,7 @@ pub async fn auth_ingest_logs(
 ) -> Response {
     let source = match authenticate_and_authorize(&state, &headers).await {
         Ok(s) => s,
-        Err(e) => return e,
+        Err(e) => return (*e).into_response(),
     };
 
     let payload =

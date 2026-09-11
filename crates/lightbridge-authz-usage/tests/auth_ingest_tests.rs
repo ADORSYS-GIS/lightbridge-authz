@@ -31,8 +31,14 @@ impl UsageRepoTrait for MockUsageRepo {
         events: &[UsageEvent],
     ) -> lightbridge_authz_core::Result<usize> {
         let count = events.len();
-        *self.inserted_events.lock().unwrap() += count;
-        self.captured.lock().unwrap().extend_from_slice(events);
+        *self
+            .inserted_events
+            .lock()
+            .expect("mutex should not be poisoned") += count;
+        self.captured
+            .lock()
+            .expect("mutex should not be poisoned")
+            .extend_from_slice(events);
         Ok(count)
     }
 
@@ -60,6 +66,7 @@ struct DummyDbPool;
 
 #[async_trait]
 impl lightbridge_authz_core::db::DbPoolTrait for DummyDbPool {
+    #[expect(clippy::unimplemented, reason = "test double — never called")]
     fn pool(&self) -> &sqlx::Pool<sqlx::Postgres> {
         unimplemented!("not used in these tests")
     }
@@ -146,10 +153,10 @@ struct CustomBearer {
 #[async_trait]
 impl lightbridge_authz_bearer::BearerTokenServiceTrait for CustomBearer {
     async fn validate_bearer_token(&self, t: &str) -> anyhow::Result<TokenInfo> {
-        if t == self.token {
-            if let Some(ref info) = self.info {
-                return Ok(info.clone());
-            }
+        if t == self.token
+            && let Some(ref info) = self.info
+        {
+            return Ok(info.clone());
         }
         Err(anyhow::anyhow!("unknown token"))
     }
@@ -398,7 +405,7 @@ async fn payload_source_mismatch_accepts_stores_and_preserves_raw_attributes() {
         "a payload whose internal governance.source mismatches X-Source must be accepted, not rejected"
     );
 
-    let captured = repo.captured.lock().unwrap();
+    let captured = repo.captured.lock().expect("mutex should not be poisoned");
     assert_eq!(
         captured.len(),
         1,

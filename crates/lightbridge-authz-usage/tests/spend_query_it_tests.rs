@@ -39,6 +39,7 @@ async fn app(pool: PgPool) -> axum::Router {
         repo,
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        ingest_principals: std::collections::HashMap::default(),
     });
     build_query_router(state, readiness_pool, false)
 }
@@ -229,6 +230,7 @@ async fn usage_query_endpoint_application_logic_is_unaffected_by_mtls(pool: PgPo
             &lightbridge_authz_usage_rest::models::UsageScope::Account,
             "acct_1",
         )),
+        ingest_principals: std::collections::HashMap::default(),
     });
     let router = build_query_router(state, readiness_pool, false);
 
