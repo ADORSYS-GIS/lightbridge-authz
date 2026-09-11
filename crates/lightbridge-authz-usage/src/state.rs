@@ -11,6 +11,7 @@ use lightbridge_authz_bearer::BearerTokenServiceTrait;
 use lightbridge_authz_core::{Result, async_trait};
 use std::sync::Arc;
 
+use crate::models::execution::{ExecutionQueryRequest, ExecutionSeriesPoint};
 use crate::models::{UsageQueryRequest, UsageSeriesPoint};
 use crate::repo::{StoreRepo, UsageEvent};
 use crate::scope_authority::ScopeAuthority;
@@ -50,6 +51,13 @@ pub trait UsageRepoTrait: Send + Sync {
     /// truncation contract `truncated` documents.
     async fn query_usage(&self, input: &UsageQueryRequest)
     -> Result<(Vec<UsageSeriesPoint>, bool)>;
+    /// Returns `(points, truncated)` for the execution grain (#726) -- see
+    /// `StoreRepo::query_executions`'s doc comment for the #578 truncation contract `truncated`
+    /// documents.
+    async fn query_executions(
+        &self,
+        input: &ExecutionQueryRequest,
+    ) -> Result<(Vec<ExecutionSeriesPoint>, bool)>;
     async fn spend_for_account(
         &self,
         account_id: &str,
@@ -72,6 +80,13 @@ impl UsageRepoTrait for StoreRepo {
         input: &UsageQueryRequest,
     ) -> Result<(Vec<UsageSeriesPoint>, bool)> {
         StoreRepo::query_usage(self, input).await
+    }
+
+    async fn query_executions(
+        &self,
+        input: &ExecutionQueryRequest,
+    ) -> Result<(Vec<ExecutionSeriesPoint>, bool)> {
+        StoreRepo::query_executions(self, input).await
     }
 
     async fn spend_for_account(

@@ -62,16 +62,22 @@
 //! runs `SET LOCAL TimeZone = 'UTC'` as its first statement, pinning every day boundary in this
 //! transaction to UTC regardless of the session's configured zone.
 
-use chrono::{DateTime, Utc};
 use lightbridge_authz_core::{Error, Result};
 use sqlx::{Connection, PgConnection, PgPool};
-use std::sync::Arc;
-use tracing::{info, warn};
 
-use crate::config::RetentionConfig;
 // The rollup/purge SQL statements live in `rollup_sql` (split out by the LoC gate); re-export them
 // here so `retention.rs`'s existing callers and the module's public surface are unchanged.
 pub use crate::rollup_sql::{ROLLUP_AND_PURGE_SQL, ROLLUP_PURGE_SQL};
+
+// The background-loop driver and the P2 purge-cutoff bookkeeping live in `retention_loop` (split
+// out by the LoC gate, lightbridge-governance#172): they are a self-contained unit built ON TOP OF
+// `rollup_and_purge` below, not part of the rollup/purge core itself. Re-exported here so every
+// existing `retention::{run_retention_loop, record_cutoff_if_completed, record_last_purge_cutoff}`
+// path -- `lib.rs`, `tests/retention_it_tests.rs` -- still resolves unchanged, and the pairing
+// (`retention_loop` calls straight back into `rollup_and_purge`/`RetentionRun` here) is unchanged.
+pub use crate::retention_loop::{
+    record_cutoff_if_completed, record_last_purge_cutoff, run_retention_loop,
+};
 
 /// Outcome of a retention/rollup run.
 #[derive(Debug, Clone, Copy)]
@@ -82,87 +88,6 @@ pub struct RetentionRun {
     /// the run was cut short by losing the advisory lock to a concurrent replica -- partial
     /// progress only, older rows still raw.
     pub completed: bool,
-}
-
-/// Runs the retention/rollup background loop forever: every `config.interval_seconds`, rolls rows
-/// older than `config.raw_days` into `usage_events_daily` and deletes them from `usage_events`,
-/// and deletes rollup rows older than `config.rollup_days`. A failed run is logged and the loop
-/// continues -- a retention hiccup must not take the server down, and the next run retries.
-pub async fn run_retention_loop(pool: Arc<PgPool>, config: RetentionConfig) {
-    if !config.enabled {
-        info!("usage retention/rollup disabled by config");
-        return;
-    }
-    info!(
-        "usage retention/rollup enabled: raw_days={}, rollup_days={}, interval={}s",
-        config.raw_days, config.rollup_days, config.interval_seconds
-    );
-    // `tokio::time::interval` (not a bare `sleep` loop) so the cadence does not drift by however
-    // long each run takes, and `MissedTickBehavior::Skip` so a run that overruns the interval
-    // does not queue a burst of catch-up ticks. The first tick fires immediately, so the first
-    // run happens at startup and then every `interval_seconds`.
-    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
-        config.interval_seconds.max(1),
-    ));
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        ticker.tick().await;
-        match rollup_and_purge(&pool, config.raw_days, config.rollup_days).await {
-            Ok(run) => {
-                record_cutoff_if_completed(&pool, config.raw_days, &run).await;
-                if run.purged > 0 {
-                    info!(
-                        "usage retention: rolled up and purged {} raw rows",
-                        run.purged
-                    );
-                }
-            }
-            Err(e) => warn!("usage retention/rollup run failed: {e}"),
-        }
-    }
-}
-
-/// Records the purge cutoff after a run, but ONLY when the run completed a full drain. A run cut
-/// short by advisory-lock contention (`completed == false`) has NOT purged everything older than
-/// the cutoff, so recording it would over-report `truncated` for ranges whose rows are still raw
-/// (P2). A stale (older) cutoff errs toward a false positive, never a false negative.
-pub async fn record_cutoff_if_completed(pool: &PgPool, raw_days: i64, run: &RetentionRun) {
-    if !run.completed {
-        warn!(
-            "usage retention: run cut short by advisory lock contention ({} rows purged); not recording purge cutoff",
-            run.purged
-        );
-        return;
-    }
-    if let Err(e) = record_last_purge_cutoff(pool, raw_days).await {
-        warn!("usage retention: failed to record last purge cutoff: {e}");
-    }
-}
-
-/// Records the day-truncated purge cutoff of a successful run into `usage_retention_state`, so
-/// `/usage/v1/usage/query` can report `truncated` from what the job actually purged (P2) rather
-/// than from the wall clock at query time. The cutoff is read from the database clock -- the same
-/// `date_trunc('day', now() - raw_days)` the rollup SQL uses -- so it matches what the run purged
-/// regardless of app/DB clock skew.
-pub async fn record_last_purge_cutoff(pool: &PgPool, raw_days: i64) -> Result<()> {
-    let cutoff: DateTime<Utc> =
-        sqlx::query_scalar("SELECT date_trunc('day', now() - ($1 * interval '1 day'))")
-            .bind(raw_days)
-            .fetch_one(pool)
-            .await
-            .map_err(|e| Error::Database(format!("usage retention cutoff read failed: {e}")))?;
-
-    sqlx::query(
-        "INSERT INTO usage_retention_state (id, last_purge_cutoff) VALUES (TRUE, $1)
-         ON CONFLICT (id) DO UPDATE
-           SET last_purge_cutoff = EXCLUDED.last_purge_cutoff, updated_at = now()",
-    )
-    .bind(cutoff)
-    .execute(pool)
-    .await
-    .map_err(|e| Error::Database(format!("usage retention state write failed: {e}")))?;
-
-    Ok(())
 }
 
 /// Rolls `usage_events` rows older than `raw_days` (rounded down to the day boundary, so only

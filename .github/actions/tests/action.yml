@@ -287,6 +287,24 @@ runs:
         CARGO_BUILD_JOBS: "2"
         CARGO_INCREMENTAL: "0"
 
+    - name: Run it-tests (usage) - execution_query_it_tests
+      shell: bash
+      run: |
+        set -euo pipefail
+        log_file="$(mktemp)"
+        cargo test -p lightbridge-authz-usage-rest --features it-tests \
+          --test execution_query_it_tests 2>&1 | tee "${log_file}"
+        passed=$(grep -oE '[0-9]+ passed' "${log_file}" | grep -oE '^[0-9]+' | tail -1 || true)
+        echo "execution_query_it_tests passed: ${passed:-0}"
+        if [ -z "${passed}" ] || [ "${passed}" -eq 0 ]; then
+          echo "::error::execution_query_it_tests reported 0 passed tests -- a skip is not a pass."
+          exit 1
+        fi
+      env:
+        DATABASE_URL: ${{ inputs.database-url }}
+        CARGO_BUILD_JOBS: "2"
+        CARGO_INCREMENTAL: "0"
+
     # day_seat_grain_it_tests (#583): 4 of its 19 tests are `#[ignore]`d -- they assert real
     # hypertable/compression/retention behavior that only fires against a Timescale-enabled
     # Postgres, which this job's plain `docker.io/library/postgres:17` container is not (#549

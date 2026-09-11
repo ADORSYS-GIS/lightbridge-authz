@@ -1,18 +1,18 @@
 use crate::UsageState;
-use crate::models::{UsageErrorResponse, UsageQueryRequest, UsageQueryResponse, UsageScope};
+use crate::handlers::ownership::{
+    AuthOutcome, GrainScope, ScopeAuthOutcome, authenticate, authorize_scope,
+    validate_common_request,
+};
+use crate::models::{UsageErrorResponse, UsageQueryRequest, UsageQueryResponse};
 use axum::{
     Json,
     extract::State,
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use lightbridge_authz_core::{Error, Permission, Result};
+use lightbridge_authz_core::{Error, Result};
 use std::sync::Arc;
 use tracing::{info, instrument, warn};
-
-// The bearer-token extraction and auth-failure helpers live in `handlers::auth` (split out by the
-// LoC gate); re-export them here so `query.rs`'s existing callers and public surface are unchanged.
-pub use crate::handlers::auth::{extract_bearer_token, forbidden, unauthorized};
 
 #[utoipa::path(
     post,
@@ -45,21 +45,9 @@ pub async fn query_usage(
     // own authentication boundary, layered on top of the mTLS the listener already requires at
     // the TLS level. A missing/invalid token is "unknown", which per AGENTS.md's fail-closed rule
     // routes to the strictest branch: refuse, never proceed, and never validate the body first.
-    let Some(token) = extract_bearer_token(&headers) else {
-        warn!("query_usage: no bearer token presented");
-        return Ok(unauthorized());
-    };
-
-    let token_info = match state.bearer.validate_bearer_token(&token).await {
-        Ok(info) if info.active => info,
-        Ok(_) => {
-            warn!("query_usage: bearer token validated but not active");
-            return Ok(unauthorized());
-        }
-        Err(err) => {
-            warn!(error = %err, "query_usage: bearer token validation failed");
-            return Ok(unauthorized());
-        }
+    let token_info = match authenticate(&state, &headers).await {
+        AuthOutcome::Authenticated(info) => info,
+        AuthOutcome::Unauthorized(response) => return Ok(response),
     };
 
     info!(
@@ -76,114 +64,26 @@ pub async fn query_usage(
         ));
     }
 
-    // `scope_id` stays a required wire field (`UsageQueryRequest::scope_id` is not `Option`) for
-    // every scope, but `UsageScope::All` has no `scope_id` to validate -- there is no single ID an
-    // estate-wide query is "about" -- so an empty value is the documented, expected shape for that
-    // one scope and must not be rejected here.
-    if !matches!(input.scope, UsageScope::All) && input.scope_id.trim().is_empty() {
-        warn!("missing scope_id for usage query");
-        return Err(Error::BadRequest(
-            "scope_id is required for usage queries".to_string(),
-        ));
-    }
-
-    if input.limit == 0 {
-        warn!("invalid limit for usage query: limit=0");
-        return Err(Error::BadRequest(
-            "limit must be greater than zero".to_string(),
-        ));
-    }
+    validate_common_request(&input.scope, &input.scope_id, input.limit)?;
 
     // #648: `filters.operation_in` is a CLOSED vocabulary, so an unknown entry is a 400 here and
     // not an empty result set from the repo -- a caller who typed `chat` instead of
     // `chat_completions` deserves to be told, not handed a blank chart that looks like "no usage".
     input.filters.validate()?;
 
-    // #648: the admin bypass. A caller holding `usage:read-all` -- the same coarse RBAC permission
-    // that already unlocks the estate-wide `scope=all` -- may read ANY `scope_id` under
-    // `user`/`project`/`account`. Without it those three scopes are strictly WIDER than `all` is
-    // narrow: `scope=all` already returns every row in the estate to this exact permission
-    // holder, so refusing them the same data sliced by one account is not a security boundary, it
-    // is a missing feature (it is why `/admin/usage`'s per-actor pages cannot be built today).
-    //
-    // What this does NOT do, deliberately: it does not touch `scope=api_key` (still refused for
-    // everyone -- there is no ownership authority for a raw `api_key_id` and an admin bypass would
-    // not create one), and it does not weaken anything for a caller WITHOUT the permission --
-    // `scope=user` stays self-only and `scope=account`/`project` still go through
-    // `scope_authority`, unchanged.
-    let is_usage_admin = token_info.has_permission(Permission::UsageReadAll);
-
-    match &input.scope {
-        // Self-ownership (or `usage:read-all`, #648): the caller reading their OWN usage.
-        // `user_id` is never a row any `accounts`/`projects` table is keyed by, so there is no
-        // `scope_authority` predicate to call for it (unlike account/project) -- but "is this token's own subject" needs no
-        // remote call at all, it is answered entirely from the already-JWKS-validated
-        // `token_info.sub`. Any `scope_id` other than the caller's own subject is refused --
-        // there is still no ownership predicate that would let a caller read someone ELSE's
-        // per-user usage -- unless they hold `usage:read-all`, which already entitles them to
-        // every one of those rows through `scope=all` anyway.
-        UsageScope::User => {
-            if !is_usage_admin && input.scope_id != token_info.sub {
-                warn!(
-                    scope = ?input.scope,
-                    "query_usage: scope=user requested for a subject other than the caller's own; refusing"
-                );
-                return Ok(forbidden());
-            }
-        }
-        // `api_key` has no resolvable ownership authority at all (no `accounts`/`projects` row is
-        // ever keyed by a raw `api_key_id`) and no caller-subject shortcut either (an API key's
-        // bearer token, if one even existed here, is not "the API key itself") -- refused
-        // unconditionally, matching the console's own guard, and never reaching `scope_authority`.
-        // #648's admin bypass deliberately stops short of this arm: `usage:read-all` grants a
-        // caller data they are already entitled to under `scope=all`, and no amount of permission
-        // conjures the ownership authority this scope has never had.
-        UsageScope::ApiKey => {
-            warn!(
-                scope = ?input.scope,
-                "query_usage: scope has no resolvable ownership authority; refusing"
-            );
-            return Ok(forbidden());
-        }
-        // Estate-wide: no per-row ownership predicate exists for "everything", by definition, so
-        // this is gated on a coarse RBAC permission instead -- the SAME `Permission::UsageReadAll`
-        // check regardless of what (if anything) `scope_id` was set to (already validated above to
-        // be the "ignored" empty-or-anything shape `UsageScope::All` documents).
-        UsageScope::All => {
-            if !is_usage_admin {
-                warn!(
-                    scope = ?input.scope,
-                    "query_usage: scope=all requires usage:read-all; refusing"
-                );
-                return Ok(forbidden());
-            }
-        }
-        UsageScope::Account | UsageScope::Project => {
-            if is_usage_admin {
-                info!(
-                    scope = ?input.scope,
-                    "query_usage: usage:read-all holder; skipping the ownership round trip"
-                );
-            } else {
-                let authorized = state
-                    .scope_authority
-                    .authorize(
-                        &token_info.iss,
-                        &token_info.sub,
-                        &input.scope,
-                        &input.scope_id,
-                    )
-                    .await?;
-                if !authorized {
-                    warn!(
-                        scope = ?input.scope,
-                        scope_id = %input.scope_id,
-                        "query_usage: scope authority refused the requested scope"
-                    );
-                    return Ok(forbidden());
-                }
-            }
-        }
+    // Scope authorization via the shared gate (Legacy model: all five scopes).
+    match authorize_scope(
+        state.scope_authority.as_ref(),
+        &token_info,
+        &input.scope,
+        &input.scope_id,
+        GrainScope::Legacy,
+    )
+    .await
+    {
+        ScopeAuthOutcome::Authorized => {}
+        ScopeAuthOutcome::Forbidden(response) => return Ok(response),
+        ScopeAuthOutcome::BadRequest(err) => return Err(err),
     }
 
     // Captured BEFORE the query so the echo describes what was ASKED for, not what came back --

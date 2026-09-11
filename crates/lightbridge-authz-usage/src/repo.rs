@@ -1,10 +1,14 @@
+mod bucket;
+pub mod execution;
+mod execution_filters;
+
 use crate::models::{UsageGroupBy, UsageQueryRequest, UsageScope, UsageSeriesPoint};
 use chrono::{DateTime, Utc};
 use lightbridge_authz_core::db::DbPoolTrait;
 use lightbridge_authz_core::{Error, Result};
 use sqlx::{FromRow, PgPool, Postgres, QueryBuilder};
 use std::collections::HashSet;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use tracing::{debug, instrument};
 
 #[derive(Debug, Clone)]
@@ -249,7 +253,7 @@ impl StoreRepo {
             "querying usage with scope={:?}, scope_id={}, bucket={}, limit={}",
             input.scope, input.scope_id, input.bucket, input.limit
         );
-        validate_bucket_interval(&input.bucket)?;
+        bucket::validate_bucket_interval(&input.bucket)?;
 
         let mut builder = build_usage_query(input);
         let rows: Vec<UsageQueryRow> = builder.build_query_as().fetch_all(self.pool()).await?;
@@ -527,41 +531,6 @@ fn push_scope_filters(builder: &mut QueryBuilder<Postgres>, input: &UsageQueryRe
         builder.push(" AND operation = ANY(");
         builder.push_bind(operations.as_slice());
         builder.push(")");
-    }
-}
-
-fn validate_bucket_interval(bucket: &str) -> Result<()> {
-    static BUCKET_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(r"^\d+\s+(second|seconds|minute|minutes|hour|hours|day|days)$")
-            .expect("bucket regex should be valid")
-    });
-
-    if BUCKET_RE.is_match(bucket.trim()) {
-        Ok(())
-    } else {
-        Err(Error::BadRequest(
-            "bucket must look like `5 minutes`, `1 hour`, or `1 day`".to_string(),
-        ))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn validate_bucket_interval_accepts_supported_units() {
-        assert!(validate_bucket_interval("1 minute").is_ok());
-        assert!(validate_bucket_interval("15 minutes").is_ok());
-        assert!(validate_bucket_interval("2 hours").is_ok());
-        assert!(validate_bucket_interval("1 day").is_ok());
-    }
-
-    #[test]
-    fn validate_bucket_interval_rejects_unexpected_values() {
-        assert!(validate_bucket_interval("hour").is_err());
-        assert!(validate_bucket_interval("1month").is_err());
-        assert!(validate_bucket_interval("1 week").is_err());
     }
 }
 

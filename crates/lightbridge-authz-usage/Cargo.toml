@@ -82,3 +82,8 @@ required-features = ["it-tests"]
 name = "execution_grain_it_tests"
 path = "tests/execution_grain_it_tests.rs"
 required-features = ["it-tests"]
+
+[[test]]
+name = "execution_query_it_tests"
+path = "tests/execution_query_it_tests.rs"
+required-features = ["it-tests"]

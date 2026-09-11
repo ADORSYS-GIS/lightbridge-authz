@@ -2595,6 +2595,13 @@ mod tests {
                 Ok((vec![], false))
             }
 
+            async fn query_executions(
+                &self,
+                _input: &crate::models::execution::ExecutionQueryRequest,
+            ) -> Result<(Vec<crate::models::execution::ExecutionSeriesPoint>, bool)> {
+                Ok((vec![], false))
+            }
+
             async fn spend_for_account(
                 &self,
                 _account_id: &str,
