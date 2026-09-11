@@ -115,6 +115,7 @@ fn mock_state() -> Arc<UsageState> {
             &UsageScope::Project,
             "proj_1",
         )),
+        ingest_principals: std::collections::HashMap::default(),
     })
 }
 
@@ -125,7 +126,7 @@ const TEST_SUBJECT: &str = "sub-1";
 /// The ingest listener's router (#347 split): probes, Swagger docs, `/v1/otel/*` only --
 /// `/usage/v1/usage/query`/`/usage/v1/spend/query` moved to `query_app` below.
 fn usage_app(dev_cors: bool) -> axum::Router {
-    build_ingest_router(mock_state(), lazy_pool(), dev_cors)
+    build_ingest_router(mock_state(), lazy_pool(), dev_cors, false)
 }
 
 /// The mTLS-required query listener's router (#347 split): `/usage/v1/usage/query` +
@@ -384,6 +385,7 @@ async fn query_usage_returns_timeseries_points_when_query_is_valid() {
             &UsageScope::Project,
             "proj_1",
         )),
+        ingest_principals: std::collections::HashMap::default(),
     });
 
     let req = base_request();
@@ -521,6 +523,7 @@ async fn query_usage_refuses_when_scope_authority_declines() {
         }),
         bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
         scope_authority: support::refuse_everything_scope_authority(),
+        ingest_principals: std::collections::HashMap::default(),
     });
 
     let response = call_query_usage(state, authorized_headers(), base_request()).await;
@@ -552,6 +555,7 @@ async fn query_usage_refuses_api_key_scope_unconditionally() {
         repo: Arc::new(MockUsageRepo::default()),
         bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
         scope_authority: Arc::new(AuthorizeEverything),
+        ingest_principals: std::collections::HashMap::default(),
     });
 
     let req = UsageQueryRequest {
@@ -582,6 +586,7 @@ async fn query_usage_allows_own_user_scope() {
         }),
         bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
         scope_authority: support::refuse_everything_scope_authority(),
+        ingest_principals: std::collections::HashMap::default(),
     });
 
     let req = UsageQueryRequest {
@@ -602,6 +607,7 @@ async fn query_usage_refuses_other_subjects_user_scope() {
         repo: Arc::new(MockUsageRepo::default()),
         bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
         scope_authority: Arc::new(AuthorizeEverything),
+        ingest_principals: std::collections::HashMap::default(),
     });
 
     let req = UsageQueryRequest {
@@ -623,6 +629,7 @@ async fn query_usage_refuses_all_scope_without_permission() {
         repo: Arc::new(MockUsageRepo::default()),
         bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
         scope_authority: Arc::new(AuthorizeEverything),
+        ingest_principals: std::collections::HashMap::default(),
     });
 
     let req = UsageQueryRequest {
@@ -650,6 +657,7 @@ async fn query_usage_allows_all_scope_with_permission() {
             ]),
         ),
         scope_authority: support::refuse_everything_scope_authority(),
+        ingest_principals: std::collections::HashMap::default(),
     });
 
     let req = UsageQueryRequest {
@@ -681,6 +689,7 @@ async fn query_usage_all_scope_does_not_require_scope_id() {
                 ]),
             ),
             scope_authority: support::refuse_everything_scope_authority(),
+            ingest_principals: std::collections::HashMap::default(),
         })),
         authorized_headers(),
         Json(req),
@@ -719,6 +728,7 @@ async fn ingest_logs_treats_noop_insert_as_success() {
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        ingest_principals: std::collections::HashMap::default(),
     });
 
     let response = ingest_logs(
@@ -744,6 +754,7 @@ async fn ingest_logs_rejects_invalid_protobuf_as_bad_request() {
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        ingest_principals: std::collections::HashMap::default(),
     });
 
     let result = ingest_logs(
@@ -771,6 +782,7 @@ async fn ingest_logs_rejects_unknown_source() {
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        ingest_principals: std::collections::HashMap::default(),
     });
 
     let mut headers = HeaderMap::new();
@@ -796,6 +808,7 @@ async fn ingest_logs_rejects_missing_source_header() {
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        ingest_principals: std::collections::HashMap::default(),
     });
 
     let result = ingest_logs(
@@ -938,6 +951,7 @@ async fn ingest_traces_treats_noop_insert_as_success() {
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        ingest_principals: std::collections::HashMap::default(),
     });
 
     let response = ingest_traces(
@@ -963,6 +977,7 @@ async fn ingest_traces_rejects_invalid_protobuf_as_bad_request() {
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        ingest_principals: std::collections::HashMap::default(),
     });
 
     let result = ingest_traces(
@@ -990,6 +1005,7 @@ async fn ingest_traces_rejects_unknown_source() {
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        ingest_principals: std::collections::HashMap::default(),
     });
 
     let mut headers = HeaderMap::new();
@@ -1020,6 +1036,7 @@ async fn ingest_metrics_treats_noop_insert_as_success() {
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        ingest_principals: std::collections::HashMap::default(),
     });
 
     let response = ingest_metrics(
@@ -1045,6 +1062,7 @@ async fn ingest_metrics_rejects_invalid_protobuf_as_bad_request() {
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        ingest_principals: std::collections::HashMap::default(),
     });
 
     let result = ingest_metrics(
@@ -1072,6 +1090,7 @@ async fn ingest_metrics_rejects_unknown_source() {
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        ingest_principals: std::collections::HashMap::default(),
     });
 
     let mut headers = HeaderMap::new();
@@ -1102,6 +1121,7 @@ async fn ingest_logs_accepts_json_content_type_payload() {
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        ingest_principals: std::collections::HashMap::default(),
     });
 
     let body = serde_json::json!({
@@ -1152,6 +1172,7 @@ async fn ingest_logs_accepts_gzip_encoded_body() {
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        ingest_principals: std::collections::HashMap::default(),
     });
 
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
@@ -1186,6 +1207,7 @@ async fn ingest_endpoints_reject_missing_or_unknown_x_source_header() {
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        ingest_principals: std::collections::HashMap::default(),
     });
 
     // Missing header

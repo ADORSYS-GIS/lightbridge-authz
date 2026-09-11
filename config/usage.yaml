@@ -54,3 +54,13 @@ scope_authority:
   username: "authorino"
   password: "change-me"
   insecure_skip_verify: true
+
+# #585: authenticated ingest configuration.
+# Maps JWT subjects (M2M svc:collector-* tokens) to the single X-Source value they are allowed to assert.
+ingest_auth:
+  principals:
+    "svc:collector-claude-code": "claude-code"
+    "svc:collector-codex": "codex"
+    "svc:collector-opencode": "opencode"
+    "svc:collector-github-copilot": "github-copilot"
+    "svc:collector-microsoft-foundry": "microsoft-foundry"

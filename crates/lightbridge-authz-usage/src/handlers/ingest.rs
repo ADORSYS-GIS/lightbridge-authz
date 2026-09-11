@@ -324,7 +324,7 @@ pub async fn ingest_logs(
     ))
 }
 
-async fn decode_otlp_request_async<T>(
+pub(crate) async fn decode_otlp_request_async<T>(
     headers: HeaderMap,
     body: Bytes,
     signal: &'static str,
@@ -395,7 +395,7 @@ fn decode_maybe_gzip<'a>(
     Ok(std::borrow::Cow::Owned(out))
 }
 
-async fn persist_events(
+pub(crate) async fn persist_events(
     state: &UsageState,
     signal_type: &str,
     events: &[UsageEvent],
@@ -506,7 +506,10 @@ fn apply_normalizer(
     }
 }
 
-fn extract_log_events(payload: ExportLogsServiceRequest, source: &str) -> Vec<UsageEvent> {
+pub(crate) fn extract_log_events(
+    payload: ExportLogsServiceRequest,
+    source: &str,
+) -> Vec<UsageEvent> {
     let mut events = Vec::new();
     let normalizer = crate::normalizer::REGISTRY.get(source);
 
@@ -583,7 +586,10 @@ fn is_json_content(headers: &HeaderMap) -> bool {
         .is_some_and(|value| value.contains("json"))
 }
 
-fn extract_trace_events(payload: ExportTraceServiceRequest, source: &str) -> Vec<UsageEvent> {
+pub(crate) fn extract_trace_events(
+    payload: ExportTraceServiceRequest,
+    source: &str,
+) -> Vec<UsageEvent> {
     let mut events = Vec::new();
     let normalizer = crate::normalizer::REGISTRY.get(source);
 
@@ -651,7 +657,10 @@ fn extract_trace_events(payload: ExportTraceServiceRequest, source: &str) -> Vec
     events
 }
 
-fn extract_metric_events(payload: ExportMetricsServiceRequest, source: &str) -> Vec<UsageEvent> {
+pub(crate) fn extract_metric_events(
+    payload: ExportMetricsServiceRequest,
+    source: &str,
+) -> Vec<UsageEvent> {
     let mut events = Vec::new();
     let normalizer = crate::normalizer::REGISTRY.get(source);
 
@@ -2646,6 +2655,7 @@ mod tests {
             repo: Arc::new(PartialInsertRepo { persisted: 1 }),
             bearer: Arc::new(RefuseEverythingBearer),
             scope_authority: Arc::new(RefuseEverythingScopeAuthority),
+            ingest_principals: std::collections::HashMap::default(),
         };
         let events = vec![base_usage_event(), base_usage_event()];
 
