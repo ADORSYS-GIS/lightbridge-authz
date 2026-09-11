@@ -401,9 +401,15 @@ async fn replay_batch_aborts_on_first_failure_under_concurrency() {
         .await
         .expect_err("a failing object must abort the batch under concurrency");
     assert!(err.to_string().contains("503"), "got: {err}");
-    // Both trace objects succeed; at least one log object hits the failing route before the
-    // batch aborts (how many is nondeterministic under concurrency).
-    ok.assert_calls(2);
+    // Under concurrency, abort_all() cancels in-flight trace tasks at their next await point
+    // (mid-send/mid-connect), so a trace request may be dropped before the mock records it. How
+    // many trace objects complete before the batch aborts is therefore nondeterministic — at
+    // most the two that were seeded. At least one log object hits the failing route before the
+    // batch aborts (how many is likewise nondeterministic).
+    assert!(
+        ok.calls() <= 2,
+        "at most the two seeded trace objects can complete"
+    );
     assert!(
         fail.calls() >= 1,
         "the failing route must be hit at least once"
