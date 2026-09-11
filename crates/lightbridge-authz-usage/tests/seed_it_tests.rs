@@ -208,7 +208,12 @@ async fn seed_then_query_returns_totals_equal_to_what_was_seeded(pool: PgPool) {
     // 2 hours x 3 projects = 6 points (one per project per bucket).
     assert_eq!(points.len(), 6);
 
-    let total_cost: f64 = points.iter().map(|p| p.total_cost).sum();
+    // Every seeded row carries a cost, so every point must too -- a `None` here would mean the
+    // seed lost a cost, and summing it as 0.0 would hide that.
+    let total_cost: f64 = points
+        .iter()
+        .map(|p| p.total_cost.expect("every seeded point carries a cost"))
+        .sum();
     let total_tokens: i64 = points.iter().map(|p| p.total_tokens).sum();
     let total_requests: i64 = points.iter().map(|p| p.requests).sum();
 

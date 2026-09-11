@@ -293,7 +293,7 @@ Each point is an aggregate across matching `usage_events` rows for:
 | `billing_plan` | string or null | yes | Present when `group_by` includes `billing_plan`, else null (#648).
 | `requests` | int64 | yes | `SUM(request_count)`.
 | `usage_value` | float64 | yes | `SUM(usage_value)`.
-| `total_cost` | float64 | yes | `SUM(total_cost)`.
+| `total_cost` | float64 or null | yes | `SUM(total_cost)`. `null` when no row in this bucket carried a cost -- never `0.0`, because "cost unknown" and "cost was zero" are different facts (governance#188). |
 | `prompt_tokens` | int64 | yes | `SUM(prompt_tokens)`.
 | `completion_tokens` | int64 | yes | `SUM(completion_tokens)`.
 | `total_tokens` | int64 | yes | `SUM(total_tokens)`.
