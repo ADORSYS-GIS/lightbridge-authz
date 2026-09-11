@@ -446,10 +446,18 @@ async fn query_usage_serializes_null_total_cost_as_null_not_zero() {
     assert_eq!(response.status(), StatusCode::OK);
 
     let body = body_json(response).await;
+    let point = body["points"][0]
+        .as_object()
+        .expect("points[0] must be an object");
+    // `Map::get` (unlike serde_json's `Index`) returns `None` for a MISSING key, so this
+    // distinguishes "serialized as an explicit null" from "omitted entirely". A future
+    // `#[serde(skip_serializing_if = "Option::is_none")]` on `total_cost` would silently drop
+    // the field -- reverting the wire contract this PR introduces -- and must fail here, not
+    // pass as a null.
     assert_eq!(
-        body["points"][0]["total_cost"],
-        serde_json::Value::Null,
-        "total_cost must serialize as null on the wire, not 0.0"
+        point.get("total_cost"),
+        Some(&serde_json::Value::Null),
+        "total_cost must be present and serialize as null on the wire, not 0.0"
     );
 
     let payload: UsageQueryResponse =
