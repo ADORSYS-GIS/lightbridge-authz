@@ -21,6 +21,7 @@ use tower::ServiceExt;
 #[derive(Debug, Default)]
 struct MockUsageRepo {
     pub inserted_events: std::sync::Mutex<usize>,
+    pub captured: std::sync::Mutex<Vec<UsageEvent>>,
 }
 
 #[async_trait]
@@ -31,6 +32,7 @@ impl UsageRepoTrait for MockUsageRepo {
     ) -> lightbridge_authz_core::Result<usize> {
         let count = events.len();
         *self.inserted_events.lock().unwrap() += count;
+        self.captured.lock().unwrap().extend_from_slice(events);
         Ok(count)
     }
 
@@ -115,15 +117,25 @@ fn build_router(
     bearer: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait>,
     principals: HashMap<String, String>,
 ) -> axum::Router {
+    build_router_with_capture(bearer, principals).0
+}
+
+/// Like `build_router` but also returns an `Arc<MockUsageRepo>` that stays alive after the
+/// router is consumed, so tests can inspect the events that were stored during the request.
+fn build_router_with_capture(
+    bearer: Arc<dyn lightbridge_authz_bearer::BearerTokenServiceTrait>,
+    principals: HashMap<String, String>,
+) -> (axum::Router, Arc<MockUsageRepo>) {
     let repo = Arc::new(MockUsageRepo::default());
+    let repo_ref = Arc::clone(&repo);
     let state = Arc::new(UsageState {
         repo,
         bearer,
         scope_authority: support::refuse_everything_scope_authority(),
         ingest_principals: principals,
     });
-
-    build_ingest_router(state, Arc::new(DummyDbPool), false, true)
+    let router = build_ingest_router(state, Arc::new(DummyDbPool), false, true);
+    (router, repo_ref)
 }
 
 struct CustomBearer {
@@ -345,8 +357,18 @@ async fn valid_auth_and_source_returns_202() {
     assert_eq!(response.status(), StatusCode::ACCEPTED);
 }
 
+/// `check_payload_identity_mismatch` has an observable contract: the mismatched batch is
+/// accepted (not rejected), the event IS stored (not silently dropped), `event.source` carries
+/// the authoritative X-Source value ("claude-code"), and the raw payload attribute
+/// `governance.source` passes through into the stored event unchanged ("codex").
+///
+/// This test fails if:
+/// - mismatched events are rejected → status ≠ 202
+/// - mismatched events are silently dropped → captured.len() == 0
+/// - `check_payload_identity_mismatch` rewrites the attribute → attributes["governance.source"] == "claude-code"
+/// - `event.source` is taken from the payload rather than the trusted header → source == "codex"
 #[tokio::test]
-async fn payload_source_mismatch_still_accepts_but_warns() {
+async fn payload_source_mismatch_accepts_stores_and_preserves_raw_attributes() {
     let bearer = custom_bearer(
         "valid-token",
         "svc:collector-claude",
@@ -358,7 +380,7 @@ async fn payload_source_mismatch_still_accepts_but_warns() {
         "claude-code".to_string(),
     );
 
-    let router = build_router(bearer, principals);
+    let (router, repo) = build_router_with_capture(bearer, principals);
 
     let request = Request::builder()
         .method("POST")
@@ -366,13 +388,38 @@ async fn payload_source_mismatch_still_accepts_but_warns() {
         .header(header::AUTHORIZATION, "Bearer valid-token")
         .header("X-Source", "claude-code")
         .header(header::CONTENT_TYPE, "application/x-protobuf")
-        // The payload contains source 'codex', but X-Source is 'claude-code'
         .body(Body::from(valid_payload_with_source("codex")))
         .unwrap();
 
     let response = router.oneshot(request).await.unwrap();
-    // It should be accepted (202), and log a warning (verified by visual inspection or logs)
-    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        response.status(),
+        StatusCode::ACCEPTED,
+        "a payload whose internal governance.source mismatches X-Source must be accepted, not rejected"
+    );
+
+    let captured = repo.captured.lock().unwrap();
+    assert_eq!(
+        captured.len(),
+        1,
+        "mismatched batch must be stored, not silently dropped"
+    );
+
+    let event = &captured[0];
+    assert_eq!(
+        event.source.as_deref(),
+        Some("claude-code"),
+        "event.source must be the trusted X-Source value, not the payload-internal attribute"
+    );
+    assert_eq!(
+        event
+            .attributes
+            .get("governance.source")
+            .and_then(|v| v.as_str()),
+        Some("codex"),
+        "the raw payload governance.source attribute must pass through into the stored event \
+         unchanged; check_payload_identity_mismatch must not rewrite it"
+    );
 }
 
 /// Proves the `caller_kind == SERVICE_CALLER_KIND` guard on line 65 of `auth_ingest.rs`
