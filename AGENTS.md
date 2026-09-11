@@ -537,6 +537,19 @@ read, never rewritten, never regenerated into our own format.
 - **Never sort or paginate by id** — CUID2 has no ordering. Use `created_at`.
 - **Store as `TEXT`**; no native `uuid` columns, no `DEFAULT gen_random_uuid()`.
 
+**One deliberate exception, documented here so it is not "fixed" by accident:** the execution
+grain's ids in the usage store (`usage_executions.id = exec_{source}_{trace_id}_{span_id}`,
+`usage_model_calls.id = {source}_{trace_id}_{span_id}:mc`,
+`usage_tool_calls.id = {source}_{trace_id}_{span_id}:tc`, #582) are **span-derived, not CUID2**.
+This is required, not a lapse: OTLP exports child spans before their parent execution span, so
+ingest must be able to derive a child's `execution_id` from the child's `parent_span_id` *before
+the parent row exists* — a minted CUID2 would be unknowable to the child. The span-derived id is
+what makes the child-before-parent link (and the stub-execution contract) work. The id embeds
+`source`, `trace_id` AND `span_id` (an OTLP `span_id` is only unique within a trace, and
+`trace_id` only within a source), and the dedup key `UNIQUE (source, trace_id, span_id)` is
+deliberately bijective with it. Do not "fix" these to `cuid2()` without first solving the
+child-before-parent linking problem; see the `20260907000002_usage_executions.sql` header.
+
 ### Service Responsibilities
 
 - CRUD API (`authz-api`)
@@ -880,7 +893,7 @@ These tests include:
 
 ### Persistence tests (it-tests)
 
-The Postgres-backed `lightbridge-authz-api-key` tests (rotate/limits), `lightbridge-authz-budget` tests (ledger writes, replay, policy store, refill/review services), and `lightbridge-authz-usage-rest` tests (`repo_it_tests`, `spend_query_it_tests`, `scope_ownership_it_tests`) are guarded by the `it-tests` feature so they only compile/run when requested. This keeps the default `cargo test` free of database setup, and lets us treat these as Docker-backed integration tests.
+The Postgres-backed `lightbridge-authz-api-key` tests (rotate/limits), `lightbridge-authz-budget` tests (ledger writes, replay, policy store, refill/review services), and `lightbridge-authz-usage-rest` tests (`repo_it_tests`, `spend_query_it_tests`, `scope_ownership_it_tests`, `seed_it_tests` — the last the #528 seed-then-query roundtrip proof) are guarded by the `it-tests` feature so they only compile/run when requested. This keeps the default `cargo test` free of database setup, and lets us treat these as Docker-backed integration tests.
 
 Run them with `just it-tests`, which brings up the `postgresql`/`redis` services, waits a moment, then sets `DATABASE_URL="postgres://postgres:postgres@localhost:5432/lightbridge_authz"` before invoking `lightbridge-authz-api-key`, `lightbridge-authz-budget`, `lightbridge-authz-rest`, and `lightbridge-authz-usage-rest` with `--features it-tests`. These tests exercise the migrations under `sqlx::test` — `lightbridge-authz-usage-rest`'s own migrations under `migrations-usage/` are deliberately written to run against this same plain Postgres, not a dedicated TimescaleDB (production runs plain Postgres today; Timescale-shaped CI is deferred to a later phase of #581, gated on that epic's storage-image decision).
 
@@ -1089,12 +1102,19 @@ hand-written SQL and direct `sqlx` dependencies.
     code/client/redirect binding is an authentication boundary that generated CRUD cannot express
     (ADR-0019, #425; `consume_authorization_code` in
     `crates/lightbridge-authz-api-key/src/repo.rs`).
-  - `lightbridge-authz-usage`: dynamic `QueryBuilder` aggregates against the plain-Postgres
-    `usage_events` table (`query_usage` in `crates/lightbridge-authz-usage/src/repo.rs`), plus the
-    hand-written retention/rollup statements in `crates/lightbridge-authz-usage/src/retention.rs`
+  - `lightbridge-authz-usage`: dynamic `QueryBuilder` aggregates against the `usage_events` table
+    (`query_usage` in `crates/lightbridge-authz-usage/src/repo.rs`), plus the hand-written
+    retention/rollup statements in `crates/lightbridge-authz-usage/src/retention.rs`
     (`ROLLUP_AND_PURGE_SQL`/`ROLLUP_PURGE_SQL` -- a `DELETE ... RETURNING` feeding an
     `INSERT ... SELECT ... ON CONFLICT DO UPDATE` that generated CRUD cannot express) and the
     `spend_for_account` UNION ALL over `usage_events`/`usage_events_daily` (same file).
+    `usage_events` is declared a Timescale hypertable (`create_hypertable` in the init migration)
+    but degrades to plain Postgres -- production runs plain Postgres today (#549 Finding 2).
+  - `usage_day_facts` / `usage_seat_snapshots` (#583): same class as `usage_events` — TimescaleDB
+    hypertables with upsert-on-natural-key semantics. Cratestack's generated CRUD cannot express
+    `create_hypertable`, `add_retention_policy`, `add_compression_policy`, or `ON CONFLICT
+    (composite, including partition column) DO UPDATE`. Justified in the migration headers as an
+    ADR-0038 exception per the grain-partitioned time-series + CAS/upsert exception class.
   - `federated_identities`: deliberately ABSENT from `authz.cstack` entirely, not merely
     `@@allow`-less -- it carries the sealed Keycloak token envelope, so a credential-bearing table
     must be unreachable from any generated read path, not just gated behind the coarse-RBAC check
@@ -1138,6 +1158,11 @@ hand-written SQL and direct `sqlx` dependencies.
     generated CRUD cannot express -- the same exception class as `authorization_codes`
     (`migrations/20260827000001_secret_claims.sql`; `consume_secret_claim` in
     `crates/lightbridge-authz-api-key/src/repo.rs`).
+  - the execution grain (`usage_executions`, `usage_model_calls`, `usage_tool_calls`, plus the
+    `usage_identities` side table, #582): grain-partitioned time-series with CAS/upsert
+    (`ON CONFLICT`) semantics that generated CRUD cannot express, in the usage DB which is
+    already hand-written SQL (see `usage_events`). Same exception class as `secret_claims`;
+    justified in each migration header under `migrations-usage/2026090700000{1,2,3,4}_*.sql`.
 - This repo runs cratestack (`cratestack-pg`) `=0.10.0` (pinned exactly in the root `Cargo.toml`,
   which also documents why the pin cannot float past it -- see that file's `cratestack-core =
   "=0.10.0"` block); ADR-0038's capability findings were verified against 0.7.8. Re-verify any

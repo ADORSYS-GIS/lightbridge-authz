@@ -529,6 +529,7 @@ scope for #401.
 | `account:update`  | `procedure.updateAccountDefaultQuota`, `procedure.updateAccountName` | `update-account`, `update-account-name` |
 | `account:delete`  | `procedure.deleteAccountPermanently`                 | `delete-account`                    |
 | `account:disable` | `procedure.disableAccount`, `procedure.enableAccount`| `disable-account`, `enable-account` |
+| `account:provision` | `procedure.provisionAccount`                       | `provision-account`                 |
 | `project:create`  | `model.Project.create`                               | `create-project`                    |
 | `project:read`    | `model.Project.list`, `model.Project.get`            | `list-projects`, `get-project`      |
 | `project:update`  | `model.Project.update`, `procedure.setDefaultProject`, `procedure.listModelCatalog`, `procedure.setProjectQuota`, `procedure.setProjectAllowedModels`, `procedure.setProjectModelPolicy` | `update-project`, `set-default-project`, `list-model-catalog`, `set-project-quota`, `set-project-allowed-models`, `set-project-model-policy` |
@@ -804,6 +805,34 @@ Every generic `model.Session.*` verb stays denied unconditionally — `model.Ses
 `create`/`update`/`delete` have no entry in `MAPPED_OP_ID_PERMISSIONS`, and an op-id that map does
 not list is refused before dispatch. The `@@allow("read", ...)` clause above exists solely so that
 `querySessions`' internal `db.session()` read is scoped by it.
+
+### Account provisioning
+
+`account:create` (`procedure.createAccount`) is self-service only — it mints an account for
+`auth().id`, the caller's own identity; there is no subject field on its input at all, so it is
+structurally incapable of targeting anyone but the caller (same shape as `revokeOwnSessions`
+above). This leaves no way for anyone to give a *different*, brand-new Keycloak subject their first
+account: `authz-idp`'s `/idp/callback` refuses to complete sign-in for a subject with no `accounts`
+row (ADR-0024's 2026-08-25 correction removed the old mint-on-login branch), and ADR-0025's
+`NoAccount` self-service bootstrap fallback — a brand-new subject's own raw Keycloak bearer token
+calling `createAccount` directly — turns out to be unreachable in production, since `authz-api`'s
+bearer middleware there validates against `authz-idp`'s own JWKS, not Keycloak's. Before
+`provisionAccount` existed, the only remedy was a manual SQL `INSERT` against production
+([#720](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/720)).
+
+**`procedure.provisionAccount`** (gated `account:provision`, admin-only via `lightbridge-admin`'s
+`*` — never granted to `lightbridge-editor`/`lightbridge-viewer`, unlike `account:create`) is the
+offboarding kill switch's mirror image at onboarding time: an operator supplies `{subject, email,
+name?}` and gets back the new `Account`. Same shape as `revokeSubjectSessions` — `@allow(auth() !=
+null)` only in the schema, no per-tenant ownership relation between an admin and an arbitrary
+target subject for a schema `@@allow` to check, so the entire authorization story is the RBAC gate.
+Unlike `createAccount`, a second call for a subject that already has an account is
+`Error::Conflict`, not a new row — `provisionAccount` only ever creates the FIRST (anchor) account
+for a subject, matching the `accounts.id == subject` invariant `federated_identities` adoption
+depends on. It also creates the account's mandatory default `projects` row in the same
+transaction — an account with no `is_default` project still dead-ends the browser SSO callback one
+step later (`find_default_project_id`), so provisioning the account alone would not actually
+unblock sign-in; `email` becomes that project's `billing_identity`.
 
 ### Budget policy lifecycle (ADR-0007)
 

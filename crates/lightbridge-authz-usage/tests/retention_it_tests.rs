@@ -30,6 +30,7 @@ fn event_with_cost(
     UsageEvent {
         observed_at,
         signal_type: "trace".to_string(),
+        source: None,
         account_id: Some(account_id.to_string()),
         project_id: Some("proj_1".to_string()),
         api_key_id: None,
@@ -62,6 +63,7 @@ fn event_with_tokens(
     UsageEvent {
         observed_at,
         signal_type: "trace".to_string(),
+        source: None,
         account_id: Some(account_id.to_string()),
         project_id: Some("proj_1".to_string()),
         api_key_id: None,

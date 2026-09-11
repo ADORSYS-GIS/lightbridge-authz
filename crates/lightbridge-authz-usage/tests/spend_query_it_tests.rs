@@ -48,6 +48,7 @@ fn sample_event(account_id: &str, observed_at: DateTime<Utc>, total_cost: f64) -
     UsageEvent {
         observed_at,
         signal_type: "trace".to_string(),
+        source: Some("eaig".to_string()),
         account_id: Some(account_id.to_string()),
         project_id: None,
         api_key_id: None,

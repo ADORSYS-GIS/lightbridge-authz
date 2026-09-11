@@ -11,6 +11,7 @@ use tracing::{debug, instrument};
 pub struct UsageEvent {
     pub observed_at: DateTime<Utc>,
     pub signal_type: String,
+    pub source: Option<String>,
     pub account_id: Option<String>,
     pub project_id: Option<String>,
     pub api_key_id: Option<String>,
@@ -64,6 +65,7 @@ struct UsageQueryRow {
     model: Option<String>,
     metric_name: Option<String>,
     signal_type: Option<String>,
+    source: Option<String>,
     azp: Option<String>,
     operation: Option<String>,
     billing_plan: Option<String>,
@@ -109,12 +111,13 @@ impl StoreRepo {
         }
 
         let mut builder = QueryBuilder::<Postgres>::new(
-            "INSERT INTO usage_events (observed_at, signal_type, account_id, project_id, api_key_id, user_id, user_name, model, metric_name, azp, operation, billing_plan, usage_value, request_count, prompt_tokens, completion_tokens, total_tokens, total_cost, latency_ms) ",
+            "INSERT INTO usage_events (observed_at, signal_type, source, account_id, project_id, api_key_id, user_id, user_name, model, metric_name, azp, operation, billing_plan, usage_value, request_count, prompt_tokens, completion_tokens, total_tokens, total_cost, latency_ms) ",
         );
 
         builder.push_values(events, |mut row, event| {
             row.push_bind(event.observed_at)
                 .push_bind(&event.signal_type)
+                .push_bind(&event.source)
                 .push_bind(&event.account_id)
                 .push_bind(&event.project_id)
                 .push_bind(&event.api_key_id)
@@ -269,6 +272,7 @@ impl StoreRepo {
                 model: row.model,
                 metric_name: row.metric_name,
                 signal_type: row.signal_type,
+                source: row.source,
                 azp: row.azp,
                 operation: row.operation,
                 billing_plan: row.billing_plan,
@@ -291,7 +295,7 @@ impl StoreRepo {
 
 /// Every dimension column `usage_events` can be grouped by, in the fixed order the `SELECT` list
 /// and the `ORDER BY` tiebreaker both use. One list, so the two can never drift apart.
-const DIMENSION_COLUMNS: [(UsageGroupBy, &str); 11] = [
+const DIMENSION_COLUMNS: [(UsageGroupBy, &str); 12] = [
     (UsageGroupBy::AccountId, "account_id"),
     (UsageGroupBy::ProjectId, "project_id"),
     (UsageGroupBy::ApiKeyId, "api_key_id"),
@@ -300,6 +304,7 @@ const DIMENSION_COLUMNS: [(UsageGroupBy, &str); 11] = [
     (UsageGroupBy::Model, "model"),
     (UsageGroupBy::MetricName, "metric_name"),
     (UsageGroupBy::SignalType, "signal_type"),
+    (UsageGroupBy::Source, "source"),
     (UsageGroupBy::Azp, "azp"),
     (UsageGroupBy::Operation, "operation"),
     (UsageGroupBy::BillingPlan, "billing_plan"),
@@ -361,7 +366,7 @@ fn build_usage_query(input: &UsageQueryRequest) -> QueryBuilder<Postgres> {
 
     // Level 0: the aggregation itself -- the only thing that touches `usage_events`.
     let mut builder = QueryBuilder::<Postgres>::new(
-        "SELECT counted.bucket_start, counted.account_id, counted.project_id, counted.api_key_id, counted.user_id, counted.user_name, counted.model, counted.metric_name, counted.signal_type, counted.azp, counted.operation, counted.billing_plan, counted.requests, counted.usage_value, counted.prompt_tokens, counted.completion_tokens, counted.total_tokens, counted.total_cost, counted.latency_samples, ",
+        "SELECT counted.bucket_start, counted.account_id, counted.project_id, counted.api_key_id, counted.user_id, counted.user_name, counted.model, counted.metric_name, counted.signal_type, counted.source, counted.azp, counted.operation, counted.billing_plan, counted.requests, counted.usage_value, counted.prompt_tokens, counted.completion_tokens, counted.total_tokens, counted.total_cost, counted.latency_samples, ",
     );
     if with_percentiles {
         builder.push("counted.latency_percentiles[1]::double precision AS latency_p50_ms, counted.latency_percentiles[2]::double precision AS latency_p95_ms, counted.latency_percentiles[3]::double precision AS latency_p99_ms, ");
@@ -495,6 +500,10 @@ fn push_scope_filters(builder: &mut QueryBuilder<Postgres>, input: &UsageQueryRe
     if let Some(signal_type) = &input.filters.signal_type {
         builder.push(" AND signal_type = ");
         builder.push_bind(signal_type);
+    }
+    if let Some(source) = &input.filters.source {
+        builder.push(" AND source = ");
+        builder.push_bind(source);
     }
     if let Some(azp) = &input.filters.azp {
         builder.push(" AND azp = ");

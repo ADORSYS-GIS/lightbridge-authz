@@ -3,6 +3,8 @@ use lightbridge_authz_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+pub mod day_seat;
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct IngestResponse {
     pub accepted_events: usize,
@@ -163,6 +165,8 @@ pub enum UsageGroupBy {
     Model,
     MetricName,
     SignalType,
+    /// Which emitter the telemetry came from (`usage_events.source` -- eaig, claude-code, …).
+    Source,
     /// The OAuth client (`azp` claim) the request arrived on -- "which channel" (#648).
     Azp,
     /// Which API surface was called, from the closed [`USAGE_OPERATIONS`] vocabulary (#648).
@@ -181,6 +185,8 @@ pub struct UsageQueryFilters {
     pub model: Option<String>,
     pub metric_name: Option<String>,
     pub signal_type: Option<String>,
+    /// Equality filter on `usage_events.source`.
+    pub source: Option<String>,
     /// Equality filter on `usage_events.azp` (#648).
     pub azp: Option<String>,
     /// Equality filter on `usage_events.operation` (#648). For "any of several operations" use
@@ -267,6 +273,9 @@ pub struct UsageSeriesPoint {
     pub model: Option<String>,
     pub metric_name: Option<String>,
     pub signal_type: Option<String>,
+    /// The emitter this bucket's telemetry came from (`usage_events.source`). Present when
+    /// `group_by` includes `source`, `null` otherwise.
+    pub source: Option<String>,
     /// The OAuth client the requests in this bucket arrived on. Present when `group_by` includes
     /// `azp`, `null` otherwise -- exactly like every other dimension echo here (#648).
     pub azp: Option<String>,

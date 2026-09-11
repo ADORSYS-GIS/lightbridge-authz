@@ -52,6 +52,7 @@ fn sample_event(account_id: &str, project_id: &str, observed_at: DateTime<Utc>) 
     UsageEvent {
         observed_at,
         signal_type: "trace".to_string(),
+        source: Some("eaig".to_string()),
         account_id: Some(account_id.to_string()),
         project_id: Some(project_id.to_string()),
         api_key_id: Some("key_1".to_string()),
@@ -442,6 +443,7 @@ fn sample_event_for_user(user_id: &str, observed_at: DateTime<Utc>) -> UsageEven
     UsageEvent {
         observed_at,
         signal_type: "trace".to_string(),
+        source: Some("eaig".to_string()),
         account_id: Some("acct-tenant-a".to_string()),
         project_id: Some("proj-tenant-a".to_string()),
         api_key_id: Some("key_1".to_string()),

@@ -299,7 +299,7 @@ Permissions are **not** a second table here: `mcp_rbac::tool_gate` maps a tool t
 build when a reachable RPC op-id has no tool, when a tool's gate differs from the REST permission
 for its op-id, or when a tool claims an op-id the REST surface fail-closes.
 
-**The surface is 70 tools** (#670): all **68** reachable RPC op-ids — it was 31 of 68 — plus the two
+**The surface is 71 tools** (#720 added `provision-account`; was 70 as of #670): all **69** reachable RPC op-ids — it was 31 of 68 at #670 — plus the two
 MCP-only validation tools (`validate-api-key`, `validate-authorino-api-key`), which have no RPC twin
 and are enumerated at `apikey:validate` in `mcp_rbac::MCP_ONLY_TOOL_PERMISSIONS`
 (`app/lightbridge-authz/src/mcp_rbac.rs:92`). `mcp_rbac::gated_tools()` (`:114`) is the single

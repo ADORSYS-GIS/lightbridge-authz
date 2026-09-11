@@ -21,6 +21,10 @@
 use crate::mcp_procedure_tool::procedure_tools;
 
 procedure_tools! {
+    // --- Accounts (#720, crud) -------------------------------------------------------------------
+    "provision-account" => provision_account,
+        "Create an account for an arbitrary Keycloak subject who cannot self-provision one (admin)";
+
     // --- Catalogues and self-scoped api-key reads (crud) ---------------------------------------
     "list-billing-plans" => list_billing_plans,
         "List the operator-configured billing plan ids a new API key may be created against";

@@ -143,7 +143,8 @@ runs:
         CARGO_INCREMENTAL: "0"
 
     # lightbridge-authz-usage-rest's own ephemeral sqlx::test suite (repo_it_tests.rs,
-    # spend_query_it_tests.rs, scope_ownership_it_tests.rs, retention_it_tests.rs -- #570/#578/#549)
+    # spend_query_it_tests.rs, scope_ownership_it_tests.rs, retention_it_tests.rs, seed_it_tests.rs,
+    # execution_grain_it_tests.rs, day_seat_grain_it_tests.rs -- #570/#578/#549/#528/#582/#583)
     # against the SAME plain
     # Postgres container as the step above -- not a dedicated TimescaleDB.
     # `migrations-usage/20260829000001_usage_event_latency.sql` is
@@ -153,17 +154,20 @@ runs:
     # cost of an extra 2.4 GB pull and ~690 MiB idle RSS inside this OOM-sensitive build job, so it
     # bought nothing. Timescale-shaped CI is deferred to the epic's Phase 1 storage rewrite, gated
     # on the #581 D1 image decision -- do not reintroduce a Timescale container here before that
-    # lands. `#[sqlx::test]` creates its own ephemeral DB per test, so this collides with neither
-    # the shared `lightbridge_authz` database the step above uses nor with itself across the two
-    # binaries.
+    # lands. `day_seat_grain_it_tests.rs` was previously registered in Cargo.toml but never wired
+    # into any CI job -- none of its assertions ran anywhere until this step; 4 of its 19 tests
+    # are `#[ignore]`d because they need real Timescale, and the step below asserts the ignored
+    # count stays exactly 4 so that status can't silently drift. `#[sqlx::test]` creates its own
+    # ephemeral DB per test, so this collides with neither the shared `lightbridge_authz` database
+    # the step above uses nor with itself across the six binaries.
     #
-    # Test targets are named explicitly (one `--test` flag per binary, run as three SEPARATE
+    # Test targets are named explicitly (one `--test` flag per binary, run as six SEPARATE
     # `cargo test` invocations below) rather than `--tests`, for three reasons: it avoids
     # re-running the 88 non-DB-gated tests in this crate's lib target and `usage_tests.rs` that
     # `cargo test --workspace` already ran above; it makes a broken `--features`/
     # `required-features` wiring a hard `cargo` error (exit 101, "requires the features:
     # `it-tests`") instead of cargo silently matching zero targets; and running each binary as its
-    # own invocation makes the `0 passed` guard PER-BINARY, not aggregated across all three. An
+    # own invocation makes the `0 passed` guard PER-BINARY, not aggregated across all six. An
     # aggregate guard is unsound the moment there are 2+ binaries: one binary silently reporting
     # "0 tests, exit 0" (the residual silent-skip case a hard cargo error can't catch -- an inner
     # `#![cfg(feature = "it-tests")]` guard surviving after `required-features` is removed from
@@ -236,6 +240,81 @@ runs:
         echo "retention_it_tests passed: ${passed:-0}"
         if [ -z "${passed}" ] || [ "${passed}" -eq 0 ]; then
           echo "::error::retention_it_tests reported 0 passed tests -- a skip is not a pass."
+          exit 1
+        fi
+      env:
+        DATABASE_URL: ${{ inputs.database-url }}
+        CARGO_BUILD_JOBS: "2"
+        CARGO_INCREMENTAL: "0"
+
+    # The automated proof for lightbridge-authz#528's Test Plan ("seed, then query through the API
+    # and assert returned totals equal what was seeded"): drives the real OTLP ingest handler with
+    # a deterministic dataset and asserts the query API returns totals equal to what was seeded.
+    # Same per-binary `0 passed` guard as the steps above -- a skipped binary is not a pass.
+    - name: Run it-tests (usage) - seed_it_tests
+      shell: bash
+      run: |
+        set -euo pipefail
+        log_file="$(mktemp)"
+        cargo test -p lightbridge-authz-usage-rest --features it-tests \
+          --test seed_it_tests 2>&1 | tee "${log_file}"
+        passed=$(grep -oE '[0-9]+ passed' "${log_file}" | grep -oE '^[0-9]+' | tail -1 || true)
+        echo "seed_it_tests passed: ${passed:-0}"
+        if [ -z "${passed}" ] || [ "${passed}" -eq 0 ]; then
+          echo "::error::seed_it_tests reported 0 passed tests -- a skip is not a pass."
+          exit 1
+        fi
+      env:
+        DATABASE_URL: ${{ inputs.database-url }}
+        CARGO_BUILD_JOBS: "2"
+        CARGO_INCREMENTAL: "0"
+
+    - name: Run it-tests (usage) - execution_grain_it_tests
+      shell: bash
+      run: |
+        set -euo pipefail
+        log_file="$(mktemp)"
+        cargo test -p lightbridge-authz-usage-rest --features it-tests \
+          --test execution_grain_it_tests 2>&1 | tee "${log_file}"
+        passed=$(grep -oE '[0-9]+ passed' "${log_file}" | grep -oE '^[0-9]+' | tail -1 || true)
+        echo "execution_grain_it_tests passed: ${passed:-0}"
+        if [ -z "${passed}" ] || [ "${passed}" -eq 0 ]; then
+          echo "::error::execution_grain_it_tests reported 0 passed tests -- a skip is not a pass."
+          exit 1
+        fi
+      env:
+        DATABASE_URL: ${{ inputs.database-url }}
+        CARGO_BUILD_JOBS: "2"
+        CARGO_INCREMENTAL: "0"
+
+    # day_seat_grain_it_tests (#583): 4 of its 19 tests are `#[ignore]`d -- they assert real
+    # hypertable/compression/retention behavior that only fires against a Timescale-enabled
+    # Postgres, which this job's plain `docker.io/library/postgres:17` container is not (#549
+    # Finding 2; Timescale-shaped CI is deferred to the #581 D1 image decision, see the note
+    # above this composite's PostgreSQL step). The other 15 need no Timescale-specific behavior
+    # (natural-key upsert, CHECK constraints, NULL-vs-zero) and are real coverage here -- this
+    # binary was previously registered in Cargo.toml but never wired into any CI job at all
+    # (#714 follow-up, 2026-09-09), so none of its assertions -- including #583's own "Test
+    # Expectations" (idempotent-reprocess, zero-DDL-second-source, NULL-money round-trip) -- were
+    # ever actually run anywhere. Asserting the ignored count catches the day this job silently
+    # starts skipping a test that should have stayed un-ignored (or one that was ignored but
+    # should not have been).
+    - name: Run it-tests (usage) - day_seat_grain_it_tests
+      shell: bash
+      run: |
+        set -euo pipefail
+        log_file="$(mktemp)"
+        cargo test -p lightbridge-authz-usage-rest --features it-tests \
+          --test day_seat_grain_it_tests 2>&1 | tee "${log_file}"
+        passed=$(grep -oE '[0-9]+ passed' "${log_file}" | grep -oE '^[0-9]+' | tail -1 || true)
+        ignored=$(grep -oE '[0-9]+ ignored' "${log_file}" | grep -oE '^[0-9]+' | tail -1 || true)
+        echo "day_seat_grain_it_tests passed: ${passed:-0}, ignored: ${ignored:-0}"
+        if [ -z "${passed}" ] || [ "${passed}" -eq 0 ]; then
+          echo "::error::day_seat_grain_it_tests reported 0 passed tests -- a skip is not a pass."
+          exit 1
+        fi
+        if [ "${ignored:-0}" -ne 4 ]; then
+          echo "::error::day_seat_grain_it_tests expected exactly 4 ignored (Timescale-only) tests, got ${ignored:-0} -- a test's #[ignore] status changed without this check being updated."
           exit 1
         fi
       env:

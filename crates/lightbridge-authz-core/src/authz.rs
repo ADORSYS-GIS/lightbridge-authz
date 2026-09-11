@@ -36,6 +36,15 @@ pub enum Permission {
     AccountDelete,
     #[serde(rename = "account:disable")]
     AccountDisable,
+    /// Create an account on behalf of an arbitrary Keycloak subject who cannot self-provision one
+    /// (#720): otherwise-unrecoverable sign-in failure for a subject with no `accounts` row, since
+    /// `authz-idp`'s `/idp/callback` refuses login before an account exists (ADR-0024) and
+    /// ADR-0025's self-service `NoAccount` fallback is unreachable in production. The offboarding
+    /// kill switch's mirror image at onboarding time -- same self/admin shape as
+    /// [`Permission::SessionRevoke`], held only via `lightbridge-admin`'s `*`, never granted to
+    /// `lightbridge-editor`/`lightbridge-viewer` alongside [`Permission::AccountCreate`].
+    #[serde(rename = "account:provision")]
+    AccountProvision,
 
     #[serde(rename = "project:create")]
     ProjectCreate,
@@ -199,12 +208,13 @@ pub enum Permission {
 impl Permission {
     /// Every permission, in declaration order. The single source of truth for wildcard expansion
     /// and documentation.
-    pub const ALL: [Permission; 37] = [
+    pub const ALL: [Permission; 38] = [
         Permission::AccountCreate,
         Permission::AccountRead,
         Permission::AccountUpdate,
         Permission::AccountDelete,
         Permission::AccountDisable,
+        Permission::AccountProvision,
         Permission::ProjectCreate,
         Permission::ProjectRead,
         Permission::ProjectUpdate,
@@ -247,6 +257,7 @@ impl Permission {
             Permission::AccountUpdate => "account:update",
             Permission::AccountDelete => "account:delete",
             Permission::AccountDisable => "account:disable",
+            Permission::AccountProvision => "account:provision",
             Permission::ProjectCreate => "project:create",
             Permission::ProjectRead => "project:read",
             Permission::ProjectUpdate => "project:update",
