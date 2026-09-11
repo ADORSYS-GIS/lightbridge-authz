@@ -16,12 +16,17 @@ use lightbridge_authz_core::{
 use lightbridge_authz_usage_rest::{
     UsageRepoTrait, UsageState, build_ingest_router, build_query_router,
     handlers::{
+        execution::query_executions,
         ingest::{ingest_logs, ingest_metrics, ingest_traces},
         query::query_usage,
     },
     models::{
         UsageGroupBy, UsageQueryFilters, UsageQueryRequest, UsageQueryResponse, UsageScope,
         UsageSeriesPoint,
+        execution::{
+            ExecutionQueryFilters, ExecutionQueryRequest, ExecutionQueryResponse,
+            ExecutionSeriesPoint,
+        },
     },
     repo::{StoreRepo, UsageEvent},
 };
@@ -48,6 +53,8 @@ struct MockUsageRepo {
     inserted_events: usize,
     spend: Option<f64>,
     truncated: bool,
+    execution_points: Vec<ExecutionSeriesPoint>,
+    execution_truncated: bool,
 }
 
 #[async_trait]
@@ -61,6 +68,13 @@ impl UsageRepoTrait for MockUsageRepo {
         _input: &UsageQueryRequest,
     ) -> Result<(Vec<UsageSeriesPoint>, bool)> {
         Ok((self.points.clone(), self.truncated))
+    }
+
+    async fn query_executions(
+        &self,
+        _input: &ExecutionQueryRequest,
+    ) -> Result<(Vec<ExecutionSeriesPoint>, bool)> {
+        Ok((self.execution_points.clone(), self.execution_truncated))
     }
 
     async fn spend_for_account(
@@ -107,6 +121,8 @@ fn mock_state() -> Arc<UsageState> {
             inserted_events: 0,
             spend: None,
             truncated: false,
+            execution_points: vec![],
+            execution_truncated: false,
         }),
         bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
         scope_authority: Arc::new(support::FakeScopeAuthority::new().authorizing(
@@ -376,6 +392,8 @@ async fn query_usage_returns_timeseries_points_when_query_is_valid() {
             }],
             spend: None,
             truncated: false,
+            execution_points: vec![],
+            execution_truncated: false,
         }),
         bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
         scope_authority: Arc::new(support::FakeScopeAuthority::new().authorizing(
@@ -518,6 +536,8 @@ async fn query_usage_refuses_when_scope_authority_declines() {
             inserted_events: 0,
             spend: None,
             truncated: false,
+            execution_points: vec![],
+            execution_truncated: false,
         }),
         bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
         scope_authority: support::refuse_everything_scope_authority(),
@@ -579,6 +599,8 @@ async fn query_usage_allows_own_user_scope() {
             inserted_events: 0,
             spend: None,
             truncated: false,
+            execution_points: vec![],
+            execution_truncated: false,
         }),
         bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
         scope_authority: support::refuse_everything_scope_authority(),
@@ -692,6 +714,161 @@ async fn query_usage_all_scope_does_not_require_scope_id() {
     );
 }
 
+fn execution_request(scope: UsageScope, scope_id: &str) -> ExecutionQueryRequest {
+    ExecutionQueryRequest {
+        scope,
+        scope_id: scope_id.to_string(),
+        start_time: Utc::now() - Duration::hours(1),
+        end_time: Utc::now(),
+        bucket: "5 minutes".to_string(),
+        filters: ExecutionQueryFilters::default(),
+        group_by: vec![],
+        limit: 100,
+    }
+}
+
+async fn call_query_executions(
+    state: Arc<UsageState>,
+    headers: HeaderMap,
+    req: ExecutionQueryRequest,
+) -> axum::response::Response {
+    query_executions(axum::extract::State(state), headers, Json(req))
+        .await
+        .expect("handler should not propagate an Err for an auth refusal")
+}
+
+/// #726: a valid `scope=user` self-ownership query returns `200` with the repo's points.
+#[tokio::test]
+async fn query_executions_returns_points_when_valid() {
+    let state = Arc::new(UsageState {
+        repo: Arc::new(MockUsageRepo {
+            execution_points: vec![ExecutionSeriesPoint {
+                bucket_start: Utc::now(),
+                source: Some("claude_code".to_string()),
+                model: Some("claude-sonnet-4-5".to_string()),
+                provider: Some("anthropic".to_string()),
+                executions_count: 1,
+                total_duration_ms: 1200,
+                total_cost: Some(5000),
+                total_input_tokens: 1200,
+                total_output_tokens: 400,
+                tool_call_count: 2,
+            }],
+            execution_truncated: false,
+            ..Default::default()
+        }),
+        bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
+        scope_authority: support::refuse_everything_scope_authority(),
+    });
+
+    let response = call_query_executions(
+        state,
+        authorized_headers(),
+        execution_request(UsageScope::User, TEST_SUBJECT),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: ExecutionQueryResponse = serde_json::from_value(body_json(response).await)
+        .expect("response body must decode as ExecutionQueryResponse");
+    assert_eq!(payload.points.len(), 1);
+    assert_eq!(payload.points[0].executions_count, 1);
+    assert!(!payload.truncated);
+}
+
+/// #726: a missing bearer token is `401`, before any body validation.
+#[tokio::test]
+async fn query_executions_refuses_missing_bearer_with_401() {
+    let response = call_query_executions(
+        mock_state(),
+        HeaderMap::new(),
+        execution_request(UsageScope::User, TEST_SUBJECT),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// #726: `scope=user` for a subject OTHER than the caller's own is `403`, even when the authority
+/// would authorize everything (self-ownership is decided from the token, never delegated).
+#[tokio::test]
+async fn query_executions_refuses_other_subjects_user_scope_with_403() {
+    let state = Arc::new(UsageState {
+        repo: Arc::new(MockUsageRepo::default()),
+        bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
+        scope_authority: Arc::new(AuthorizeEverything),
+    });
+
+    let response = call_query_executions(
+        state,
+        authorized_headers(),
+        execution_request(UsageScope::User, "someone-else"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(response).await, serde_json::Value::Null);
+}
+
+/// #726: `scope=account` is not applicable to the execution grain and is `400`.
+#[tokio::test]
+async fn query_executions_rejects_account_scope_with_400() {
+    let state = Arc::new(UsageState {
+        repo: Arc::new(MockUsageRepo::default()),
+        bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
+        scope_authority: Arc::new(AuthorizeEverything),
+    });
+
+    let result = query_executions(
+        axum::extract::State(state),
+        authorized_headers(),
+        Json(execution_request(UsageScope::Account, "acct-1")),
+    )
+    .await;
+    assert!(
+        matches!(result, Err(Error::BadRequest(_))),
+        "scope=account must be a 400 for the execution grain"
+    );
+}
+
+/// #726: `total_cost: null` survives serialization as `null`, never `0` (governance#188).
+#[tokio::test]
+async fn query_executions_null_cost_serializes_as_null() {
+    let state = Arc::new(UsageState {
+        repo: Arc::new(MockUsageRepo {
+            execution_points: vec![ExecutionSeriesPoint {
+                bucket_start: Utc::now(),
+                source: None,
+                model: None,
+                provider: None,
+                executions_count: 1,
+                total_duration_ms: 0,
+                total_cost: None,
+                total_input_tokens: 0,
+                total_output_tokens: 0,
+                tool_call_count: 0,
+            }],
+            execution_truncated: false,
+            ..Default::default()
+        }),
+        bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
+        scope_authority: support::refuse_everything_scope_authority(),
+    });
+
+    let response = call_query_executions(
+        state,
+        authorized_headers(),
+        execution_request(UsageScope::User, TEST_SUBJECT),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let value = body_json(response).await;
+    assert_eq!(
+        value["points"][0]["total_cost"],
+        serde_json::Value::Null,
+        "total_cost: None must serialize as null, never 0"
+    );
+}
+
 /// Serde round-trip for `UsageScope::All` -- the wire representation is `"all"`.
 #[test]
 fn usage_scope_all_serializes_as_lowercase_all() {
@@ -716,6 +893,8 @@ async fn ingest_logs_treats_noop_insert_as_success() {
             inserted_events: 0,
             spend: None,
             truncated: false,
+            execution_points: vec![],
+            execution_truncated: false,
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
@@ -741,6 +920,8 @@ async fn ingest_logs_rejects_invalid_protobuf_as_bad_request() {
             inserted_events: 0,
             spend: None,
             truncated: false,
+            execution_points: vec![],
+            execution_truncated: false,
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
@@ -768,6 +949,8 @@ async fn ingest_logs_rejects_unknown_source() {
             inserted_events: 0,
             spend: None,
             truncated: false,
+            execution_points: vec![],
+            execution_truncated: false,
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
@@ -793,6 +976,8 @@ async fn ingest_logs_rejects_missing_source_header() {
             inserted_events: 0,
             spend: None,
             truncated: false,
+            execution_points: vec![],
+            execution_truncated: false,
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
@@ -935,6 +1120,8 @@ async fn ingest_traces_treats_noop_insert_as_success() {
             inserted_events: 0,
             spend: None,
             truncated: false,
+            execution_points: vec![],
+            execution_truncated: false,
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
@@ -960,6 +1147,8 @@ async fn ingest_traces_rejects_invalid_protobuf_as_bad_request() {
             inserted_events: 0,
             spend: None,
             truncated: false,
+            execution_points: vec![],
+            execution_truncated: false,
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
@@ -987,6 +1176,8 @@ async fn ingest_traces_rejects_unknown_source() {
             inserted_events: 0,
             spend: None,
             truncated: false,
+            execution_points: vec![],
+            execution_truncated: false,
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
@@ -1017,6 +1208,8 @@ async fn ingest_metrics_treats_noop_insert_as_success() {
             inserted_events: 0,
             spend: None,
             truncated: false,
+            execution_points: vec![],
+            execution_truncated: false,
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
@@ -1042,6 +1235,8 @@ async fn ingest_metrics_rejects_invalid_protobuf_as_bad_request() {
             inserted_events: 0,
             spend: None,
             truncated: false,
+            execution_points: vec![],
+            execution_truncated: false,
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
@@ -1069,6 +1264,8 @@ async fn ingest_metrics_rejects_unknown_source() {
             inserted_events: 0,
             spend: None,
             truncated: false,
+            execution_points: vec![],
+            execution_truncated: false,
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
@@ -1099,6 +1296,8 @@ async fn ingest_logs_accepts_json_content_type_payload() {
             inserted_events: 0,
             spend: None,
             truncated: false,
+            execution_points: vec![],
+            execution_truncated: false,
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
@@ -1149,6 +1348,8 @@ async fn ingest_logs_accepts_gzip_encoded_body() {
             inserted_events: 0,
             spend: None,
             truncated: false,
+            execution_points: vec![],
+            execution_truncated: false,
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
@@ -1183,6 +1384,8 @@ async fn ingest_endpoints_reject_missing_or_unknown_x_source_header() {
             inserted_events: 0,
             spend: None,
             truncated: false,
+            execution_points: vec![],
+            execution_truncated: false,
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),

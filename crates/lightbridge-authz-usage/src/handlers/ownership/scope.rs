@@ -23,6 +23,12 @@ pub enum GrainScope {
     /// via JWT subject) and `all` (`usage:read-all` permission) are supported. `account`,
     /// `project`, and `api_key` are rejected with `400`.
     DaySeat,
+    /// The execution grain (`usage_executions` + `usage_model_calls` + `usage_tool_calls`, #726):
+    /// only `user` (self-ownership via JWT subject, resolved through `usage_identities`) and `all`
+    /// (`usage:read-all` permission) are supported. `account`, `project`, and `api_key` are
+    /// rejected with `400` -- this grain has no per-account/per-project/per-key ownership
+    /// authority.
+    Execution,
 }
 
 /// Outcome of scope authorization. The caller matches on this to decide whether to proceed with
@@ -46,14 +52,14 @@ pub enum ScopeAuthOutcome {
 /// - `all`: requires `usage:read-all` permission.
 /// - `account`/`project`: remote scope-authority check, or `usage:read-all` bypass (#648).
 ///
-/// For `GrainScope::DaySeat`:
+/// For `GrainScope::DaySeat` and `GrainScope::Execution`:
 /// - `user`: self-ownership only (scope_id == token subject), or `usage:read-all` bypass.
 /// - `all`: requires `usage:read-all` permission.
 /// - `account`/`project`/`api_key`: refused with `400`.
 ///
 /// Takes the `scope_authority` as a trait object (rather than the whole `UsageState`) so the gate
 /// is testable without constructing a full state, and so future grain handlers that never consult
-/// the authority (day/seat) still pass the same interface.
+/// the authority (day/seat/execution) still pass the same interface.
 pub async fn authorize_scope(
     scope_authority: &dyn ScopeAuthority,
     token_info: &TokenInfo,
@@ -64,16 +70,16 @@ pub async fn authorize_scope(
     let is_usage_admin = token_info.has_permission(Permission::UsageReadAll);
 
     match grain {
-        GrainScope::DaySeat => match scope {
+        GrainScope::DaySeat | GrainScope::Execution => match scope {
             UsageScope::User => authorize_user_scope(token_info, scope_id, is_usage_admin),
             UsageScope::All => authorize_all_scope(is_usage_admin),
             UsageScope::Account | UsageScope::Project | UsageScope::ApiKey => {
                 warn!(
                     scope = ?scope,
-                    "day/seat grain does not support this scope; refusing"
+                    "day/seat/execution grain does not support this scope; refusing"
                 );
                 ScopeAuthOutcome::BadRequest(Error::BadRequest(format!(
-                    "day/seat grain does not support scope {}; only user and all are supported",
+                    "this grain does not support scope {}; only user and all are supported",
                     scope_wire_value(scope),
                 )))
             }
