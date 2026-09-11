@@ -6,19 +6,18 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use lightbridge_authz_bearer::SERVICE_CALLER_KIND;
-use lightbridge_authz_core::Error;
 use opentelemetry_proto::tonic::collector::{
     logs::v1::ExportLogsServiceRequest, metrics::v1::ExportMetricsServiceRequest,
     trace::v1::ExportTraceServiceRequest,
 };
-use prost::Message;
 use std::sync::Arc;
 use tracing::{debug, warn};
 
 use crate::{
     UsageState,
     handlers::ingest::{
-        extract_log_events, extract_metric_events, extract_trace_events, persist_events,
+        decode_otlp_request_async, extract_log_events, extract_metric_events, extract_trace_events,
+        persist_events,
     },
     models::IngestResponse,
     repo::UsageEvent,
@@ -42,12 +41,14 @@ async fn authenticate_and_authorize(
     state: &UsageState,
     headers: &HeaderMap,
 ) -> std::result::Result<String, Response> {
-    // 1. Extract bearer token
+    // 1. Extract bearer token — RFC 7235 treats the scheme name as case-insensitive,
+    //    so lowercase before matching and extract the token from the original string
+    //    (same pattern as handlers/query.rs and lightbridge-authz-rest middleware).
     let auth_header = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .filter(|s| s.starts_with("Bearer "))
-        .map(|s| s["Bearer ".len()..].trim());
+        .filter(|s| s.to_ascii_lowercase().starts_with("bearer "))
+        .map(|s| s["bearer ".len()..].trim());
 
     let token = match auth_header {
         Some(token) if !token.is_empty() => token,
@@ -129,9 +130,13 @@ pub async fn auth_ingest_traces(
         Err(e) => return e,
     };
 
-    let payload = match ExportTraceServiceRequest::decode(body) {
+    let payload = match decode_otlp_request_async::<ExportTraceServiceRequest>(
+        headers, body, "trace",
+    )
+    .await
+    {
         Ok(p) => p,
-        Err(e) => return Error::BadRequest(format!("invalid protobuf: {e}")).into_response(),
+        Err(e) => return e.into_response(),
     };
 
     let events = extract_trace_events(payload, &source);
@@ -158,10 +163,13 @@ pub async fn auth_ingest_metrics(
         Err(e) => return e,
     };
 
-    let payload = match ExportMetricsServiceRequest::decode(body) {
-        Ok(p) => p,
-        Err(e) => return Error::BadRequest(format!("invalid protobuf: {e}")).into_response(),
-    };
+    let payload =
+        match decode_otlp_request_async::<ExportMetricsServiceRequest>(headers, body, "metrics")
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => return e.into_response(),
+        };
 
     let events = extract_metric_events(payload, &source);
     check_payload_identity_mismatch(&events, &source);
@@ -187,10 +195,11 @@ pub async fn auth_ingest_logs(
         Err(e) => return e,
     };
 
-    let payload = match ExportLogsServiceRequest::decode(body) {
-        Ok(p) => p,
-        Err(e) => return Error::BadRequest(format!("invalid protobuf: {e}")).into_response(),
-    };
+    let payload =
+        match decode_otlp_request_async::<ExportLogsServiceRequest>(headers, body, "logs").await {
+            Ok(p) => p,
+            Err(e) => return e.into_response(),
+        };
 
     let events = extract_log_events(payload, &source);
     check_payload_identity_mismatch(&events, &source);

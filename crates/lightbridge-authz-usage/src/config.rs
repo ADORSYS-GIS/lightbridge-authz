@@ -112,6 +112,20 @@ pub fn load_from_path<P: AsRef<std::path::Path>>(path: P) -> Result<UsageConfig>
         ));
     }
 
+    if let Some(auth) = &config.ingest_auth {
+        for (sub, source) in &auth.principals {
+            if !crate::normalizer::KNOWN_SOURCES.contains(&source.as_str()) {
+                return Err(lightbridge_authz_core::Error::BadRequest(format!(
+                    "ingest_auth.principals: mapped source '{}' for principal '{}' is not a \
+                     known source; valid sources are: {}",
+                    source,
+                    sub,
+                    crate::normalizer::KNOWN_SOURCES.join(", ")
+                )));
+            }
+        }
+    }
+
     debug!("loaded usage config successfully");
     Ok(config)
 }
@@ -323,6 +337,32 @@ otel:
         assert!(
             result.is_err(),
             "a config with ingest_auth but empty principals must fail to load"
+        );
+    }
+
+    /// #585: a `principals` mapping value that is not in `normalizer::KNOWN_SOURCES` must fail
+    /// config validation rather than silently producing per-request 400/403s when the operator
+    /// typo is deployed. Extends the existing `is_empty` guard in `load_from_path`.
+    #[test]
+    fn config_with_ingest_principals_unknown_source_fails_to_load() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be monotonic")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("usage-config-bad-source-{unique}.yaml"));
+        let content = format!(
+            "{}\noauth2:\n  type: external\n  jwks_url: \"http://keycloak:9100/realms/dev/protocol/openid-connect/certs\"\nscope_authority:\n  base_url: \"https://authz-opa:3001\"\n  username: \"authorino\"\n  password: \"change-me\"\ningest_auth:\n  principals:\n    svc:collector-x: claudecode\n",
+            valid_server_and_logging_block()
+        );
+        fs::write(&path, content).expect("temp config should be written");
+
+        let result = load_from_path(&path);
+        fs::remove_file(&path).expect("temp config should be removed");
+
+        assert!(
+            result.is_err(),
+            "a config with an ingest_auth principal mapped to an unknown source \
+             must fail to load, not silently degrade to per-request 400/403s"
         );
     }
 }

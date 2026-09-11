@@ -374,3 +374,71 @@ async fn payload_source_mismatch_still_accepts_but_warns() {
     // It should be accepted (202), and log a warning (verified by visual inspection or logs)
     assert_eq!(response.status(), StatusCode::ACCEPTED);
 }
+
+/// Proves the `caller_kind == SERVICE_CALLER_KIND` guard on line 65 of `auth_ingest.rs`
+/// is not dead code: a token whose `sub` IS in `ingest_principals` but has no `caller_kind`
+/// claim (e.g. a human OIDC login token) must be refused, not admitted.
+///
+/// Mutate the guard to `!= Some(SERVICE_CALLER_KIND)` and this test stays green — but delete the
+/// entire `if` block and this test turns red (the request reaches step 4 and succeeds).
+#[tokio::test]
+async fn no_caller_kind_with_valid_sub_returns_403() {
+    let bearer = custom_bearer("valid-token", "svc:collector-claude", None);
+    let mut principals = HashMap::new();
+    principals.insert(
+        "svc:collector-claude".to_string(),
+        "claude-code".to_string(),
+    );
+
+    let router = build_router(bearer, principals);
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/auth/v1/otel/logs")
+        .header(header::AUTHORIZATION, "Bearer valid-token")
+        .header("X-Source", "claude-code")
+        .header(header::CONTENT_TYPE, "application/x-protobuf")
+        .body(Body::from(test_payload()))
+        .unwrap();
+
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "a token with no caller_kind whose sub matches ingest_principals must be refused; \
+         only service tokens (caller_kind == SERVICE_CALLER_KIND) may use the authenticated ingest surface"
+    );
+}
+
+/// Companion to `no_caller_kind_with_valid_sub_returns_403`: an `api_key`-derived token
+/// (a real caller_kind value, but not the service one) must also be refused, even if its
+/// `sub` collides with a configured principal. Covers the `Some("api_key")` branch the
+/// original review flagged.
+#[tokio::test]
+async fn api_key_caller_kind_with_valid_sub_returns_403() {
+    let bearer = custom_bearer("valid-token", "svc:collector-claude", Some("api_key"));
+    let mut principals = HashMap::new();
+    principals.insert(
+        "svc:collector-claude".to_string(),
+        "claude-code".to_string(),
+    );
+
+    let router = build_router(bearer, principals);
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/auth/v1/otel/logs")
+        .header(header::AUTHORIZATION, "Bearer valid-token")
+        .header("X-Source", "claude-code")
+        .header(header::CONTENT_TYPE, "application/x-protobuf")
+        .body(Body::from(test_payload()))
+        .unwrap();
+
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "an api_key-derived token whose sub matches ingest_principals must be refused; \
+         only client_credentials service tokens may use the authenticated ingest surface"
+    );
+}

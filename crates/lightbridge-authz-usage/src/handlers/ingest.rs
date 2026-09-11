@@ -324,7 +324,7 @@ pub async fn ingest_logs(
     ))
 }
 
-async fn decode_otlp_request_async<T>(
+pub(crate) async fn decode_otlp_request_async<T>(
     headers: HeaderMap,
     body: Bytes,
     signal: &'static str,
@@ -2655,6 +2655,7 @@ mod tests {
             repo: Arc::new(PartialInsertRepo { persisted: 1 }),
             bearer: Arc::new(RefuseEverythingBearer),
             scope_authority: Arc::new(RefuseEverythingScopeAuthority),
+            ingest_principals: std::collections::HashMap::default(),
         };
         let events = vec![base_usage_event(), base_usage_event()];
 
