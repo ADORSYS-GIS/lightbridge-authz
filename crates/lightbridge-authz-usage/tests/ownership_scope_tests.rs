@@ -171,6 +171,105 @@ async fn day_seat_rejects_account_project_and_api_key_scopes_with_bad_request() 
 }
 
 // -----------------------------------------------------------------------
+// authorize_scope -- GrainScope::Execution (#726, the two-scope model)
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn execution_user_scope_authorizes_the_callers_own_subject() {
+    let outcome = authorize_scope(
+        &RefuseEverything,
+        &plain_token("sub-a"),
+        &UsageScope::User,
+        "sub-a",
+        GrainScope::Execution,
+    )
+    .await;
+    assert!(
+        matches!(outcome, ScopeAuthOutcome::Authorized),
+        "scope=user with the caller's own subject must be authorized, got {outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn execution_user_scope_refuses_another_subject() {
+    let outcome = authorize_scope(
+        &AuthorizeEverything,
+        &plain_token("sub-a"),
+        &UsageScope::User,
+        "sub-victim",
+        GrainScope::Execution,
+    )
+    .await;
+    assert!(
+        matches!(outcome, ScopeAuthOutcome::Forbidden(_)),
+        "scope=user for another subject must be refused even when the authority says yes"
+    );
+}
+
+#[tokio::test]
+async fn execution_user_scope_allows_usage_read_all_for_any_subject() {
+    let outcome = authorize_scope(
+        &RefuseEverything,
+        &admin_token("sub-admin"),
+        &UsageScope::User,
+        "sub-someone-else",
+        GrainScope::Execution,
+    )
+    .await;
+    assert!(
+        matches!(outcome, ScopeAuthOutcome::Authorized),
+        "a usage:read-all holder may read any subject's execution user scope"
+    );
+}
+
+#[tokio::test]
+async fn execution_all_scope_requires_usage_read_all() {
+    let refused = authorize_scope(
+        &AuthorizeEverything,
+        &plain_token("sub-a"),
+        &UsageScope::All,
+        "",
+        GrainScope::Execution,
+    )
+    .await;
+    assert!(
+        matches!(refused, ScopeAuthOutcome::Forbidden(_)),
+        "scope=all without usage:read-all must be refused"
+    );
+
+    let allowed = authorize_scope(
+        &RefuseEverything,
+        &admin_token("sub-admin"),
+        &UsageScope::All,
+        "",
+        GrainScope::Execution,
+    )
+    .await;
+    assert!(
+        matches!(allowed, ScopeAuthOutcome::Authorized),
+        "scope=all with usage:read-all must be authorized"
+    );
+}
+
+#[tokio::test]
+async fn execution_rejects_account_project_and_api_key_scopes_with_bad_request() {
+    for scope in [UsageScope::Account, UsageScope::Project, UsageScope::ApiKey] {
+        let outcome = authorize_scope(
+            &AuthorizeEverything,
+            &admin_token("sub-admin"),
+            &scope,
+            "whatever",
+            GrainScope::Execution,
+        )
+        .await;
+        assert!(
+            matches!(outcome, ScopeAuthOutcome::BadRequest(_)),
+            "execution grain must reject scope {scope:?} with a 400, got {outcome:?}"
+        );
+    }
+}
+
+// -----------------------------------------------------------------------
 // authorize_scope -- GrainScope::Legacy (the existing five-scope model)
 // -----------------------------------------------------------------------
 
