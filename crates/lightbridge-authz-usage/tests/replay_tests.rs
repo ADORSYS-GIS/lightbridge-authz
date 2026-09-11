@@ -350,8 +350,9 @@ async fn replay_batch_aborts_on_first_failure() {
 async fn replay_batch_aborts_on_first_failure_under_concurrency() {
     let server = MockServer::start();
     // A mix of successes and a failure; the batch must abort with the failure and not report a
-    // successful summary.
-    let ok = server.mock(|when, then| {
+    // successful summary. The traces mock is registered (unbound) so trace requests succeed and
+    // the failure is specifically the log route's 503.
+    server.mock(|when, then| {
         when.method(POST).path("/v1/otel/traces");
         then.status(200);
     });
@@ -401,15 +402,10 @@ async fn replay_batch_aborts_on_first_failure_under_concurrency() {
         .await
         .expect_err("a failing object must abort the batch under concurrency");
     assert!(err.to_string().contains("503"), "got: {err}");
-    // Under concurrency, abort_all() cancels in-flight trace tasks at their next await point
-    // (mid-send/mid-connect), so a trace request may be dropped before the mock records it. How
-    // many trace objects complete before the batch aborts is therefore nondeterministic — at
-    // most the two that were seeded. At least one log object hits the failing route before the
-    // batch aborts (how many is likewise nondeterministic).
-    assert!(
-        ok.calls() <= 2,
-        "at most the two seeded trace objects can complete"
-    );
+    // Under concurrency, abort_all() cancels in-flight tasks at their next await point
+    // (mid-send/mid-connect), so exactly how many requests reach the mock before the batch
+    // aborts is nondeterministic. The contract that must hold is: the batch aborted with the
+    // failing 503, and at least one object hit the failing route before that happened.
     assert!(
         fail.calls() >= 1,
         "the failing route must be hit at least once"

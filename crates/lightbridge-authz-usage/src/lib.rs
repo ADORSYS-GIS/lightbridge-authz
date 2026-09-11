@@ -1,8 +1,7 @@
 use axum::{Json, Router, http::StatusCode, routing::get};
-use chrono::{DateTime, Utc};
 use lightbridge_authz_bearer::{BearerTokenService, BearerTokenServiceTrait};
 use lightbridge_authz_core::{
-    Error, Result, async_trait,
+    Error, Result,
     build_info::log_build_info,
     config::{Database, Oauth2},
     db::{DbPool, DbPoolTrait, is_database_ready},
@@ -21,14 +20,16 @@ pub mod instrumentation;
 pub mod models;
 pub mod normalizer;
 pub mod replay;
+pub mod replay_types;
 pub mod repo;
 pub mod routers;
 pub mod scope_authority;
+pub mod usage_repo_trait;
 
 pub use config::{ScopeAuthorityConfig, UsageConfig, UsageServer, load_from_path};
-use models::{UsageQueryRequest, UsageSeriesPoint};
-use repo::{StoreRepo, UsageEvent};
+use repo::StoreRepo;
 use scope_authority::{RemoteScopeAuthority, ScopeAuthority};
+pub use usage_repo_trait::UsageRepoTrait;
 
 #[derive(Serialize, Deserialize)]
 struct RootResponse {
@@ -53,44 +54,6 @@ pub struct UsageState {
     pub bearer: Arc<dyn BearerTokenServiceTrait>,
     /// Ownership authority for `/usage/v1/usage/query`'s `account`/`project` scopes (#570).
     pub scope_authority: Arc<dyn ScopeAuthority>,
-}
-
-#[async_trait]
-pub trait UsageRepoTrait: Send + Sync {
-    async fn insert_usage_events(&self, events: &[UsageEvent]) -> Result<usize>;
-    /// Returns `(points, truncated)` -- see `StoreRepo::query_usage`'s doc comment for the #578
-    /// truncation contract `truncated` documents.
-    async fn query_usage(&self, input: &UsageQueryRequest)
-    -> Result<(Vec<UsageSeriesPoint>, bool)>;
-    async fn spend_for_account(
-        &self,
-        account_id: &str,
-        start: DateTime<Utc>,
-        end: DateTime<Utc>,
-    ) -> Result<Option<f64>>;
-}
-
-#[async_trait]
-impl UsageRepoTrait for StoreRepo {
-    async fn insert_usage_events(&self, events: &[UsageEvent]) -> Result<usize> {
-        StoreRepo::insert_usage_events(self, events).await
-    }
-
-    async fn query_usage(
-        &self,
-        input: &UsageQueryRequest,
-    ) -> Result<(Vec<UsageSeriesPoint>, bool)> {
-        StoreRepo::query_usage(self, input).await
-    }
-
-    async fn spend_for_account(
-        &self,
-        account_id: &str,
-        start: DateTime<Utc>,
-        end: DateTime<Utc>,
-    ) -> Result<Option<f64>> {
-        StoreRepo::spend_for_account(self, account_id, start, end).await
-    }
 }
 
 /// Service names reported by `GET /version` and the `service.build` startup log line (#573).
