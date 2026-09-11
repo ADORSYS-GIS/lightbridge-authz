@@ -73,6 +73,17 @@ use crate::config::RetentionConfig;
 // here so `retention.rs`'s existing callers and the module's public surface are unchanged.
 pub use crate::rollup_sql::{ROLLUP_AND_PURGE_SQL, ROLLUP_PURGE_SQL};
 
+/// Outcome of a retention/rollup run.
+#[derive(Debug, Clone, Copy)]
+pub struct RetentionRun {
+    /// Number of raw rows rolled up and purged.
+    pub purged: u64,
+    /// Whether the run drained the raw table to the cutoff (reached an empty batch). `false` when
+    /// the run was cut short by losing the advisory lock to a concurrent replica -- partial
+    /// progress only, older rows still raw.
+    pub completed: bool,
+}
+
 /// Runs the retention/rollup background loop forever: every `config.interval_seconds`, rolls rows
 /// older than `config.raw_days` into `usage_events_daily` and deletes them from `usage_events`,
 /// and deletes rollup rows older than `config.rollup_days`. A failed run is logged and the loop
@@ -97,22 +108,34 @@ pub async fn run_retention_loop(pool: Arc<PgPool>, config: RetentionConfig) {
     loop {
         ticker.tick().await;
         match rollup_and_purge(&pool, config.raw_days, config.rollup_days).await {
-            Ok(purged) => {
-                // Record the cutoff this run actually purged up to, so the query handler can report
-                // `truncated` from what the job did (P2) rather than from the wall clock at query
-                // time. Recorded even when `purged == 0`: the cutoff is still the actual purge
-                // boundary (everything older than it is gone). A failure here only leaves the
-                // previous cutoff in place -- a stale (older) cutoff errs toward a false positive,
-                // never a false negative.
-                if let Err(e) = record_last_purge_cutoff(&pool, config.raw_days).await {
-                    warn!("usage retention: failed to record last purge cutoff: {e}");
-                }
-                if purged > 0 {
-                    info!("usage retention: rolled up and purged {purged} raw rows");
+            Ok(run) => {
+                record_cutoff_if_completed(&pool, config.raw_days, &run).await;
+                if run.purged > 0 {
+                    info!(
+                        "usage retention: rolled up and purged {} raw rows",
+                        run.purged
+                    );
                 }
             }
             Err(e) => warn!("usage retention/rollup run failed: {e}"),
         }
+    }
+}
+
+/// Records the purge cutoff after a run, but ONLY when the run completed a full drain. A run cut
+/// short by advisory-lock contention (`completed == false`) has NOT purged everything older than
+/// the cutoff, so recording it would over-report `truncated` for ranges whose rows are still raw
+/// (P2). A stale (older) cutoff errs toward a false positive, never a false negative.
+pub async fn record_cutoff_if_completed(pool: &PgPool, raw_days: i64, run: &RetentionRun) {
+    if !run.completed {
+        warn!(
+            "usage retention: run cut short by advisory lock contention ({} rows purged); not recording purge cutoff",
+            run.purged
+        );
+        return;
+    }
+    if let Err(e) = record_last_purge_cutoff(pool, raw_days).await {
+        warn!("usage retention: failed to record last purge cutoff: {e}");
     }
 }
 
@@ -122,13 +145,12 @@ pub async fn run_retention_loop(pool: Arc<PgPool>, config: RetentionConfig) {
 /// `date_trunc('day', now() - raw_days)` the rollup SQL uses -- so it matches what the run purged
 /// regardless of app/DB clock skew.
 pub async fn record_last_purge_cutoff(pool: &PgPool, raw_days: i64) -> Result<()> {
-    let cutoff: DateTime<Utc> = sqlx::query_scalar(
-        "SELECT date_trunc('day', now() - ($1 * interval '1 day'))",
-    )
-    .bind(raw_days)
-    .fetch_one(pool)
-    .await
-    .map_err(|e| Error::Database(format!("usage retention cutoff read failed: {e}")))?;
+    let cutoff: DateTime<Utc> =
+        sqlx::query_scalar("SELECT date_trunc('day', now() - ($1 * interval '1 day'))")
+            .bind(raw_days)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| Error::Database(format!("usage retention cutoff read failed: {e}")))?;
 
     sqlx::query(
         "INSERT INTO usage_retention_state (id, last_purge_cutoff) VALUES (TRUE, $1)
@@ -145,7 +167,8 @@ pub async fn record_last_purge_cutoff(pool: &PgPool, raw_days: i64) -> Result<()
 
 /// Rolls `usage_events` rows older than `raw_days` (rounded down to the day boundary, so only
 /// complete days) into `usage_events_daily`, deletes them from `usage_events`, and deletes rollup
-/// rows older than `rollup_days`. Returns the number of raw rows purged.
+/// rows older than `rollup_days`. Returns the run's outcome -- how many raw rows were purged and
+/// whether the run completed a full drain (see [`RetentionRun`]).
 ///
 /// The rollup+purge runs in bounded batches ([`BATCH_SIZE`] rows per statement), and **each batch
 /// commits in its own transaction**, so the FIRST run against a large pre-existing backlog does
@@ -156,7 +179,11 @@ pub async fn record_last_purge_cutoff(pool: &PgPool, raw_days: i64) -> Result<()
 /// leave partial progress that the next run continues. Each batch is idempotent (`ON CONFLICT DO
 /// UPDATE`), so a batch re-run after a crash, or a concurrent run on another replica, folds in
 /// rather than double-counts.
-pub async fn rollup_and_purge(pool: &PgPool, raw_days: i64, rollup_days: i64) -> Result<u64> {
+pub async fn rollup_and_purge(
+    pool: &PgPool,
+    raw_days: i64,
+    rollup_days: i64,
+) -> Result<RetentionRun> {
     let mut conn = pool.acquire().await?;
     rollup_and_purge_on(&mut conn, raw_days, rollup_days).await
 }
@@ -170,7 +197,7 @@ pub async fn rollup_and_purge_on(
     conn: &mut PgConnection,
     raw_days: i64,
     rollup_days: i64,
-) -> Result<u64> {
+) -> Result<RetentionRun> {
     let mut total_purged: u64 = 0;
     loop {
         let mut tx = conn.begin().await?;
@@ -192,8 +219,13 @@ pub async fn rollup_and_purge_on(
                 .map_err(|e| Error::Database(format!("usage retention lock failed: {e}")))?;
 
         if !lock_acquired {
-            // Another replica is currently running the rollup, gracefully skip this run.
-            return Ok(total_purged);
+            // Another replica is currently running the rollup, gracefully skip this run. The run is
+            // NOT complete: it may have purged some batches before losing the lock, but older rows
+            // are still raw, so the caller must not record a purge cutoff (P2).
+            return Ok(RetentionRun {
+                purged: total_purged,
+                completed: false,
+            });
         }
 
         // One statement per batch: DELETE ... RETURNING feeds the INSERT, so the rollup and the raw
@@ -228,7 +260,10 @@ pub async fn rollup_and_purge_on(
             .map_err(|e| Error::Database(format!("usage retention commit failed: {e}")))?;
     }
 
-    Ok(total_purged)
+    Ok(RetentionRun {
+        purged: total_purged,
+        completed: true,
+    })
 }
 
 /// Maximum number of raw rows rolled up and purged per statement, bounding the first run against a

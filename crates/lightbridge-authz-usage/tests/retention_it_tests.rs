@@ -137,12 +137,13 @@ async fn rollup_and_purge_moves_old_rows_and_spend_is_unchanged(pool: PgPool) {
     assert_eq!(s_recent_before, Some(100.0));
 
     // Run the retention job.
-    let purged = rollup_and_purge(&pool, raw_days, rollup_days)
+    let run = rollup_and_purge(&pool, raw_days, rollup_days)
         .await
         .expect("rollup should run");
     assert!(
-        purged >= 2,
-        "the two old rows must be purged from raw, got {purged}"
+        run.purged >= 2,
+        "the two old rows must be purged from raw, got {}",
+        run.purged
     );
 
     // Old rows are gone from raw.
@@ -222,12 +223,12 @@ async fn rollup_and_purge_is_idempotent(pool: PgPool) {
     let first = rollup_and_purge(&pool, raw_days, rollup_days)
         .await
         .expect("first run");
-    assert_eq!(first, 1, "first run purges the one old row");
+    assert_eq!(first.purged, 1, "first run purges the one old row");
 
     let second = rollup_and_purge(&pool, raw_days, rollup_days)
         .await
         .expect("second run");
-    assert_eq!(second, 0, "second run has nothing left to purge");
+    assert_eq!(second.purged, 0, "second run has nothing left to purge");
 
     let rollup_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage_events_daily")
         .fetch_one(&pool)
@@ -264,7 +265,7 @@ async fn late_arriving_event_for_an_already_rolled_up_day_is_folded_in_not_dropp
     let first = rollup_and_purge(&pool, raw_days, rollup_days)
         .await
         .expect("first run");
-    assert_eq!(first, 1, "first run purges the one old row");
+    assert_eq!(first.purged, 1, "first run purges the one old row");
 
     // A late event ($99) for the SAME day arrives after that day was already rolled up.
     repo.insert_usage_events(&[event_with_cost("acct_1", old_day, 99.0)])
@@ -276,7 +277,7 @@ async fn late_arriving_event_for_an_already_rolled_up_day_is_folded_in_not_dropp
     let second = rollup_and_purge(&pool, raw_days, rollup_days)
         .await
         .expect("second run must not wedge on the late event");
-    assert_eq!(second, 1, "the late raw row must still be purged");
+    assert_eq!(second.purged, 1, "the late raw row must still be purged");
 
     let late_raw: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM usage_events WHERE account_id = $1 AND observed_at >= $2 AND observed_at < $3",
@@ -338,10 +339,10 @@ async fn rollup_rows_older_than_rollup_days_are_purged_from_the_rollup(pool: PgP
         .await
         .expect("insert");
 
-    let purged = rollup_and_purge(&pool, raw_days, rollup_days)
+    let run = rollup_and_purge(&pool, raw_days, rollup_days)
         .await
         .expect("rollup should run");
-    assert_eq!(purged, 1, "the old raw row must be purged");
+    assert_eq!(run.purged, 1, "the old raw row must be purged");
 
     let raw_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage_events")
         .fetch_one(&pool)
@@ -385,12 +386,16 @@ async fn second_concurrent_run_skips_while_the_advisory_lock_is_held(pool: PgPoo
     assert!(acquired, "the test must acquire the lock first");
 
     // A run while the lock is held must skip, not race.
-    let purged = rollup_and_purge(&pool, 90, 365)
+    let run = rollup_and_purge(&pool, 90, 365)
         .await
         .expect("rollup should skip cleanly");
     assert_eq!(
-        purged, 0,
+        run.purged, 0,
         "a run while another replica holds the advisory lock must skip (return 0)"
+    );
+    assert!(
+        !run.completed,
+        "a run skipped by advisory-lock contention must not be marked completed"
     );
 
     // The old row must still be raw -- it was not rolled up because the run skipped.
@@ -401,6 +406,66 @@ async fn second_concurrent_run_skips_while_the_advisory_lock_is_held(pool: PgPoo
     assert_eq!(raw, 1, "the old row must stay raw when the run skips");
 
     holder.rollback().await.expect("rollback holder");
+}
+
+/// P2: a run cut short by advisory-lock contention (`completed == false`) must NOT record a purge
+/// cutoff -- it has not purged everything older than the cutoff, so recording it would over-report
+/// `truncated` for ranges whose rows are still raw. Only a completed drain records the cutoff.
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn incomplete_run_does_not_record_a_purge_cutoff(pool: PgPool) {
+    use lightbridge_authz_usage_rest::retention::record_cutoff_if_completed;
+
+    let repo = build_repo(pool.clone());
+    let now = Utc::now();
+    let old_day = (now - Duration::days(100))
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .expect("valid time")
+        .and_utc();
+    repo.insert_usage_events(&[event_with_cost("acct_1", old_day, 10.0)])
+        .await
+        .expect("insert old row");
+
+    // Hold the advisory lock so a run skips (incomplete).
+    let mut holder = pool.begin().await.expect("begin holder");
+    let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(549000001)")
+        .fetch_one(&mut *holder)
+        .await
+        .expect("acquire lock");
+    assert!(acquired, "the test must acquire the lock first");
+
+    let run = rollup_and_purge(&pool, 90, 365)
+        .await
+        .expect("run should skip cleanly");
+    assert!(
+        !run.completed,
+        "a lock-skipped run must not be marked completed"
+    );
+    assert_eq!(run.purged, 0, "a lock-skipped run purges nothing");
+
+    // The skipped run must not record a cutoff: nothing was drained, so no range is truncated.
+    record_cutoff_if_completed(&pool, 90, &run).await;
+    assert_eq!(
+        repo.last_purge_cutoff().await.expect("read cutoff"),
+        None,
+        "an incomplete run must not record a purge cutoff"
+    );
+
+    holder.rollback().await.expect("rollback holder");
+
+    // A completed run (lock released) DOES record the cutoff -- the drain reached the boundary.
+    let run = rollup_and_purge(&pool, 90, 365)
+        .await
+        .expect("run should complete");
+    assert!(run.completed, "a run with the lock free must complete");
+    record_cutoff_if_completed(&pool, 90, &run).await;
+    assert!(
+        repo.last_purge_cutoff()
+            .await
+            .expect("read cutoff")
+            .is_some(),
+        "a completed run must record a purge cutoff"
+    );
 }
 
 /// Only COMPLETE days are rolled up: the cutoff is rounded DOWN to the day boundary, so the whole
@@ -425,11 +490,11 @@ async fn boundary_day_is_not_partially_rolled_up(pool: PgPool) {
         .await
         .expect("insert boundary-day row");
 
-    let purged = rollup_and_purge(&pool, 90, 365)
+    let run = rollup_and_purge(&pool, 90, 365)
         .await
         .expect("rollup should run");
     assert_eq!(
-        purged, 0,
+        run.purged, 0,
         "the boundary day must not be rolled up -- only complete days are"
     );
 
@@ -554,14 +619,18 @@ async fn concurrent_backdated_insert_preserves_total_spend(pool: PgPool) {
             .expect("concurrent insert");
     });
 
-    let purged = rollup_and_purge(&pool, 90, 365)
+    let run = rollup_and_purge(&pool, 90, 365)
         .await
         .expect("rollup should run");
     insert_task.await.expect("concurrent insert task");
 
     // Total spend must be preserved: 2000 * 1.0 + 777.0 = 2777.0. The concurrent row is either
     // rolled up or still raw, but never lost.
-    assert!(purged >= 2000, "the old batch must be purged, got {purged}");
+    assert!(
+        run.purged >= 2000,
+        "the old batch must be purged, got {}",
+        run.purged
+    );
     let spend = repo
         .spend_for_account("acct_1", old_day, old_day + Duration::days(1))
         .await
@@ -599,7 +668,7 @@ async fn late_null_tokens_do_not_zero_out_accumulated_rollup_tokens(pool: PgPool
     let first = rollup_and_purge(&pool, raw_days, rollup_days)
         .await
         .expect("first run");
-    assert_eq!(first, 1, "first run purges the one old row");
+    assert_eq!(first.purged, 1, "first run purges the one old row");
 
     // A late event for the SAME day arrives with NULL token counts (a signal that carried no
     // token usage). Its cost folds in, but its NULL tokens must not wipe the accumulated totals.
@@ -609,7 +678,7 @@ async fn late_null_tokens_do_not_zero_out_accumulated_rollup_tokens(pool: PgPool
     let second = rollup_and_purge(&pool, raw_days, rollup_days)
         .await
         .expect("second run");
-    assert_eq!(second, 1, "the late raw row must still be purged");
+    assert_eq!(second.purged, 1, "the late raw row must still be purged");
 
     let (prompt, completion, total, cost): (Option<i64>, Option<i64>, Option<i64>, Option<f64>) =
         sqlx::query_as(
@@ -670,8 +739,7 @@ async fn record_last_purge_cutoff_round_trips_through_usage_retention_state(pool
         .expect("valid time")
         .and_utc();
     assert_eq!(
-        cutoff,
-        expected,
+        cutoff, expected,
         "the recorded cutoff must be the day-truncated raw-window boundary"
     );
 }

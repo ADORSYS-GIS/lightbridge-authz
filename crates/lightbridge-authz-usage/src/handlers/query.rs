@@ -204,9 +204,7 @@ pub async fn query_usage(
     // has been purged, so no range is truncated. Comparing `start_time` against the persisted
     // cutoff (rather than recomputing `Utc::now() - raw_days` here) avoids the daily false-positive
     // window where a query-time cutoff has advanced past what the job has actually purged.
-    let range_truncated = state
-        .raw_days
-        .is_some()
+    let range_truncated = state.raw_days.is_some()
         && state
             .repo
             .last_purge_cutoff()
