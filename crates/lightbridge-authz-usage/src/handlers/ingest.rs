@@ -2393,6 +2393,10 @@ mod tests {
             ) -> Result<Option<f64>> {
                 Ok(None)
             }
+
+            async fn last_purge_cutoff(&self) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+                Ok(None)
+            }
         }
 
         struct RefuseEverythingBearer;

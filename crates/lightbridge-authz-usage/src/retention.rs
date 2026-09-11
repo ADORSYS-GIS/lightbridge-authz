@@ -62,6 +62,7 @@
 //! runs `SET LOCAL TimeZone = 'UTC'` as its first statement, pinning every day boundary in this
 //! transaction to UTC regardless of the session's configured zone.
 
+use chrono::{DateTime, Utc};
 use lightbridge_authz_core::{Error, Result};
 use sqlx::{Connection, PgConnection, PgPool};
 use std::sync::Arc;
@@ -97,6 +98,15 @@ pub async fn run_retention_loop(pool: Arc<PgPool>, config: RetentionConfig) {
         ticker.tick().await;
         match rollup_and_purge(&pool, config.raw_days, config.rollup_days).await {
             Ok(purged) => {
+                // Record the cutoff this run actually purged up to, so the query handler can report
+                // `truncated` from what the job did (P2) rather than from the wall clock at query
+                // time. Recorded even when `purged == 0`: the cutoff is still the actual purge
+                // boundary (everything older than it is gone). A failure here only leaves the
+                // previous cutoff in place -- a stale (older) cutoff errs toward a false positive,
+                // never a false negative.
+                if let Err(e) = record_last_purge_cutoff(&pool, config.raw_days).await {
+                    warn!("usage retention: failed to record last purge cutoff: {e}");
+                }
                 if purged > 0 {
                     info!("usage retention: rolled up and purged {purged} raw rows");
                 }
@@ -104,6 +114,33 @@ pub async fn run_retention_loop(pool: Arc<PgPool>, config: RetentionConfig) {
             Err(e) => warn!("usage retention/rollup run failed: {e}"),
         }
     }
+}
+
+/// Records the day-truncated purge cutoff of a successful run into `usage_retention_state`, so
+/// `/usage/v1/usage/query` can report `truncated` from what the job actually purged (P2) rather
+/// than from the wall clock at query time. The cutoff is read from the database clock -- the same
+/// `date_trunc('day', now() - raw_days)` the rollup SQL uses -- so it matches what the run purged
+/// regardless of app/DB clock skew.
+pub async fn record_last_purge_cutoff(pool: &PgPool, raw_days: i64) -> Result<()> {
+    let cutoff: DateTime<Utc> = sqlx::query_scalar(
+        "SELECT date_trunc('day', now() - ($1 * interval '1 day'))",
+    )
+    .bind(raw_days)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| Error::Database(format!("usage retention cutoff read failed: {e}")))?;
+
+    sqlx::query(
+        "INSERT INTO usage_retention_state (id, last_purge_cutoff) VALUES (TRUE, $1)
+         ON CONFLICT (id) DO UPDATE
+           SET last_purge_cutoff = EXCLUDED.last_purge_cutoff, updated_at = now()",
+    )
+    .bind(cutoff)
+    .execute(pool)
+    .await
+    .map_err(|e| Error::Database(format!("usage retention state write failed: {e}")))?;
+
+    Ok(())
 }
 
 /// Rolls `usage_events` rows older than `raw_days` (rounded down to the day boundary, so only

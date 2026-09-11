@@ -14,7 +14,7 @@
 use chrono::{Duration, Utc};
 use lightbridge_authz_core::db::DbPool;
 use lightbridge_authz_usage_rest::repo::{StoreRepo, UsageEvent};
-use lightbridge_authz_usage_rest::retention::rollup_and_purge;
+use lightbridge_authz_usage_rest::retention::{record_last_purge_cutoff, rollup_and_purge};
 use sqlx::PgPool;
 use std::sync::Arc;
 
@@ -636,4 +636,40 @@ async fn late_null_tokens_do_not_zero_out_accumulated_rollup_tokens(pool: PgPool
         "NULL late total_tokens must not zero out the accumulated 800"
     );
     assert_eq!(cost, Some(99.0), "the late cost must still fold in");
+}
+
+/// P2: `record_last_purge_cutoff` persists the day-truncated purge cutoff into
+/// `usage_retention_state`, and `StoreRepo::last_purge_cutoff` reads it back -- the round trip the
+/// query handler relies on to report `truncated` from what the job actually purged. Before any
+/// record the read is `None`; after recording it is `Some` and day-truncated.
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn record_last_purge_cutoff_round_trips_through_usage_retention_state(pool: PgPool) {
+    let repo = build_repo(pool.clone());
+    let raw_days = 90;
+
+    assert_eq!(
+        repo.last_purge_cutoff().await.expect("read cutoff"),
+        None,
+        "no run yet, so no purge cutoff is recorded"
+    );
+
+    record_last_purge_cutoff(&pool, raw_days)
+        .await
+        .expect("record cutoff");
+
+    let cutoff = repo
+        .last_purge_cutoff()
+        .await
+        .expect("read cutoff")
+        .expect("cutoff recorded");
+    let expected = (Utc::now() - Duration::days(raw_days))
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .expect("valid time")
+        .and_utc();
+    assert_eq!(
+        cutoff,
+        expected,
+        "the recorded cutoff must be the day-truncated raw-window boundary"
+    );
 }

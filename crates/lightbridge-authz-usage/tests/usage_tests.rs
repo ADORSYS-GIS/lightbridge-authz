@@ -38,6 +38,7 @@ struct MockUsageRepo {
     inserted_events: usize,
     spend: Option<f64>,
     truncated: bool,
+    last_purge_cutoff: Option<chrono::DateTime<Utc>>,
 }
 
 #[async_trait]
@@ -60,6 +61,10 @@ impl UsageRepoTrait for MockUsageRepo {
         _end: chrono::DateTime<Utc>,
     ) -> Result<Option<f64>> {
         Ok(self.spend)
+    }
+
+    async fn last_purge_cutoff(&self) -> Result<Option<chrono::DateTime<Utc>>> {
+        Ok(self.last_purge_cutoff)
     }
 }
 
@@ -93,6 +98,7 @@ fn lazy_pool() -> Arc<dyn DbPoolTrait> {
 fn mock_state() -> Arc<UsageState> {
     Arc::new(UsageState {
         repo: Arc::new(MockUsageRepo {
+            last_purge_cutoff: None,
             points: vec![],
             inserted_events: 0,
             spend: None,
@@ -339,6 +345,7 @@ async fn query_usage_returns_timeseries_points_when_query_is_valid() {
     let now = Utc::now();
     let state = Arc::new(UsageState {
         repo: Arc::new(MockUsageRepo {
+            last_purge_cutoff: None,
             inserted_events: 1,
             points: vec![UsageSeriesPoint {
                 bucket_start: now,
@@ -391,10 +398,27 @@ async fn query_usage_returns_timeseries_points_when_query_is_valid() {
 /// P1-5: `/usage/v1/usage/query` reads raw `usage_events` only, so a request whose `start_time` is
 /// older than the raw retention window (`raw_days`, default 90) has no data there. The handler must
 /// set `truncated: true` for such a range rather than report `truncated: false` for a range it
-/// cannot answer.
+/// cannot answer. P2: the flag comes from the retention job's persisted purge cutoff -- the mock
+/// supplies one at the raw-window boundary, so a `start_time` older than it is flagged truncated.
 #[tokio::test]
 async fn query_usage_sets_truncated_when_start_time_predates_the_raw_retention_window() {
-    let state = mock_state();
+    let state = Arc::new(UsageState {
+        repo: Arc::new(MockUsageRepo {
+            points: vec![],
+            inserted_events: 0,
+            spend: None,
+            truncated: false,
+            last_purge_cutoff: Some(Utc::now() - Duration::days(90)),
+        }),
+        bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
+        scope_authority: Arc::new(support::FakeScopeAuthority::new().authorizing(
+            TEST_ISSUER,
+            TEST_SUBJECT,
+            &UsageScope::Project,
+            "proj_1",
+        )),
+        raw_days: Some(90),
+    });
     let mut req = base_request();
     // Older than the 90-day raw window.
     req.start_time = Utc::now() - Duration::days(200);
@@ -410,6 +434,44 @@ async fn query_usage_sets_truncated_when_start_time_predates_the_raw_retention_w
     );
 }
 
+/// P2: `range_truncated` follows the retention job's persisted purge cutoff, not the wall clock at
+/// query time. A `start_time` after the persisted cutoff -- even one that a query-time
+/// `Utc::now() - raw_days` recomputation could call truncated during the daily advance window -- is
+/// NOT flagged, because the job has not actually purged it.
+#[tokio::test]
+async fn query_usage_does_not_flag_truncated_when_start_time_is_after_the_persisted_cutoff() {
+    let state = Arc::new(UsageState {
+        repo: Arc::new(MockUsageRepo {
+            points: vec![],
+            inserted_events: 0,
+            spend: None,
+            truncated: false,
+            last_purge_cutoff: Some(Utc::now() - Duration::days(90)),
+        }),
+        bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
+        scope_authority: Arc::new(support::FakeScopeAuthority::new().authorizing(
+            TEST_ISSUER,
+            TEST_SUBJECT,
+            &UsageScope::Project,
+            "proj_1",
+        )),
+        raw_days: Some(90),
+    });
+    let mut req = base_request();
+    // Within the raw window, after the persisted cutoff.
+    req.start_time = Utc::now() - Duration::days(50);
+    req.end_time = Utc::now();
+
+    let response = call_query_usage(state, authorized_headers(), req).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: UsageQueryResponse = serde_json::from_value(body_json(response).await)
+        .expect("response body must decode as UsageQueryResponse");
+    assert!(
+        !payload.truncated,
+        "a range after the persisted purge cutoff must not be flagged truncated"
+    );
+}
+
 /// P2: `range_truncated` must reflect what the retention job actually did, not the config value
 /// alone. When the job is disabled (`retention.enabled: false`, so `state.raw_days` is `None`),
 /// nothing is ever purged -- `usage_events` holds everything ingested -- so a range predating the
@@ -419,6 +481,7 @@ async fn query_usage_sets_truncated_when_start_time_predates_the_raw_retention_w
 async fn query_usage_does_not_flag_truncated_when_retention_is_disabled() {
     let state = Arc::new(UsageState {
         repo: Arc::new(MockUsageRepo {
+            last_purge_cutoff: None,
             points: vec![],
             inserted_events: 0,
             spend: None,
@@ -541,6 +604,7 @@ async fn query_usage_refuses_unrecognized_bearer_with_401() {
 async fn query_usage_refuses_when_scope_authority_declines() {
     let state = Arc::new(UsageState {
         repo: Arc::new(MockUsageRepo {
+            last_purge_cutoff: None,
             points: vec![UsageSeriesPoint {
                 bucket_start: Utc::now(),
                 account_id: None,
@@ -627,6 +691,7 @@ async fn query_usage_refuses_api_key_scope_unconditionally() {
 async fn query_usage_allows_own_user_scope() {
     let state = Arc::new(UsageState {
         repo: Arc::new(MockUsageRepo {
+            last_purge_cutoff: None,
             points: vec![],
             inserted_events: 0,
             spend: None,
@@ -763,6 +828,7 @@ fn usage_scope_all_serializes_as_lowercase_all() {
 async fn ingest_logs_treats_noop_insert_as_success() {
     let state = Arc::new(UsageState {
         repo: Arc::new(MockUsageRepo {
+            last_purge_cutoff: None,
             points: vec![],
             inserted_events: 0,
             spend: None,
@@ -789,6 +855,7 @@ async fn ingest_logs_treats_noop_insert_as_success() {
 async fn ingest_logs_rejects_invalid_protobuf_as_bad_request() {
     let state = Arc::new(UsageState {
         repo: Arc::new(MockUsageRepo {
+            last_purge_cutoff: None,
             points: vec![],
             inserted_events: 0,
             spend: None,
@@ -932,6 +999,7 @@ fn encoded_metrics_request() -> Bytes {
 async fn ingest_traces_treats_noop_insert_as_success() {
     let state = Arc::new(UsageState {
         repo: Arc::new(MockUsageRepo {
+            last_purge_cutoff: None,
             points: vec![],
             inserted_events: 0,
             spend: None,
@@ -958,6 +1026,7 @@ async fn ingest_traces_treats_noop_insert_as_success() {
 async fn ingest_traces_rejects_invalid_protobuf_as_bad_request() {
     let state = Arc::new(UsageState {
         repo: Arc::new(MockUsageRepo {
+            last_purge_cutoff: None,
             points: vec![],
             inserted_events: 0,
             spend: None,
@@ -986,6 +1055,7 @@ async fn ingest_traces_rejects_invalid_protobuf_as_bad_request() {
 async fn ingest_metrics_treats_noop_insert_as_success() {
     let state = Arc::new(UsageState {
         repo: Arc::new(MockUsageRepo {
+            last_purge_cutoff: None,
             points: vec![],
             inserted_events: 0,
             spend: None,
@@ -1012,6 +1082,7 @@ async fn ingest_metrics_treats_noop_insert_as_success() {
 async fn ingest_metrics_rejects_invalid_protobuf_as_bad_request() {
     let state = Arc::new(UsageState {
         repo: Arc::new(MockUsageRepo {
+            last_purge_cutoff: None,
             points: vec![],
             inserted_events: 0,
             spend: None,
@@ -1040,6 +1111,7 @@ async fn ingest_metrics_rejects_invalid_protobuf_as_bad_request() {
 async fn ingest_logs_accepts_json_content_type_payload() {
     let state = Arc::new(UsageState {
         repo: Arc::new(MockUsageRepo {
+            last_purge_cutoff: None,
             points: vec![],
             inserted_events: 0,
             spend: None,
@@ -1091,6 +1163,7 @@ async fn ingest_logs_accepts_gzip_encoded_body() {
 
     let state = Arc::new(UsageState {
         repo: Arc::new(MockUsageRepo {
+            last_purge_cutoff: None,
             points: vec![],
             inserted_events: 0,
             spend: None,

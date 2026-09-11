@@ -6,7 +6,6 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use chrono::Utc;
 use lightbridge_authz_core::{Error, Permission, Result};
 use std::sync::Arc;
 use tracing::{info, instrument, warn};
@@ -198,26 +197,21 @@ pub async fn query_usage(
     // dropped data", so OR in a range-truncation flag rather than report `truncated: false` for a
     // range the API cannot answer.
     //
-    // P2: the flag must reflect what the retention job actually did, not the config value alone.
-    // `state.raw_days` is `None` when the job is disabled (`retention.enabled: false`) -- nothing
-    // is ever purged, so `usage_events` holds everything ingested and no range is truncated by
-    // retention; stamping `truncated: true` on a complete answer would disclaim whole data during
-    // a billing dispute. Only when the job is enabled is a range older than the raw window
-    // genuinely truncated.
-    //
-    // The retention cutoff is day-truncated (`date_trunc('day', now() - raw_days)` in
-    // `retention.rs`), so compare against the same day-truncated instant. Comparing against the
-    // un-rounded `now() - raw_days` would report `truncated: true` for a window whose raw data is
-    // still fully present whenever `start_time` falls between the day boundary and the un-rounded
-    // instant.
-    let range_truncated = state.raw_days.is_some_and(|raw_days| {
-        let cutoff = (Utc::now() - chrono::Duration::days(raw_days))
-            .date_naive()
-            .and_hms_opt(0, 0, 0)
-            .expect("midnight is a valid time")
-            .and_utc();
-        input.start_time < cutoff
-    });
+    // P2: the flag must reflect what the retention job actually did, not the config value or the
+    // wall clock at query time. `last_purge_cutoff` is the day-truncated cutoff of the most recent
+    // successful run, persisted in `usage_retention_state` by the retention job; it is `None` when
+    // the job has never run (retention disabled, or a fresh start before the first run) -- nothing
+    // has been purged, so no range is truncated. Comparing `start_time` against the persisted
+    // cutoff (rather than recomputing `Utc::now() - raw_days` here) avoids the daily false-positive
+    // window where a query-time cutoff has advanced past what the job has actually purged.
+    let range_truncated = state
+        .raw_days
+        .is_some()
+        && state
+            .repo
+            .last_purge_cutoff()
+            .await?
+            .is_some_and(|cutoff| input.start_time < cutoff);
     let truncated = truncated || range_truncated;
 
     Ok((

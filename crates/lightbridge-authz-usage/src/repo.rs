@@ -154,6 +154,21 @@ impl StoreRepo {
         crate::spend::spend_for_account(self.pool(), account_id, start, end).await
     }
 
+    /// Reads the last successful retention purge cutoff from `usage_retention_state` (P2). `None`
+    /// when the job has never successfully run (or retention is disabled) -- nothing has been
+    /// purged, so no range is truncated by retention. The handler compares a request's `start_time`
+    /// against this persisted cutoff (rather than recomputing `Utc::now() - raw_days` at query
+    /// time) so `truncated` reflects what the job actually did.
+    pub async fn last_purge_cutoff(&self) -> Result<Option<DateTime<Utc>>> {
+        let cutoff: Option<DateTime<Utc>> = sqlx::query_scalar(
+            "SELECT last_purge_cutoff FROM usage_retention_state WHERE id = TRUE",
+        )
+        .fetch_optional(self.pool())
+        .await
+        .map_err(|e| Error::Database(format!("usage retention state read failed: {e}")))?;
+        Ok(cutoff)
+    }
+
     /// Returns up to `input.limit` WHOLE buckets plus whether more existed (#578). `truncated` is
     /// derived from the count of DISTINCT `bucket_start` values that matched, never from row
     /// count -- see below for why that distinction is load-bearing whenever `group_by` is

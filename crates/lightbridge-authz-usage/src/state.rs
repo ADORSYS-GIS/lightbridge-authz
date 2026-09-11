@@ -56,6 +56,9 @@ pub trait UsageRepoTrait: Send + Sync {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> Result<Option<f64>>;
+    /// Reads the last successful retention purge cutoff (P2) -- `None` when the job has never run,
+    /// so no range is truncated by retention. See `StoreRepo::last_purge_cutoff`.
+    async fn last_purge_cutoff(&self) -> Result<Option<DateTime<Utc>>>;
 }
 
 #[async_trait]
@@ -78,5 +81,9 @@ impl UsageRepoTrait for StoreRepo {
         end: DateTime<Utc>,
     ) -> Result<Option<f64>> {
         StoreRepo::spend_for_account(self, account_id, start, end).await
+    }
+
+    async fn last_purge_cutoff(&self) -> Result<Option<DateTime<Utc>>> {
+        StoreRepo::last_purge_cutoff(self).await
     }
 }
