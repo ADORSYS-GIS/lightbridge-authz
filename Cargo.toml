@@ -262,6 +262,7 @@ cuid = { version = "2", default-features = false, features = ["v2"] }
 getrandom = "0.4"
 goose = "0.18"
 httpmock = "0.8"
+tempfile = "3"
 # Dev-only: generates throwaway CA/leaf TLS keypairs at test runtime so tests can exercise real
 # TLS handshakes (crates/lightbridge-authz-budget/tests/usage_service_ca_bundle_tests.rs) without
 # ever committing a private key PEM to the repo -- gitleaks' `private-key` rule flags any committed

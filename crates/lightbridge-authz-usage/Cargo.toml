@@ -44,6 +44,7 @@ tokio.workspace = true
 sqlx.workspace = true
 tower.workspace = true
 httpmock.workspace = true
+tempfile.workspace = true
 
 [features]
 it-tests = []
@@ -76,4 +77,9 @@ required-features = ["it-tests"]
 [[test]]
 name = "execution_grain_it_tests"
 path = "tests/execution_grain_it_tests.rs"
+required-features = ["it-tests"]
+
+[[test]]
+name = "replay_tests"
+path = "tests/replay_tests.rs"
 required-features = ["it-tests"]
