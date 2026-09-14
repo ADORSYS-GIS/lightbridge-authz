@@ -331,10 +331,22 @@ actually live versus merely implemented — is in [`budget.md`](./budget.md).
 
 ## The usage side: a separate database
 
-The usage database (`lightbridge-authz-usage`'s own `DATABASE_URL`) hosts one hypertable family per
-grain of ADR-0027's four-grain taxonomy, each with `source TEXT NOT NULL` as a
-filterable/group-by-able dimension column (ADR-0027 Decision 2 — grain partitions storage, vendor
-never does). The execution grain (#582) and the request-grain rewrite are their own stories:
+`usage_events` (`migrations-usage/`) is **not** in the schema above — it lives in its own
+Postgres database (`lightbridge-authz-usage`'s own `DATABASE_URL`, provisioned
+independently from the authz Postgres instance; plain Postgres in production, no Timescale
+extension), ingested via unprotected OTLP/HTTP
+(`/v1/otel/traces`, `/v1/otel/metrics`, `/v1/otel/logs`) and queried via
+`/usage/v1/usage/query` (mTLS + Bearer JWT + ownership since #570/#603). It carries
+`account_id`/`project_id` as plain `TEXT` columns with no foreign key back into `accounts`/
+`projects` — there is no live referential relationship, only a shared convention of which id
+format each column holds. The budget domain reads spend directly from this table
+(`crates/lightbridge-authz-budget/src/spend.rs`); see `budget.md`'s "spend dependency" section for
+what happens when this database is unavailable.
+
+The usage database also hosts one hypertable family per grain of ADR-0027's four-grain taxonomy,
+each with `source TEXT NOT NULL` as a filterable/group-by-able dimension column (ADR-0027 Decision
+2 — grain partitions storage, vendor never does). The execution grain (#582) and the request-grain
+rewrite are their own stories:
 
 | Table | Grain | Partition column | Retention | Status |
 |---|---|---|---|---|
@@ -353,9 +365,7 @@ target (ADR-0028 D22; ADR-0039 bans `gen_random_uuid()` defaults), and a D22 tes
 into an already-compressed chunk is still absorbed by it.
 
 All tables share no foreign keys back into `accounts`/`projects` — plain `TEXT` columns with
-the shared convention of which id format each holds. The budget domain reads spend directly
-(`crates/lightbridge-authz-budget/src/spend.rs`); see `budget.md`'s "spend dependency" section for
-what happens when this database is unavailable.
+the shared convention of which id format each holds.
 
 The execution grain (#582) adds three further tables to the same usage database —
 `usage_executions`, `usage_model_calls`, `usage_tool_calls` — ported from
@@ -431,7 +441,7 @@ scratch:
 | `project_members` | Composite primary key `(project_id, account_id)`; cratestack's schema only models it as a relation target with a synthetic `id`, explicitly barred from the migration generator. |
 | `exchange_refresh_tokens` | Refresh-token rotation is a compare-and-swap (`SELECT ... FOR UPDATE`), not a plain CRUD write. |
 | `federated_identities` (ADR-0024) | Carries a sealed credential (`token_envelope`); must be structurally unreachable from any generated read path, same class as `signing_keys` — modelling it, even `@@allow`-less, would still leave it reachable as a relation target. |
-| `lightbridge-authz-usage`'s `usage_events` queries | Dynamic `QueryBuilder`-assembled aggregates against the Timescale-backed table, driven by caller-selected dimensions/filters. |
+| `lightbridge-authz-usage`'s `usage_events` queries | Dynamic `QueryBuilder`-assembled aggregates against the table (plus the `usage_events_daily` rollup for spend, #549), driven by caller-selected dimensions/filters. |
 | `usage_day_facts` / `usage_seat_snapshots` (#583) | Same class as `usage_events`: TimescaleDB hypertables with upsert-on-natural-key semantics. Cratestack's generated CRUD cannot express `create_hypertable`, `add_retention_policy`, `add_compression_policy`, or `ON CONFLICT (composite, including partition column) DO UPDATE`. Justified in the migration headers as an ADR-0038 exception per the grain-partitioned time-series + CAS/upsert exception class. |
 
 This repo runs `cratestack-pg` 0.5.1; ADR-0038's own capability findings were verified against

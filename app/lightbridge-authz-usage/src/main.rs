@@ -43,6 +43,7 @@ async fn main() -> Result<()> {
                 &config.database,
                 &config.oauth2,
                 &config.scope_authority,
+                &config.retention,
             )
             .await
         }

@@ -91,6 +91,27 @@ pub async fn query_usage(
     let metrics = input.effective_metrics();
     let (points, truncated) = state.repo.query_usage(&input).await?;
 
+    // P1-5: `/usage/v1/usage/query` reads raw `usage_events` only (the rollup does not carry
+    // latency percentiles), so a request whose range extends before the raw retention window has
+    // silently no data there. `truncated` is the published field whose job (#578) is to say "we
+    // dropped data", so OR in a range-truncation flag rather than report `truncated: false` for a
+    // range the API cannot answer.
+    //
+    // P2: the flag must reflect what the retention job actually did, not the config value or the
+    // wall clock at query time. `last_purge_cutoff` is the day-truncated cutoff of the most recent
+    // successful run, persisted in `usage_retention_state` by the retention job; it is `None` when
+    // the job has never run (retention disabled, or a fresh start before the first run) -- nothing
+    // has been purged, so no range is truncated. Comparing `start_time` against the persisted
+    // cutoff (rather than recomputing `Utc::now() - raw_days` here) avoids the daily false-positive
+    // window where a query-time cutoff has advanced past what the job has actually purged.
+    let range_truncated = state.raw_days.is_some()
+        && state
+            .repo
+            .last_purge_cutoff()
+            .await?
+            .is_some_and(|cutoff| input.start_time < cutoff);
+    let truncated = truncated || range_truncated;
+
     Ok((
         StatusCode::OK,
         Json(UsageQueryResponse {

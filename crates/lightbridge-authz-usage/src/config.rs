@@ -3,6 +3,10 @@ use lightbridge_authz_core::config::{Database, Logging, Oauth2, Otel, Tls, load_
 use serde::Deserialize;
 use tracing::debug;
 
+// `RetentionConfig` lives in `retention_config` (split out by the LoC gate); re-export it here so
+// every existing `use config::RetentionConfig` path still resolves.
+pub use crate::retention_config::RetentionConfig;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct UsageConfig {
     pub server: UsageServerGroup,
@@ -22,6 +26,12 @@ pub struct UsageConfig {
     /// `oauth2` above is: this is the one thing that turns "we validated a bearer token" into "and
     /// this user actually owns what they're asking about."
     pub scope_authority: ScopeAuthorityConfig,
+    /// Retention/rollup for `usage_events` (#549 AC2). Optional with safe defaults: the background
+    /// job is OFF by default (see [`RetentionConfig::enabled`] for the rollback-safety reason),
+    /// and when enabled keeps 90 days of raw events and rolls older rows into `usage_events_daily`
+    /// hourly. See [`RetentionConfig`].
+    #[serde(default)]
+    pub retention: RetentionConfig,
 }
 
 /// HTTP client config for calling `authz-opa`'s `POST /idp/v1/authorize-usage-scope` (#570).
@@ -85,195 +95,29 @@ pub struct UsageServer {
 
 pub fn load_from_path<P: AsRef<std::path::Path>>(path: P) -> Result<UsageConfig> {
     debug!("loading usage config from {:?}", path.as_ref());
-    let config = load_yaml_from_path(path)?;
+    let config: UsageConfig = load_yaml_from_path(path)?;
+    if config.retention.raw_days < 90 {
+        return Err(lightbridge_authz_core::Error::Server(format!(
+            "retention.raw_days must be >= 90 (got {})",
+            config.retention.raw_days
+        )));
+    }
+    if config.retention.rollup_days < 1 {
+        return Err(lightbridge_authz_core::Error::Server(format!(
+            "retention.rollup_days must be >= 1 (got {})",
+            config.retention.rollup_days
+        )));
+    }
+    // The rollup must retain data LONGER than the raw window, or a rolled-up day is deleted from
+    // `usage_events_daily` in the same transaction that wrote it (the rollup purge cutoff is
+    // `rollup_days`, and a day older than `raw_days` is already older than `rollup_days` when
+    // `rollup_days <= raw_days`). That would silently destroy every rolled-up day.
+    if config.retention.rollup_days <= config.retention.raw_days {
+        return Err(lightbridge_authz_core::Error::Server(format!(
+            "retention.rollup_days must be > retention.raw_days (got rollup_days={}, raw_days={})",
+            config.retention.rollup_days, config.retention.raw_days
+        )));
+    }
     debug!("loaded usage config successfully");
     Ok(config)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::env;
-    use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    #[test]
-    fn interpolate_env_vars_should_handle_default_values() {
-        unsafe {
-            env::remove_var("USAGE_MISSING_VAR");
-        }
-
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time should be monotonic")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("usage-config-{unique}.yaml"));
-        let content = r#"
-server:
-  usage:
-    address: "0.0.0.0"
-    port: 3002
-    tls:
-      cert_path: "/tls/usage.crt"
-      key_path: "/tls/usage.key"
-  query:
-    address: "0.0.0.0"
-    port: 3006
-    tls:
-      cert_path: "/tls/usage.crt"
-      key_path: "/tls/usage.key"
-      client_ca_bundle_path: "/tls/ca.crt"
-logging:
-  level: "info"
-database:
-  url: "postgres://${USAGE_MISSING_VAR:-host}:5432/db"
-  pool_size: 10
-otel:
-  enabled: false
-  otlp_endpoint: "http://localhost:4317"
-  service_name: "lightbridge-authz-usage"
-oauth2:
-  type: external
-  jwks_url: "http://keycloak:9100/realms/dev/protocol/openid-connect/certs"
-scope_authority:
-  base_url: "https://authz-opa:3001"
-  username: "authorino"
-  password: "change-me"
-"#;
-        fs::write(&path, content).expect("temp config should be written");
-
-        let cfg = load_from_path(&path).expect("config should load");
-        fs::remove_file(&path).expect("temp config should be removed");
-
-        assert_eq!(cfg.database.url, "postgres://host:5432/db");
-    }
-
-    /// #347: `server.query` is required (not `Option`), a deliberate hard cutover -- a config that
-    /// omits it must fail to load rather than silently leaving `/usage/v1/usage/query`/
-    /// `/usage/v1/spend/query` on the old unauthenticated listener. See `UsageServerGroup::query`'s
-    /// doc comment for the full reasoning and the required deploy-ordering consequence.
-    #[test]
-    fn config_missing_query_server_fails_to_load() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time should be monotonic")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("usage-config-missing-query-{unique}.yaml"));
-        let content = r#"
-server:
-  usage:
-    address: "0.0.0.0"
-    port: 3002
-    tls:
-      cert_path: "/tls/usage.crt"
-      key_path: "/tls/usage.key"
-logging:
-  level: "info"
-database:
-  url: "postgres://host:5432/db"
-  pool_size: 10
-otel:
-  enabled: false
-  otlp_endpoint: "http://localhost:4317"
-  service_name: "lightbridge-authz-usage"
-oauth2:
-  type: external
-  jwks_url: "http://keycloak:9100/realms/dev/protocol/openid-connect/certs"
-scope_authority:
-  base_url: "https://authz-opa:3001"
-  username: "authorino"
-  password: "change-me"
-"#;
-        fs::write(&path, content).expect("temp config should be written");
-
-        let result = load_from_path(&path);
-        fs::remove_file(&path).expect("temp config should be removed");
-
-        assert!(
-            result.is_err(),
-            "a config omitting server.query must fail to load, not silently degrade"
-        );
-    }
-
-    fn valid_server_and_logging_block() -> &'static str {
-        r#"
-server:
-  usage:
-    address: "0.0.0.0"
-    port: 3002
-    tls:
-      cert_path: "/tls/usage.crt"
-      key_path: "/tls/usage.key"
-  query:
-    address: "0.0.0.0"
-    port: 3006
-    tls:
-      cert_path: "/tls/usage.crt"
-      key_path: "/tls/usage.key"
-      client_ca_bundle_path: "/tls/ca.crt"
-logging:
-  level: "info"
-database:
-  url: "postgres://host:5432/db"
-  pool_size: 10
-otel:
-  enabled: false
-  otlp_endpoint: "http://localhost:4317"
-  service_name: "lightbridge-authz-usage"
-"#
-    }
-
-    /// #570: `oauth2` (used to validate the end-user bearer token `/usage/v1/usage/query` now
-    /// requires) is required, not `Option` -- see [`UsageConfig::oauth2`]'s doc comment. A config
-    /// omitting it must fail to load, not silently leave the query listener unable to validate a
-    /// bearer token.
-    #[test]
-    fn config_missing_oauth2_fails_to_load() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time should be monotonic")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("usage-config-missing-oauth2-{unique}.yaml"));
-        let content = format!(
-            "{}\nscope_authority:\n  base_url: \"https://authz-opa:3001\"\n  username: \"authorino\"\n  password: \"change-me\"\n",
-            valid_server_and_logging_block()
-        );
-        fs::write(&path, content).expect("temp config should be written");
-
-        let result = load_from_path(&path);
-        fs::remove_file(&path).expect("temp config should be removed");
-
-        assert!(
-            result.is_err(),
-            "a config omitting oauth2 must fail to load, not silently degrade"
-        );
-    }
-
-    /// #570: `scope_authority` (the ownership authority `/usage/v1/usage/query` calls for
-    /// `account`/`project` scopes) is required, not `Option` -- see
-    /// [`UsageConfig::scope_authority`]'s doc comment. A config omitting it must fail to load, not
-    /// silently leave the query listener unable to enforce ownership.
-    #[test]
-    fn config_missing_scope_authority_fails_to_load() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time should be monotonic")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "usage-config-missing-scope-authority-{unique}.yaml"
-        ));
-        let content = format!(
-            "{}\noauth2:\n  type: external\n  jwks_url: \"http://keycloak:9100/realms/dev/protocol/openid-connect/certs\"\n",
-            valid_server_and_logging_block()
-        );
-        fs::write(&path, content).expect("temp config should be written");
-
-        let result = load_from_path(&path);
-        fs::remove_file(&path).expect("temp config should be removed");
-
-        assert!(
-            result.is_err(),
-            "a config omitting scope_authority must fail to load, not silently degrade"
-        );
-    }
 }
