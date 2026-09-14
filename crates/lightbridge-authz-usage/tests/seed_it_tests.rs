@@ -31,6 +31,7 @@ fn build_state(pool: PgPool) -> Arc<UsageState> {
         repo,
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        raw_days: None,
     })
 }
 

@@ -1102,8 +1102,14 @@ hand-written SQL and direct `sqlx` dependencies.
     code/client/redirect binding is an authentication boundary that generated CRUD cannot express
     (ADR-0019, #425; `consume_authorization_code` in
     `crates/lightbridge-authz-api-key/src/repo.rs`).
-  - `lightbridge-authz-usage`: dynamic `QueryBuilder` aggregates against the Timescale-backed
-    `usage_events` table (`query_usage` in `crates/lightbridge-authz-usage/src/repo.rs`).
+  - `lightbridge-authz-usage`: dynamic `QueryBuilder` aggregates against the `usage_events` table
+    (`query_usage` in `crates/lightbridge-authz-usage/src/repo.rs`), plus the hand-written
+    retention/rollup statements in `crates/lightbridge-authz-usage/src/retention.rs`
+    (`ROLLUP_AND_PURGE_SQL`/`ROLLUP_PURGE_SQL` -- a `DELETE ... RETURNING` feeding an
+    `INSERT ... SELECT ... ON CONFLICT DO UPDATE` that generated CRUD cannot express) and the
+    `spend_for_account` UNION ALL over `usage_events`/`usage_events_daily` (same file).
+    `usage_events` is declared a Timescale hypertable (`create_hypertable` in the init migration)
+    but degrades to plain Postgres -- production runs plain Postgres today (#549 Finding 2).
   - `usage_day_facts` / `usage_seat_snapshots` (#583): same class as `usage_events` — TimescaleDB
     hypertables with upsert-on-natural-key semantics. Cratestack's generated CRUD cannot express
     `create_hypertable`, `add_retention_policy`, `add_compression_policy`, or `ON CONFLICT

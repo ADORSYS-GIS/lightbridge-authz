@@ -16,12 +16,17 @@ use lightbridge_authz_core::{
 use lightbridge_authz_usage_rest::{
     UsageRepoTrait, UsageState, build_ingest_router, build_query_router,
     handlers::{
+        execution::query_executions,
         ingest::{ingest_logs, ingest_metrics, ingest_traces},
         query::query_usage,
     },
     models::{
         UsageGroupBy, UsageQueryFilters, UsageQueryRequest, UsageQueryResponse, UsageScope,
         UsageSeriesPoint,
+        execution::{
+            ExecutionQueryFilters, ExecutionQueryRequest, ExecutionQueryResponse,
+            ExecutionSeriesPoint,
+        },
     },
     repo::{StoreRepo, UsageEvent},
 };
@@ -48,6 +53,9 @@ struct MockUsageRepo {
     inserted_events: usize,
     spend: Option<f64>,
     truncated: bool,
+    last_purge_cutoff: Option<chrono::DateTime<Utc>>,
+    execution_points: Vec<ExecutionSeriesPoint>,
+    execution_truncated: bool,
 }
 
 #[async_trait]
@@ -63,6 +71,13 @@ impl UsageRepoTrait for MockUsageRepo {
         Ok((self.points.clone(), self.truncated))
     }
 
+    async fn query_executions(
+        &self,
+        _input: &ExecutionQueryRequest,
+    ) -> Result<(Vec<ExecutionSeriesPoint>, bool)> {
+        Ok((self.execution_points.clone(), self.execution_truncated))
+    }
+
     async fn spend_for_account(
         &self,
         _account_id: &str,
@@ -70,6 +85,10 @@ impl UsageRepoTrait for MockUsageRepo {
         _end: chrono::DateTime<Utc>,
     ) -> Result<Option<f64>> {
         Ok(self.spend)
+    }
+
+    async fn last_purge_cutoff(&self) -> Result<Option<chrono::DateTime<Utc>>> {
+        Ok(self.last_purge_cutoff)
     }
 }
 
@@ -103,10 +122,13 @@ fn lazy_pool() -> Arc<dyn DbPoolTrait> {
 fn mock_state() -> Arc<UsageState> {
     Arc::new(UsageState {
         repo: Arc::new(MockUsageRepo {
+            last_purge_cutoff: None,
             points: vec![],
             inserted_events: 0,
             spend: None,
             truncated: false,
+            execution_points: vec![],
+            execution_truncated: false,
         }),
         bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
         scope_authority: Arc::new(support::FakeScopeAuthority::new().authorizing(
@@ -115,6 +137,7 @@ fn mock_state() -> Arc<UsageState> {
             &UsageScope::Project,
             "proj_1",
         )),
+        raw_days: Some(90),
     })
 }
 
@@ -348,6 +371,7 @@ async fn query_usage_returns_timeseries_points_when_query_is_valid() {
     let now = Utc::now();
     let state = Arc::new(UsageState {
         repo: Arc::new(MockUsageRepo {
+            last_purge_cutoff: None,
             inserted_events: 1,
             points: vec![UsageSeriesPoint {
                 bucket_start: now,
@@ -376,6 +400,8 @@ async fn query_usage_returns_timeseries_points_when_query_is_valid() {
             }],
             spend: None,
             truncated: false,
+            execution_points: vec![],
+            execution_truncated: false,
         }),
         bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
         scope_authority: Arc::new(support::FakeScopeAuthority::new().authorizing(
@@ -384,6 +410,7 @@ async fn query_usage_returns_timeseries_points_when_query_is_valid() {
             &UsageScope::Project,
             "proj_1",
         )),
+        raw_days: Some(90),
     });
 
     let req = base_request();
@@ -432,6 +459,9 @@ async fn query_usage_serializes_null_total_cost_as_null_not_zero() {
             inserted_events: 0,
             spend: None,
             truncated: false,
+            last_purge_cutoff: None,
+            execution_points: vec![],
+            execution_truncated: false,
         }),
         bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
         scope_authority: Arc::new(support::FakeScopeAuthority::new().authorizing(
@@ -440,6 +470,7 @@ async fn query_usage_serializes_null_total_cost_as_null_not_zero() {
             &UsageScope::Project,
             "proj_1",
         )),
+        raw_days: Some(90),
     });
 
     let response = call_query_usage(state, authorized_headers(), base_request()).await;
@@ -464,6 +495,128 @@ async fn query_usage_serializes_null_total_cost_as_null_not_zero() {
         serde_json::from_value(body).expect("response body must decode as UsageQueryResponse");
     assert_eq!(payload.points.len(), 1);
     assert!(payload.points[0].total_cost.is_none());
+}
+
+/// P1-5: `/usage/v1/usage/query` reads raw `usage_events` only, so a request whose `start_time` is
+/// older than the raw retention window (`raw_days`, default 90) has no data there. The handler must
+/// set `truncated: true` for such a range rather than report `truncated: false` for a range it
+/// cannot answer. P2: the flag comes from the retention job's persisted purge cutoff -- the mock
+/// supplies one at the raw-window boundary, so a `start_time` older than it is flagged truncated.
+#[tokio::test]
+async fn query_usage_sets_truncated_when_start_time_predates_the_raw_retention_window() {
+    let state = Arc::new(UsageState {
+        repo: Arc::new(MockUsageRepo {
+            points: vec![],
+            inserted_events: 0,
+            spend: None,
+            truncated: false,
+            last_purge_cutoff: Some(Utc::now() - Duration::days(90)),
+            execution_points: vec![],
+            execution_truncated: false,
+        }),
+        bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
+        scope_authority: Arc::new(support::FakeScopeAuthority::new().authorizing(
+            TEST_ISSUER,
+            TEST_SUBJECT,
+            &UsageScope::Project,
+            "proj_1",
+        )),
+        raw_days: Some(90),
+    });
+    let mut req = base_request();
+    // Older than the 90-day raw window.
+    req.start_time = Utc::now() - Duration::days(200);
+    req.end_time = Utc::now() - Duration::days(100);
+
+    let response = call_query_usage(state, authorized_headers(), req).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: UsageQueryResponse = serde_json::from_value(body_json(response).await)
+        .expect("response body must decode as UsageQueryResponse");
+    assert!(
+        payload.truncated,
+        "a range predating the raw retention window must be reported as truncated"
+    );
+}
+
+/// P2: `range_truncated` follows the retention job's persisted purge cutoff, not the wall clock at
+/// query time. A `start_time` after the persisted cutoff -- even one that a query-time
+/// `Utc::now() - raw_days` recomputation could call truncated during the daily advance window -- is
+/// NOT flagged, because the job has not actually purged it.
+#[tokio::test]
+async fn query_usage_does_not_flag_truncated_when_start_time_is_after_the_persisted_cutoff() {
+    let state = Arc::new(UsageState {
+        repo: Arc::new(MockUsageRepo {
+            points: vec![],
+            inserted_events: 0,
+            spend: None,
+            truncated: false,
+            last_purge_cutoff: Some(Utc::now() - Duration::days(90)),
+            execution_points: vec![],
+            execution_truncated: false,
+        }),
+        bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
+        scope_authority: Arc::new(support::FakeScopeAuthority::new().authorizing(
+            TEST_ISSUER,
+            TEST_SUBJECT,
+            &UsageScope::Project,
+            "proj_1",
+        )),
+        raw_days: Some(90),
+    });
+    let mut req = base_request();
+    // Within the raw window, after the persisted cutoff.
+    req.start_time = Utc::now() - Duration::days(50);
+    req.end_time = Utc::now();
+
+    let response = call_query_usage(state, authorized_headers(), req).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: UsageQueryResponse = serde_json::from_value(body_json(response).await)
+        .expect("response body must decode as UsageQueryResponse");
+    assert!(
+        !payload.truncated,
+        "a range after the persisted purge cutoff must not be flagged truncated"
+    );
+}
+
+/// P2: `range_truncated` must reflect what the retention job actually did, not the config value
+/// alone. When the job is disabled (`retention.enabled: false`, so `state.raw_days` is `None`),
+/// nothing is ever purged -- `usage_events` holds everything ingested -- so a range predating the
+/// (unused) raw window must NOT be flagged truncated. Stamping `truncated: true` on a complete
+/// answer would disclaim whole data during a billing dispute.
+#[tokio::test]
+async fn query_usage_does_not_flag_truncated_when_retention_is_disabled() {
+    let state = Arc::new(UsageState {
+        repo: Arc::new(MockUsageRepo {
+            last_purge_cutoff: None,
+            points: vec![],
+            inserted_events: 0,
+            spend: None,
+            truncated: false,
+            execution_points: vec![],
+            execution_truncated: false,
+        }),
+        bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
+        scope_authority: Arc::new(support::FakeScopeAuthority::new().authorizing(
+            TEST_ISSUER,
+            TEST_SUBJECT,
+            &UsageScope::Project,
+            "proj_1",
+        )),
+        raw_days: None,
+    });
+    let mut req = base_request();
+    // Older than the (disabled) 90-day raw window -- but nothing was ever purged.
+    req.start_time = Utc::now() - Duration::days(200);
+    req.end_time = Utc::now() - Duration::days(100);
+
+    let response = call_query_usage(state, authorized_headers(), req).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: UsageQueryResponse = serde_json::from_value(body_json(response).await)
+        .expect("response body must decode as UsageQueryResponse");
+    assert!(
+        !payload.truncated,
+        "with retention disabled nothing is purged, so a complete answer must not be flagged truncated"
+    );
 }
 
 /// #570: no `Authorization` header at all -- 401, no data.
@@ -559,6 +712,7 @@ async fn query_usage_refuses_unrecognized_bearer_with_401() {
 async fn query_usage_refuses_when_scope_authority_declines() {
     let state = Arc::new(UsageState {
         repo: Arc::new(MockUsageRepo {
+            last_purge_cutoff: None,
             points: vec![UsageSeriesPoint {
                 bucket_start: Utc::now(),
                 account_id: None,
@@ -587,9 +741,12 @@ async fn query_usage_refuses_when_scope_authority_declines() {
             inserted_events: 0,
             spend: None,
             truncated: false,
+            execution_points: vec![],
+            execution_truncated: false,
         }),
         bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
         scope_authority: support::refuse_everything_scope_authority(),
+        raw_days: Some(90),
     });
 
     let response = call_query_usage(state, authorized_headers(), base_request()).await;
@@ -621,6 +778,7 @@ async fn query_usage_refuses_api_key_scope_unconditionally() {
         repo: Arc::new(MockUsageRepo::default()),
         bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
         scope_authority: Arc::new(AuthorizeEverything),
+        raw_days: Some(90),
     });
 
     let req = UsageQueryRequest {
@@ -644,13 +802,17 @@ async fn query_usage_refuses_api_key_scope_unconditionally() {
 async fn query_usage_allows_own_user_scope() {
     let state = Arc::new(UsageState {
         repo: Arc::new(MockUsageRepo {
+            last_purge_cutoff: None,
             points: vec![],
             inserted_events: 0,
             spend: None,
             truncated: false,
+            execution_points: vec![],
+            execution_truncated: false,
         }),
         bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
         scope_authority: support::refuse_everything_scope_authority(),
+        raw_days: Some(90),
     });
 
     let req = UsageQueryRequest {
@@ -671,6 +833,7 @@ async fn query_usage_refuses_other_subjects_user_scope() {
         repo: Arc::new(MockUsageRepo::default()),
         bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
         scope_authority: Arc::new(AuthorizeEverything),
+        raw_days: Some(90),
     });
 
     let req = UsageQueryRequest {
@@ -692,6 +855,7 @@ async fn query_usage_refuses_all_scope_without_permission() {
         repo: Arc::new(MockUsageRepo::default()),
         bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
         scope_authority: Arc::new(AuthorizeEverything),
+        raw_days: Some(90),
     });
 
     let req = UsageQueryRequest {
@@ -719,6 +883,7 @@ async fn query_usage_allows_all_scope_with_permission() {
             ]),
         ),
         scope_authority: support::refuse_everything_scope_authority(),
+        raw_days: Some(90),
     });
 
     let req = UsageQueryRequest {
@@ -750,6 +915,7 @@ async fn query_usage_all_scope_does_not_require_scope_id() {
                 ]),
             ),
             scope_authority: support::refuse_everything_scope_authority(),
+            raw_days: Some(90),
         })),
         authorized_headers(),
         Json(req),
@@ -758,6 +924,165 @@ async fn query_usage_all_scope_does_not_require_scope_id() {
     assert!(
         result.is_ok(),
         "scope=all with an empty scope_id must not be rejected as a bad request"
+    );
+}
+
+fn execution_request(scope: UsageScope, scope_id: &str) -> ExecutionQueryRequest {
+    ExecutionQueryRequest {
+        scope,
+        scope_id: scope_id.to_string(),
+        start_time: Utc::now() - Duration::hours(1),
+        end_time: Utc::now(),
+        bucket: "5 minutes".to_string(),
+        filters: ExecutionQueryFilters::default(),
+        group_by: vec![],
+        limit: 100,
+    }
+}
+
+async fn call_query_executions(
+    state: Arc<UsageState>,
+    headers: HeaderMap,
+    req: ExecutionQueryRequest,
+) -> axum::response::Response {
+    query_executions(axum::extract::State(state), headers, Json(req))
+        .await
+        .expect("handler should not propagate an Err for an auth refusal")
+}
+
+/// #726: a valid `scope=user` self-ownership query returns `200` with the repo's points.
+#[tokio::test]
+async fn query_executions_returns_points_when_valid() {
+    let state = Arc::new(UsageState {
+        repo: Arc::new(MockUsageRepo {
+            execution_points: vec![ExecutionSeriesPoint {
+                bucket_start: Utc::now(),
+                source: Some("claude_code".to_string()),
+                model: Some("claude-sonnet-4-5".to_string()),
+                provider: Some("anthropic".to_string()),
+                executions_count: 1,
+                total_duration_ms: 1200,
+                total_cost: Some(5000),
+                total_input_tokens: 1200,
+                total_output_tokens: 400,
+                tool_call_count: 2,
+            }],
+            execution_truncated: false,
+            ..Default::default()
+        }),
+        bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
+        scope_authority: support::refuse_everything_scope_authority(),
+        raw_days: Some(90),
+    });
+
+    let response = call_query_executions(
+        state,
+        authorized_headers(),
+        execution_request(UsageScope::User, TEST_SUBJECT),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: ExecutionQueryResponse = serde_json::from_value(body_json(response).await)
+        .expect("response body must decode as ExecutionQueryResponse");
+    assert_eq!(payload.points.len(), 1);
+    assert_eq!(payload.points[0].executions_count, 1);
+    assert!(!payload.truncated);
+}
+
+/// #726: a missing bearer token is `401`, before any body validation.
+#[tokio::test]
+async fn query_executions_refuses_missing_bearer_with_401() {
+    let response = call_query_executions(
+        mock_state(),
+        HeaderMap::new(),
+        execution_request(UsageScope::User, TEST_SUBJECT),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// #726: `scope=user` for a subject OTHER than the caller's own is `403`, even when the authority
+/// would authorize everything (self-ownership is decided from the token, never delegated).
+#[tokio::test]
+async fn query_executions_refuses_other_subjects_user_scope_with_403() {
+    let state = Arc::new(UsageState {
+        repo: Arc::new(MockUsageRepo::default()),
+        bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
+        scope_authority: Arc::new(AuthorizeEverything),
+        raw_days: Some(90),
+    });
+
+    let response = call_query_executions(
+        state,
+        authorized_headers(),
+        execution_request(UsageScope::User, "someone-else"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(response).await, serde_json::Value::Null);
+}
+
+/// #726: `scope=account` is not applicable to the execution grain and is `400`.
+#[tokio::test]
+async fn query_executions_rejects_account_scope_with_400() {
+    let state = Arc::new(UsageState {
+        repo: Arc::new(MockUsageRepo::default()),
+        bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
+        scope_authority: Arc::new(AuthorizeEverything),
+        raw_days: Some(90),
+    });
+
+    let result = query_executions(
+        axum::extract::State(state),
+        authorized_headers(),
+        Json(execution_request(UsageScope::Account, "acct-1")),
+    )
+    .await;
+    assert!(
+        matches!(result, Err(Error::BadRequest(_))),
+        "scope=account must be a 400 for the execution grain"
+    );
+}
+
+/// #726: `total_cost: null` survives serialization as `null`, never `0` (governance#188).
+#[tokio::test]
+async fn query_executions_null_cost_serializes_as_null() {
+    let state = Arc::new(UsageState {
+        repo: Arc::new(MockUsageRepo {
+            execution_points: vec![ExecutionSeriesPoint {
+                bucket_start: Utc::now(),
+                source: None,
+                model: None,
+                provider: None,
+                executions_count: 1,
+                total_duration_ms: 0,
+                total_cost: None,
+                total_input_tokens: 0,
+                total_output_tokens: 0,
+                tool_call_count: 0,
+            }],
+            execution_truncated: false,
+            ..Default::default()
+        }),
+        bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
+        scope_authority: support::refuse_everything_scope_authority(),
+        raw_days: Some(90),
+    });
+
+    let response = call_query_executions(
+        state,
+        authorized_headers(),
+        execution_request(UsageScope::User, TEST_SUBJECT),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let value = body_json(response).await;
+    assert_eq!(
+        value["points"][0]["total_cost"],
+        serde_json::Value::Null,
+        "total_cost: None must serialize as null, never 0"
     );
 }
 
@@ -781,13 +1106,17 @@ fn headers_with_source(source: &str) -> HeaderMap {
 async fn ingest_logs_treats_noop_insert_as_success() {
     let state = Arc::new(UsageState {
         repo: Arc::new(MockUsageRepo {
+            last_purge_cutoff: None,
             points: vec![],
             inserted_events: 0,
             spend: None,
             truncated: false,
+            execution_points: vec![],
+            execution_truncated: false,
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        raw_days: Some(90),
     });
 
     let response = ingest_logs(
@@ -806,13 +1135,17 @@ async fn ingest_logs_treats_noop_insert_as_success() {
 async fn ingest_logs_rejects_invalid_protobuf_as_bad_request() {
     let state = Arc::new(UsageState {
         repo: Arc::new(MockUsageRepo {
+            last_purge_cutoff: None,
             points: vec![],
             inserted_events: 0,
             spend: None,
             truncated: false,
+            execution_points: vec![],
+            execution_truncated: false,
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        raw_days: Some(90),
     });
 
     let result = ingest_logs(
@@ -837,9 +1170,13 @@ async fn ingest_logs_rejects_unknown_source() {
             inserted_events: 0,
             spend: None,
             truncated: false,
+            last_purge_cutoff: None,
+            execution_points: vec![],
+            execution_truncated: false,
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        raw_days: None,
     });
 
     let mut headers = HeaderMap::new();
@@ -862,9 +1199,13 @@ async fn ingest_logs_rejects_missing_source_header() {
             inserted_events: 0,
             spend: None,
             truncated: false,
+            last_purge_cutoff: None,
+            execution_points: vec![],
+            execution_truncated: false,
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        raw_days: None,
     });
 
     let result = ingest_logs(
@@ -1000,13 +1341,17 @@ fn encoded_metrics_request() -> Bytes {
 async fn ingest_traces_treats_noop_insert_as_success() {
     let state = Arc::new(UsageState {
         repo: Arc::new(MockUsageRepo {
+            last_purge_cutoff: None,
             points: vec![],
             inserted_events: 0,
             spend: None,
             truncated: false,
+            execution_points: vec![],
+            execution_truncated: false,
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        raw_days: Some(90),
     });
 
     let response = ingest_traces(
@@ -1025,13 +1370,17 @@ async fn ingest_traces_treats_noop_insert_as_success() {
 async fn ingest_traces_rejects_invalid_protobuf_as_bad_request() {
     let state = Arc::new(UsageState {
         repo: Arc::new(MockUsageRepo {
+            last_purge_cutoff: None,
             points: vec![],
             inserted_events: 0,
             spend: None,
             truncated: false,
+            execution_points: vec![],
+            execution_truncated: false,
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        raw_days: Some(90),
     });
 
     let result = ingest_traces(
@@ -1056,9 +1405,13 @@ async fn ingest_traces_rejects_unknown_source() {
             inserted_events: 0,
             spend: None,
             truncated: false,
+            last_purge_cutoff: None,
+            execution_points: vec![],
+            execution_truncated: false,
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        raw_days: None,
     });
 
     let mut headers = HeaderMap::new();
@@ -1082,13 +1435,17 @@ async fn ingest_traces_rejects_unknown_source() {
 async fn ingest_metrics_treats_noop_insert_as_success() {
     let state = Arc::new(UsageState {
         repo: Arc::new(MockUsageRepo {
+            last_purge_cutoff: None,
             points: vec![],
             inserted_events: 0,
             spend: None,
             truncated: false,
+            execution_points: vec![],
+            execution_truncated: false,
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        raw_days: Some(90),
     });
 
     let response = ingest_metrics(
@@ -1107,13 +1464,17 @@ async fn ingest_metrics_treats_noop_insert_as_success() {
 async fn ingest_metrics_rejects_invalid_protobuf_as_bad_request() {
     let state = Arc::new(UsageState {
         repo: Arc::new(MockUsageRepo {
+            last_purge_cutoff: None,
             points: vec![],
             inserted_events: 0,
             spend: None,
             truncated: false,
+            execution_points: vec![],
+            execution_truncated: false,
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        raw_days: Some(90),
     });
 
     let result = ingest_metrics(
@@ -1138,9 +1499,13 @@ async fn ingest_metrics_rejects_unknown_source() {
             inserted_events: 0,
             spend: None,
             truncated: false,
+            last_purge_cutoff: None,
+            execution_points: vec![],
+            execution_truncated: false,
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        raw_days: None,
     });
 
     let mut headers = HeaderMap::new();
@@ -1164,13 +1529,17 @@ async fn ingest_metrics_rejects_unknown_source() {
 async fn ingest_logs_accepts_json_content_type_payload() {
     let state = Arc::new(UsageState {
         repo: Arc::new(MockUsageRepo {
+            last_purge_cutoff: None,
             points: vec![],
             inserted_events: 0,
             spend: None,
             truncated: false,
+            execution_points: vec![],
+            execution_truncated: false,
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        raw_days: Some(90),
     });
 
     let body = serde_json::json!({
@@ -1214,13 +1583,17 @@ async fn ingest_logs_accepts_gzip_encoded_body() {
 
     let state = Arc::new(UsageState {
         repo: Arc::new(MockUsageRepo {
+            last_purge_cutoff: None,
             points: vec![],
             inserted_events: 0,
             spend: None,
             truncated: false,
+            execution_points: vec![],
+            execution_truncated: false,
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        raw_days: Some(90),
     });
 
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
@@ -1252,9 +1625,13 @@ async fn ingest_endpoints_reject_missing_or_unknown_x_source_header() {
             inserted_events: 0,
             spend: None,
             truncated: false,
+            last_purge_cutoff: None,
+            execution_points: vec![],
+            execution_truncated: false,
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        raw_days: None,
     });
 
     // Missing header

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 pub mod day_seat;
-
+pub mod execution;
 #[derive(Debug, Serialize, ToSchema)]
 pub struct IngestResponse {
     pub accepted_events: usize,
