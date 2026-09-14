@@ -319,7 +319,6 @@ fn default_bucket() -> String {
 fn default_limit() -> u32 {
     1_000
 }
-
 /// Request body for the internal, mTLS-protected `/usage/v1/spend/query` endpoint (the query
 /// listener requires and verifies a client certificate -- see `UsageServerGroup::query`'s doc
 /// comment; this route carries no Basic-auth or bearer check of its own). Answers
