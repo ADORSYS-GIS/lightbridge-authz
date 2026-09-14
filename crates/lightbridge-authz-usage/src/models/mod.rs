@@ -3,6 +3,7 @@ use lightbridge_authz_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+pub mod day_fact;
 pub mod day_seat;
 pub mod execution;
 #[derive(Debug, Serialize, ToSchema)]
