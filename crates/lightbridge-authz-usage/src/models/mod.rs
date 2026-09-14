@@ -288,7 +288,7 @@ pub struct UsageSeriesPoint {
     pub billing_plan: Option<String>,
     pub requests: i64,
     pub usage_value: f64,
-    pub total_cost: f64,
+    pub total_cost: Option<f64>,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
     pub total_tokens: i64,
