@@ -73,7 +73,9 @@ impl StoreRepo {
 ///
 /// Mirrors `build_day_fact_query`'s nested-subquery + `dense_rank()` shape (one `FROM
 /// usage_seat_snapshots`, bucket-scoped, newest-kept). `snapshot_day` is a `DATE` column, so it is
-/// cast to `timestamptz` for `date_bin` bucketing.
+/// cast to `timestamptz` for `date_bin` bucketing -- pinned to UTC via
+/// `(snapshot_day::timestamp AT TIME ZONE 'UTC')` so the bucket boundary is independent of the
+/// database session's `TimeZone` (the #733 review's P2 on the day-facts grain, applied here too).
 ///
 /// The three counts are seat-days (`COUNT(*)`), partition-disjoint and additive: `active_count +
 /// pending_cancellation_count = seat_count`. "Active" is `pending_cancellation_date IS NULL` —
@@ -90,7 +92,7 @@ fn build_seat_snapshot_query(input: &SeatSnapshotQueryRequest) -> QueryBuilder<P
         " AS truncated FROM (SELECT ranked.*, max(ranked.bucket_rank) OVER () AS bucket_count FROM (SELECT agg.*, dense_rank() OVER (ORDER BY agg.bucket_start DESC) AS bucket_rank FROM (SELECT date_bin(CAST(",
     );
     builder.push_bind(&input.bucket).push(
-        " AS interval), ss.snapshot_day::timestamptz, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS bucket_start",
+        " AS interval), (ss.snapshot_day::timestamp AT TIME ZONE 'UTC'), TIMESTAMPTZ '1970-01-01 00:00:00+00') AS bucket_start",
     );
 
     if group_set.contains(&SeatGroupBy::Source) {
