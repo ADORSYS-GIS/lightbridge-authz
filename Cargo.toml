@@ -211,7 +211,7 @@ jsonwebtoken = { version = "11.0", features = ["rust_crypto"] }
 # an in-cluster JWKS endpoint) instead of always dialling out with `reqwest::Client::new()`. This
 # is the whole reason for the bump; `authkestra-op`/`authkestra-engine` move only to keep the
 # lockstep -- no call site here touches either crate's new surface.
-authkestra-resource = "=0.7.1"
+authkestra-resource = "=0.9.4"
 authkestra-op = "=0.7.1"
 authkestra-engine = "=0.7.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "tracing", "net", "time"] }
