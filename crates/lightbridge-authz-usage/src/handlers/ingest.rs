@@ -2602,6 +2602,13 @@ mod tests {
                 Ok((vec![], false))
             }
 
+            async fn query_seat_snapshots(
+                &self,
+                _input: &crate::models::seat::SeatSnapshotQueryRequest,
+            ) -> Result<(Vec<crate::models::seat::SeatSnapshotSeriesPoint>, bool)> {
+                Ok((vec![], false))
+            }
+
             async fn spend_for_account(
                 &self,
                 _account_id: &str,

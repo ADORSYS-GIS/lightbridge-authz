@@ -2,6 +2,7 @@ use crate::UsageState;
 use crate::handlers::execution::query_executions;
 use crate::handlers::ingest::{ingest_logs, ingest_metrics, ingest_traces};
 use crate::handlers::query::query_usage;
+use crate::handlers::seat::query_seat_snapshots;
 use crate::handlers::spend::query_spend;
 use axum::{Router, routing::post};
 use std::sync::Arc;
@@ -38,5 +39,6 @@ pub fn query_router() -> Router<Arc<UsageState>> {
     Router::new()
         .route("/usage/v1/usage/query", post(query_usage))
         .route("/usage/v1/usage/executions/query", post(query_executions))
+        .route("/usage/v1/usage/seats/query", post(query_seat_snapshots))
         .route("/usage/v1/spend/query", post(query_spend))
 }

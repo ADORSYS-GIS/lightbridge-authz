@@ -12,6 +12,7 @@ use lightbridge_authz_core::{Result, async_trait};
 use std::sync::Arc;
 
 use crate::models::execution::{ExecutionQueryRequest, ExecutionSeriesPoint};
+use crate::models::seat::{SeatSnapshotQueryRequest, SeatSnapshotSeriesPoint};
 use crate::models::{UsageQueryRequest, UsageSeriesPoint};
 use crate::repo::{StoreRepo, UsageEvent};
 use crate::scope_authority::ScopeAuthority;
@@ -58,6 +59,13 @@ pub trait UsageRepoTrait: Send + Sync {
         &self,
         input: &ExecutionQueryRequest,
     ) -> Result<(Vec<ExecutionSeriesPoint>, bool)>;
+    /// Returns `(points, truncated)` for the seat grain (#728) -- see
+    /// `StoreRepo::query_seat_snapshots`'s doc comment for the #578 truncation contract `truncated`
+    /// documents.
+    async fn query_seat_snapshots(
+        &self,
+        input: &SeatSnapshotQueryRequest,
+    ) -> Result<(Vec<SeatSnapshotSeriesPoint>, bool)>;
     async fn spend_for_account(
         &self,
         account_id: &str,
@@ -87,6 +95,13 @@ impl UsageRepoTrait for StoreRepo {
         input: &ExecutionQueryRequest,
     ) -> Result<(Vec<ExecutionSeriesPoint>, bool)> {
         StoreRepo::query_executions(self, input).await
+    }
+
+    async fn query_seat_snapshots(
+        &self,
+        input: &SeatSnapshotQueryRequest,
+    ) -> Result<(Vec<SeatSnapshotSeriesPoint>, bool)> {
+        StoreRepo::query_seat_snapshots(self, input).await
     }
 
     async fn spend_for_account(
