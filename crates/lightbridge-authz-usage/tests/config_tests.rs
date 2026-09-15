@@ -249,3 +249,122 @@ fn config_rejects_rollup_days_not_greater_than_raw_days() {
         "rollup_days <= raw_days must fail to load, not silently destroy rolled-up days"
     );
 }
+
+/// The `oauth2` + `scope_authority` blocks every test below needs before it can reach the
+/// `ingest_auth` validation (both are mandatory, so a config omitting either fails earlier).
+fn valid_auth_block() -> &'static str {
+    "oauth2:\n  type: external\n  jwks_url: \"http://keycloak:9100/realms/dev/protocol/openid-connect/certs\"\n\
+     scope_authority:\n  base_url: \"https://authz-opa:3001\"\n  username: \"authorino\"\n  \
+     password: \"change-me\"\n"
+}
+
+/// Writes a temp config made of the valid server/logging block, the mandatory auth block, and
+/// `ingest_auth` YAML, then loads it. Returns the load result.
+fn load_config_with_ingest_auth(ingest_auth: &str) -> lightbridge_authz_core::Result<()> {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("usage-config-ingest-{unique}.yaml"));
+    let content = format!(
+        "{}{}{}",
+        valid_server_and_logging_block(),
+        valid_auth_block(),
+        ingest_auth
+    );
+    fs::write(&path, content).expect("temp config should be written");
+
+    let result = load_from_path(&path).map(|_| ());
+    fs::remove_file(&path).expect("temp config should be removed");
+    result
+}
+
+/// `ingest_auth` is optional: absent, the config loads and the authenticated surface simply is
+/// not mounted. This is the positive control without which every test below could pass by
+/// rejecting all `ingest_auth` blocks.
+#[test]
+fn config_without_ingest_auth_loads() {
+    let result = load_config_with_ingest_auth("");
+    assert!(
+        result.is_ok(),
+        "ingest_auth is optional; omitting it must load, unmounting /auth/v1/otel/*: {result:?}"
+    );
+}
+
+/// #585: `ingest_auth` present but with no principals authorizes nobody, and is far more likely
+/// to be a mistake than an intention -- fail loudly at startup instead.
+#[test]
+fn config_with_empty_ingest_principals_fails_to_load() {
+    let result = load_config_with_ingest_auth(
+        "ingest_auth:\n  audience: \"lightbridge-usage-ingest\"\n  principals: {}\n",
+    );
+    assert!(
+        result.is_err(),
+        "a config with ingest_auth but empty principals must fail to load"
+    );
+}
+
+/// #585: a `principals` mapping VALUE outside `normalizer::KNOWN_SOURCES` means that principal
+/// can never successfully ingest -- the runtime gate requires `resolve_source` (which is itself a
+/// `KNOWN_SOURCES` check) to equal this value, so every request would 400 or 403. Fail at config
+/// load instead of surfacing as a mystery 400/403 when a collector deploys.
+#[test]
+fn config_with_ingest_principals_unknown_source_fails_to_load() {
+    let result = load_config_with_ingest_auth(
+        "ingest_auth:\n  audience: \"lightbridge-usage-ingest\"\n  principals:\n    \
+         svc:collector-x: claudecode\n",
+    );
+    assert!(
+        result.is_err(),
+        "an ingest_auth principal mapped to an unknown source must fail to load, not silently \
+         degrade to per-request 400/403s"
+    );
+}
+
+/// #585: the KEYS of `principals` are matched against a `client_credentials` token's `sub`, which
+/// `authz-idp` always mints as `svc:<client_id>`. A key without that prefix can therefore never
+/// match -- a silently disabled principal, with nothing in the logs to say so.
+///
+/// Mutation this catches: dropping the `svc:` key check, which leaves this config loading cleanly.
+#[test]
+fn config_with_ingest_principal_not_service_prefixed_fails_to_load() {
+    for bad_key in ["collector-x", "sub-1", "svc"] {
+        let result = load_config_with_ingest_auth(&format!(
+            "ingest_auth:\n  audience: \"lightbridge-usage-ingest\"\n  principals:\n    {bad_key}: \
+             github-copilot\n"
+        ));
+        assert!(
+            result.is_err(),
+            "principal key {bad_key:?} is not `svc:`-prefixed and must fail to load"
+        );
+    }
+}
+
+/// #585 AC4: `audience` is the binding that makes "the credential names the collector" hold, and
+/// a blank one would match no token's `aud` -- a config that can only ever refuse every request.
+///
+/// Mutation this catches: dropping the empty-audience check, or defaulting it to `""`.
+#[test]
+fn config_with_empty_ingest_audience_fails_to_load() {
+    let result = load_config_with_ingest_auth(
+        "ingest_auth:\n  audience: \"\"\n  principals:\n    \
+         svc:collector-github-copilot: github-copilot\n",
+    );
+    assert!(
+        result.is_err(),
+        "an empty ingest_auth.audience must fail to load, not silently refuse every request"
+    );
+}
+
+/// The positive control for the two tests above: a well-formed `ingest_auth` block loads.
+#[test]
+fn config_with_valid_ingest_auth_loads() {
+    let result = load_config_with_ingest_auth(
+        "ingest_auth:\n  audience: \"lightbridge-usage-ingest\"\n  principals:\n    \
+         svc:collector-github-copilot: github-copilot\n",
+    );
+    assert!(
+        result.is_ok(),
+        "a well-formed ingest_auth block must load: {result:?}"
+    );
+}

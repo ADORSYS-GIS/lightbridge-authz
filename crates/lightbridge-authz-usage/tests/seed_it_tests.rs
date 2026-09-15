@@ -31,7 +31,7 @@ fn build_state(pool: PgPool) -> Arc<UsageState> {
         repo,
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
-        ingest_principals: std::collections::HashMap::default(),
+        ingest_auth: None,
         raw_days: None,
     })
 }
@@ -136,7 +136,7 @@ async fn post_traces(app: &axum::Router, payload: serde_json::Value) {
 async fn seed_then_query_returns_totals_equal_to_what_was_seeded(pool: PgPool) {
     let state = build_state(pool.clone());
     let readiness_pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool.clone()));
-    let app = build_ingest_router(state, readiness_pool, false, false);
+    let app = build_ingest_router(state, readiness_pool, false);
 
     let now = Utc::now();
     let start = now - Duration::days(3);
