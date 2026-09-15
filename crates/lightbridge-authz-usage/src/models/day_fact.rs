@@ -68,20 +68,22 @@ pub enum DayFactGroupBy {
 /// `group_by`, `null` otherwise -- exactly like every dimension echo on the legacy
 /// `UsageSeriesPoint`.
 ///
-/// `is_aggregate_only` is `Some` when the caller filtered on it (every returned row then shares
-/// that value), `null` when unfiltered -- a bucket that mixes aggregate-only and per-entity rows
-/// has no single value to report.
+/// `is_aggregate_only` is always present and is a real group key: aggregate-only rows (e.g. a
+/// GitHub Copilot org daily, which is the aggregate over its member user dailies) and per-entity
+/// rows are overlapping populations, so they are never summed into one bucket. A caller who wants
+/// the total across both must add the two points themselves.
 ///
 /// Every measure is `Option<i64>`: `NULL` = unknown, never `0` (governance#188). A source that
 /// does not report a measure leaves it `null`, and a bucket whose rows all carry `NULL` cost
-/// reports `cost_micro_usd: null`, never `0`.
+/// reports `cost_micro_usd: null`, never `0`. `total_active_users` is a per-day distinct count, so
+/// it is reported as the peak daily active users in the bucket (`MAX`), never summed across days.
 #[derive(Debug, Serialize, Deserialize, ToSchema, Clone)]
 pub struct DayFactSeriesPoint {
     pub bucket_start: DateTime<Utc>,
     pub source: Option<String>,
     pub subject_kind: Option<String>,
     pub subject_id: Option<String>,
-    pub is_aggregate_only: Option<bool>,
+    pub is_aggregate_only: bool,
     pub total_suggestions: Option<i64>,
     pub total_acceptances: Option<i64>,
     pub total_lines_suggested: Option<i64>,

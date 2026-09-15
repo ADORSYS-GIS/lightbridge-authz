@@ -198,6 +198,125 @@ async fn all_scope_returns_every_fact_including_org_level(pool: PgPool) {
     assert_eq!(points.len(), 2, "both the user and org facts");
 }
 
+/// P1 regression (#733 review): an org-level aggregate row and the per-user rows it aggregates are
+/// overlapping populations and must NOT be summed into one bucket by default. An org daily
+/// (is_aggregate_only = TRUE, 500 suggestions, 5 000 µ$) and a member's user daily
+/// (is_aggregate_only = FALSE, 100 suggestions, 1 000 µ$) on the SAME day must come back as two
+/// points -- 500/5 000 and 100/1 000 -- never a single 600/6 000 point.
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn aggregate_only_and_per_entity_rows_are_not_summed_together(pool: PgPool) {
+    let d = day(2026, 8, 15);
+    sqlx::query(
+        "INSERT INTO usage_day_facts \
+         (source, day, subject_kind, subject_id, provider_user_id, total_suggestions_count, total_acceptances_count, cost_micro_usd, is_aggregate_only) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, TRUE)",
+    )
+    .bind(SOURCE)
+    .bind(d)
+    .bind("org")
+    .bind("org-1")
+    .bind(Option::<&str>::None)
+    .bind(500_i64)
+    .bind(400_i64)
+    .bind(5_000_i64)
+    .execute(&pool)
+    .await
+    .expect("insert aggregate-only org fact");
+    insert_day_fact(
+        &pool,
+        SOURCE,
+        d,
+        "user",
+        "user-1",
+        Some("sub-a"),
+        Some(100),
+        Some(80),
+        Some(1_000),
+    )
+    .await;
+
+    let (points, _) = repo(&pool)
+        .query_day_facts(&request(
+            UsageScope::All,
+            "",
+            ts(2026, 8, 1),
+            ts(2026, 9, 1),
+            vec![],
+            100,
+        ))
+        .await
+        .expect("query must succeed");
+
+    assert_eq!(
+        points.len(),
+        2,
+        "aggregate-only and per-entity rows must be separate points, not summed"
+    );
+    let agg = points
+        .iter()
+        .find(|p| p.is_aggregate_only)
+        .expect("aggregate-only point");
+    let per = points
+        .iter()
+        .find(|p| !p.is_aggregate_only)
+        .expect("per-entity point");
+    assert_eq!(agg.total_suggestions, Some(500));
+    assert_eq!(agg.cost_micro_usd, Some(5_000));
+    assert_eq!(per.total_suggestions, Some(100));
+    assert_eq!(per.cost_micro_usd, Some(1_000));
+}
+
+/// P1 regression (#733 review): `total_active_users` is a per-day distinct count, not additive.
+/// Summing it across a multi-day bucket would multiply it by the number of days; it must be
+/// reported as the peak daily active users in the bucket (MAX), never the sum.
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn total_active_users_is_peak_not_sum_across_days(pool: PgPool) {
+    for (y, m, dd, users) in [(2026, 8, 15, 8_i64), (2026, 8, 16, 12_i64)] {
+        sqlx::query(
+            "INSERT INTO usage_day_facts \
+             (source, day, subject_kind, subject_id, provider_user_id, total_active_users, is_aggregate_only) \
+             VALUES ($1, $2, $3, $4, $5, $6, TRUE)",
+        )
+        .bind(SOURCE)
+        .bind(day(y, m, dd))
+        .bind("org")
+        .bind("org-1")
+        .bind(Option::<&str>::None)
+        .bind(users)
+        .execute(&pool)
+        .await
+        .expect("insert aggregate-only org fact");
+    }
+
+    let mut input = request(
+        UsageScope::All,
+        "",
+        ts(2026, 8, 1),
+        ts(2026, 9, 1),
+        vec![],
+        100,
+    );
+    // A 7-day bucket spans both seeded days (15th and 16th) into one point, so the MAX-vs-SUM
+    // distinction is actually exercised.
+    input.bucket = "7 days".to_string();
+
+    let (points, _) = repo(&pool)
+        .query_day_facts(&input)
+        .await
+        .expect("query must succeed");
+
+    assert_eq!(
+        points.len(),
+        1,
+        "one aggregate-only point spanning both days"
+    );
+    assert_eq!(
+        points[0].total_active_users,
+        Some(12),
+        "peak daily active users (MAX), not the sum (20)"
+    );
+}
+
 /// A bucket whose rows all carry `NULL` cost reports `cost_micro_usd: None`, never `0`
 /// (governance#188).
 #[sqlx::test(migrations = "../../migrations-usage")]

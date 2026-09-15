@@ -16,7 +16,7 @@ struct DayFactQueryRow {
     source: Option<String>,
     subject_kind: Option<String>,
     subject_id: Option<String>,
-    is_aggregate_only: Option<bool>,
+    is_aggregate_only: bool,
     total_suggestions: Option<i64>,
     total_acceptances: Option<i64>,
     total_lines_suggested: Option<i64>,
@@ -78,16 +78,15 @@ impl StoreRepo {
 ///
 /// Mirrors `build_execution_query`'s nested-subquery + `dense_rank()` shape (one `FROM
 /// usage_day_facts`, bucket-scoped, newest-kept). `day` is a `DATE` column, so it is cast to
-/// `timestamptz` for `date_bin` bucketing.
+/// `timestamptz` for `date_bin` bucketing via `(df.day::timestamp AT TIME ZONE 'UTC')` -- the
+/// explicit `AT TIME ZONE 'UTC'` pins the cast so it does not depend on the database session's
+/// `TimeZone` (the same class `retention.rs` already fixed).
 ///
-/// `is_aggregate_only` is treated as a conditional dimension: when the caller filters on it, it is
-/// selected and grouped, so every returned point is homogeneous in that flag; when unfiltered it
-/// selects `NULL::boolean` and is not grouped, so a bucket that mixes aggregate-only and per-entity
-/// rows reports `is_aggregate_only: null` (no single value to report).
+/// `is_aggregate_only` is ALWAYS a group key (see the inline comment): aggregate-only rows and
+/// per-entity rows are overlapping populations and must never be summed into one bucket.
 fn build_day_fact_query(input: &DayFactQueryRequest) -> QueryBuilder<Postgres> {
     let group_set: HashSet<DayFactGroupBy> = input.group_by.iter().cloned().collect();
     let limit = i64::from(input.limit);
-    let aggregate_only_is_dimension = input.filters.is_aggregate_only.is_some();
 
     let mut builder = QueryBuilder::<Postgres>::new(
         "SELECT counted.bucket_start, counted.source, counted.subject_kind, counted.subject_id, counted.is_aggregate_only, counted.total_suggestions, counted.total_acceptances, counted.total_lines_suggested, counted.total_lines_accepted, counted.total_active_users, counted.cost_micro_usd, counted.bucket_count > ",
@@ -97,7 +96,7 @@ fn build_day_fact_query(input: &DayFactQueryRequest) -> QueryBuilder<Postgres> {
         " AS truncated FROM (SELECT ranked.*, max(ranked.bucket_rank) OVER () AS bucket_count FROM (SELECT agg.*, dense_rank() OVER (ORDER BY agg.bucket_start DESC) AS bucket_rank FROM (SELECT date_bin(CAST(",
     );
     builder.push_bind(&input.bucket).push(
-        " AS interval), df.day::timestamptz, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS bucket_start",
+        " AS interval), (df.day::timestamp AT TIME ZONE 'UTC'), TIMESTAMPTZ '1970-01-01 00:00:00+00') AS bucket_start",
     );
 
     if group_set.contains(&DayFactGroupBy::Source) {
@@ -115,17 +114,22 @@ fn build_day_fact_query(input: &DayFactQueryRequest) -> QueryBuilder<Postgres> {
     } else {
         builder.push(", NULL::text AS subject_id");
     }
-    if aggregate_only_is_dimension {
-        builder.push(", df.is_aggregate_only");
-    } else {
-        builder.push(", NULL::boolean AS is_aggregate_only");
-    }
+    // `is_aggregate_only` is ALWAYS a group key, not a conditional dimension: an org-level
+    // aggregate row and the per-user rows it aggregates are overlapping populations (the org row
+    // IS the sum over its members), so summing them into one bucket would double-count measures
+    // and cost. Partitioning by the flag keeps aggregate-only rows and per-entity rows in separate
+    // points, so the default (no filter, no group_by) never silently adds them together.
+    builder.push(", df.is_aggregate_only");
 
     builder.push(", SUM(df.total_suggestions_count)::bigint AS total_suggestions");
     builder.push(", SUM(df.total_acceptances_count)::bigint AS total_acceptances");
     builder.push(", SUM(df.total_lines_suggested)::bigint AS total_lines_suggested");
     builder.push(", SUM(df.total_lines_accepted)::bigint AS total_lines_accepted");
-    builder.push(", SUM(df.total_active_users)::bigint AS total_active_users");
+    // `total_active_users` is a per-day DISTINCT count, not additive: summing it across a
+    // multi-day bucket would multiply it by the number of days. MAX reports the peak daily active
+    // users in the bucket -- the honest, bounded reading of a distinct count we cannot re-derive
+    // from daily aggregates.
+    builder.push(", MAX(df.total_active_users)::bigint AS total_active_users");
     builder.push(", SUM(df.cost_micro_usd)::bigint AS cost_micro_usd");
 
     builder.push(" FROM usage_day_facts df WHERE ");
@@ -141,9 +145,7 @@ fn build_day_fact_query(input: &DayFactQueryRequest) -> QueryBuilder<Postgres> {
     if group_set.contains(&DayFactGroupBy::SubjectId) {
         builder.push(", df.subject_id");
     }
-    if aggregate_only_is_dimension {
-        builder.push(", df.is_aggregate_only");
-    }
+    builder.push(", df.is_aggregate_only");
 
     builder.push(") agg) ranked) counted WHERE counted.bucket_rank <= ");
     builder.push_bind(limit);
