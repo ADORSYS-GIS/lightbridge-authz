@@ -26,6 +26,17 @@ pub(super) fn push_day_fact_scope_filters(
 
     match input.scope {
         UsageScope::User => {
+            // `scope=user` matches `provider_user_id = $scope_id`. The gate (`authorize_user_scope`)
+            // only admits `scope=user` when `scope_id == token.sub` (the Keycloak JWT subject), so
+            // this assumes `provider_user_id` is written in the SAME namespace as the JWT subject.
+            // The migration documents `provider_user_id` as "the join key per governance#185" and
+            // the table's ids as "never joined across providers except through usage_identities" --
+            // if ingest instead writes a provider-scoped id (e.g. a GitHub numeric id), this direct
+            // match would return empty for every non-admin self-query and the resolution would need
+            // to route through `usage_identities` like the execution grain does. There is no
+            // day-facts ingest yet (#727 ships the query surface only), so this assumption is
+            // unverified and MUST be settled by the ingest story before self-service scope=user is
+            // relied on.
             builder.push(" AND df.provider_user_id = ");
             builder.push_bind(&input.scope_id);
         }
