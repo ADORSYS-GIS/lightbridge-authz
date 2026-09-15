@@ -388,10 +388,22 @@ This brings up `timescaledb` + `authz-usage-migrate` + `authz-usage`, then runs
 - **Spreads data over 14 days** (configurable via `--days`) so every bucket interval the query API
   supports (seconds/minutes/hours/days) has data.
 - **Covers 3 projects, 2 accounts, 2 users, 2 API keys, and 5 models** so `group_by` is exercised.
-- **Uses production-semantics magnitudes**: token counts in the hundreds-to-thousands, costs in
-  micro-USD (the gateway's `llm_custom_total_cost` unit — `spend_units.rs`, #488; the console
-  divides by 1e6 for display, so dollars in the column would render as 10^-6 dollars), latency in
-  milliseconds.
+- **Uses production-semantics magnitudes**: token counts in the hundreds-to-thousands, latency in
+  milliseconds, and realistic per-request **dollar** costs (`MODEL_PRICING`'s dollars-per-1K-token
+  table, `scripts/seed-usage-events.py:63-69`). The script itself computes that dollar figure as a
+  micro-USD integer and sends it under the raw gateway attribute
+  `io.envoy.ai_gateway.llm_custom_total_cost` (`scripts/seed-usage-events.py:148,170`) — its own
+  docstring still frames this as seeding "micro-USD" (`scripts/seed-usage-events.py:21-26`,
+  predating the unit change below and not corrected here since this is a docs-only pass). What
+  actually lands in `usage_events.total_cost` is **dollars**: the `eaig` normalizer
+  (`crates/lightbridge-authz-usage/src/normalizer/eaig.rs:20-23,50-54`) reads that attribute as
+  `cost_micros`, and `apply_normalizer` (`crates/lightbridge-authz-usage/src/handlers/ingest.rs:492-495`)
+  divides it by `1_000_000.0` before storage — so the round trip lands back at the original dollar
+  amount, matching the query API's documented dollar-scale contract
+  (`docs/lightbridge-query-api.md:250`, `"total_cost": 12.34`). See
+  [ADR-0034 §3](adr/0034-dynamic-budget-limiter.md) for why this matters on the budget side:
+  `validate_total_cost_micros` (`crates/lightbridge-authz-budget/src/spend_units.rs`) is what
+  scales this dollar figure into micro-USD for the ledger, not the ingest/seed path.
 
 The script takes optional flags:
 
