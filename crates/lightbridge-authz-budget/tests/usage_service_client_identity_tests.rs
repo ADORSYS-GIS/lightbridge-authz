@@ -123,10 +123,11 @@ fn write_temp_pem(pem: &str, label: &str) -> std::path::PathBuf {
     path
 }
 
-/// `total_cost` is already micro-USD on the wire (#488) -- this fixture uses a whole
-/// micro-USD figure so the `Spend::Known(3_750_000)` assertions below need no scaling.
+/// `total_cost` is dollar-scale on the wire (#736, correcting #488) -- this fixture uses $3.75,
+/// which scales exactly to 3,750,000 micro-USD, so the `Spend::Known(3_750_000)` assertions below
+/// need no fractional rounding.
 async fn spend_query_handler() -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "total_cost": 3_750_000.0 }))
+    Json(serde_json::json!({ "total_cost": 3.75 }))
 }
 
 /// Starts a real HTTPS server on an ephemeral loopback port that REQUIRES and verifies a client
