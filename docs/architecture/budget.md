@@ -401,6 +401,16 @@ to the usage-events database and ran `SELECT SUM(total_cost) ...` against `usage
 two services querying one service's tables. `lightbridge-authz-usage` owns `usage_events`; it now
 owns the query too, and `UsageServiceSpendReader` calls it like any other client would.
 
+**Unit note:** whichever reader is asking, the raw `total_cost`/`SUM(total_cost)` figure is
+dollar-scale, not micro-USD — `usage_events.total_cost` is written in dollars by
+`apply_normalizer` (`crates/lightbridge-authz-usage/src/handlers/ingest.rs:492-495`).
+`UsageServiceSpendReader`'s caller converts it into the `i64` micro-USD
+`Facts.spend_this_period`/`spend_last_period` actually carry via
+`validate_total_cost_micros` (`crates/lightbridge-authz-budget/src/spend_units.rs`) — see
+[ADR-0034 §3](../adr/0034-dynamic-budget-limiter.md)'s "`spent_micros` is dollars-on-the-wire"
+note for the full history (PR #488 vs. commit `6413db1` vs. PR
+[#737](https://github.com/ADORSYS-GIS/lightbridge-authz/pull/737)).
+
 **⚠️ This inversion is a breaking config-key rename, and it needs a companion change in
 `ai-helm-values` to keep working in production.** As of the PR that introduced this section, prod's
 `api` component Helm values (`environments/prod/values/lightbridge-app.yaml` in the separate

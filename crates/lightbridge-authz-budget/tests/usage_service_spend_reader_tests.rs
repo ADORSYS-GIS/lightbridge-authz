@@ -30,10 +30,10 @@ fn period() -> Period {
     Period::parse("2026-08").expect("valid period")
 }
 
-/// Test 1 (minimum test list, client-side half): a known, non-null `total_cost` -- already
-/// micro-USD on the wire (#488) -- is passed through into `Spend::Known` unscaled. Realistic
-/// gateway figure: a request costing 1,234 micro-USD (~$0.001234). Prove-fail: reintroducing
-/// `validate_total_cost_micros`'s old `* 1_000_000.0` makes this assert `1_234_000_000` instead.
+/// Test 1 (minimum test list, client-side half): a known, non-null `total_cost` -- **dollar-scale
+/// on the wire (#736, correcting #488)** -- is scaled by `1_000_000.0` into `Spend::Known`
+/// micro-USD. Realistic wire figure: a request costing $1,234.00. Prove-fail: this test failed
+/// against the pre-#736 code, which applied no scaling and asserted `Spend::Known(1_234)` instead.
 #[tokio::test]
 async fn known_nonzero_total_cost_becomes_spend_known_in_micros() {
     let server = MockServer::start();
@@ -50,7 +50,7 @@ async fn known_nonzero_total_cost_becomes_spend_known_in_micros() {
         .await
         .expect("reader never returns Err");
 
-    assert_eq!(spend, Spend::Known(1_234));
+    assert_eq!(spend, Spend::Known(1_234_000_000));
 }
 
 /// Test 5 (minimum test list): a genuinely-zero spend must be `Spend::Known(0)`, not
@@ -286,8 +286,9 @@ async fn a_non_success_status_observes_as_unreachable_never_empty() {
     assert_eq!(observation, SpendObservation::Unreachable);
 }
 
-/// A real, non-null total is reported as itself on both methods -- the split changed nothing for
-/// the ordinary path.
+/// A real, non-null total is reported as itself (scaled to micro-USD) on both methods -- the
+/// split changed nothing for the ordinary path, and both agree on the same #736 dollar-to-micro
+/// scaling.
 #[tokio::test]
 async fn a_known_total_observes_as_answered_with_the_same_micros() {
     let server = MockServer::start();
@@ -304,14 +305,14 @@ async fn a_known_total_observes_as_answered_with_the_same_micros() {
             .observe_spend_for_account("acct_1", &period())
             .await
             .expect("reader never returns Err"),
-        SpendObservation::Answered(1_234)
+        SpendObservation::Answered(1_234_000_000)
     );
     assert_eq!(
         reader
             .spend_for_account("acct_1", &period())
             .await
             .expect("reader never returns Err"),
-        Spend::Known(1_234)
+        Spend::Known(1_234_000_000)
     );
 }
 
