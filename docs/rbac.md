@@ -833,6 +833,56 @@ non-grandfather issuer, or a service account — the same gap that, before `prov
 had no remedy but a manual SQL `INSERT` against production
 ([#720](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/720)).
 
+```mermaid
+sequenceDiagram
+    autonumber
+    participant B as Browser / device
+    participant IDP as authz-idp
+    participant KC as Keycloak
+    participant DB as Postgres
+
+    B->>KC: authenticate
+    KC-->>IDP: 303 /idp/callback?code
+    IDP->>IDP: validate_id_token (iss, aud, nonce)<br/>relying_party.rs:760
+    IDP->>DB: upsert_federated_identity_and_provision<br/>federated_provisioning.rs:41
+    alt issuer is NOT the grandfather issuer
+        DB-->>IDP: Forbidden (ADR-0025 pin, unchanged)
+        IDP-->>B: 303 /ui/error
+    else no accounts row, grandfather issuer
+        DB->>DB: INSERT accounts + default project<br/>(same transaction)
+        DB-->>IDP: outcome.provisioned = true
+        IDP->>DB: book_starting_grant (#697, fail-soft)
+        IDP-->>B: signed in
+    else accounts row exists
+        DB-->>IDP: outcome.provisioned = false
+        IDP-->>B: signed in (budget untouched)
+    end
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> Authenticated: Keycloak login ok
+    Authenticated --> Refused: issuer is not the grandfather issuer
+    Authenticated --> Refused: subject already adopted by another issuer
+    Authenticated --> Adopted: accounts row exists
+    Authenticated --> Provisioned: no accounts row, grandfather issuer
+
+    Provisioned --> Funded: starting grant booked
+    Provisioned --> Unfunded: grant failed (logged, login still succeeds)
+    Funded --> [*]
+    Unfunded --> [*]
+    Adopted --> [*]
+    Refused --> [*]: 303 /ui/error
+
+    note right of Provisioned
+        Before this change this transition did not exist:
+        every first-time subject fell to Refused.
+        Unfunded is deliberately reachable - an unbookable
+        grant must not turn one accountless subject into
+        one account that cannot sign in at all.
+    end note
+```
+
 **`procedure.provisionAccount`** (gated `account:provision`, admin-only via `lightbridge-admin`'s
 `*` — never granted to `lightbridge-editor`/`lightbridge-viewer`, unlike `account:create`) is the
 offboarding kill switch's mirror image at onboarding time: an operator supplies `{subject, email,
