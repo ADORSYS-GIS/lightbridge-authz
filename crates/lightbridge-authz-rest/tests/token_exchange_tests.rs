@@ -302,7 +302,8 @@ fn browser_client(client_id: &str, redirect_uri: &str) -> OauthClient {
 }
 
 /// A Confidential authorization_code client with `require_pkce: false` -- the exact shape
-/// `validate_authorization_code_clients` (`lib.rs`) now refuses at startup (follow-up to PR
+/// `validate_authorization_code_clients` (`oauth2_client_validation.rs`) now refuses at startup
+/// (follow-up to PR
 /// #466's review finding), used here to prove `/authorize` itself also refuses a codeless-
 /// challenge request for this client, independent of both `client_type` and the `require_pkce`
 /// flag on the client record. Defense-in-depth: even a client object that somehow reached this
@@ -329,6 +330,14 @@ fn relying_party(repo: Arc<StoreRepo>) -> Arc<KeycloakRelyingParty> {
 }
 
 fn relying_party_with_issuer(repo: Arc<StoreRepo>, issuer: &str) -> Arc<KeycloakRelyingParty> {
+    // Reuses `repo`'s own already-wrapped `Arc<dyn DbPoolTrait>` (a cheap Arc clone) rather than
+    // asking every caller of this helper to thread a second, separate `pool: PgPool` through just
+    // for this constructor argument.
+    let starting_grant = Arc::new(lightbridge_authz_budget::StartingGrantService::new(
+        repo.pool.clone(),
+        lightbridge_authz_rest::budget_services::BUDGET_POLICY_SET_ID,
+        lightbridge_authz_rest::budget_services::BUDGET_POLICY_EVALUATION_BUDGET,
+    ));
     Arc::new(
         KeycloakRelyingParty::new(
             OidcRelyingParty {
@@ -344,6 +353,7 @@ fn relying_party_with_issuer(repo: Arc<StoreRepo>, issuer: &str) -> Arc<Keycloak
             issuer.to_string(),
             repo,
             Arc::new(InMemoryRateLimitStore::new()),
+            starting_grant,
             None,
         )
         .unwrap(),

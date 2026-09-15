@@ -1,6 +1,7 @@
 pub mod api_key_labels;
 pub mod db;
 pub mod entities;
+pub mod federated_provisioning;
 pub mod identity_resolution;
 pub mod platform_role_lookup;
 pub mod platform_roles;
