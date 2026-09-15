@@ -142,7 +142,24 @@ fn relying_party(
     discovery_url: String,
     repo: Arc<StoreRepo>,
 ) -> KeycloakRelyingParty {
-    KeycloakRelyingParty::new(config, issuer, discovery_url, repo, rate_limiter(), None).unwrap()
+    // Reuses `repo`'s own already-wrapped `Arc<dyn DbPoolTrait>` (a cheap Arc clone) rather than
+    // asking every caller of this helper to thread a second, separate `pool: PgPool` through just
+    // for this constructor argument.
+    let starting_grant = Arc::new(lightbridge_authz_budget::StartingGrantService::new(
+        repo.pool.clone(),
+        lightbridge_authz_rest::budget_services::BUDGET_POLICY_SET_ID,
+        lightbridge_authz_rest::budget_services::BUDGET_POLICY_EVALUATION_BUDGET,
+    ));
+    KeycloakRelyingParty::new(
+        config,
+        issuer,
+        discovery_url,
+        repo,
+        rate_limiter(),
+        starting_grant,
+        None,
+    )
+    .unwrap()
 }
 
 fn token_set(refresh_token: Option<&str>, issuer: &str) -> KeycloakTokenSet {
