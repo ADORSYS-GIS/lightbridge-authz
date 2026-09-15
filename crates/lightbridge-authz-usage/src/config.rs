@@ -1,6 +1,7 @@
 use lightbridge_authz_core::Result;
 use lightbridge_authz_core::config::{Database, Logging, Oauth2, Otel, Tls, load_yaml_from_path};
 use serde::Deserialize;
+use std::collections::HashMap;
 use tracing::debug;
 
 // `RetentionConfig` lives in `retention_config` (split out by the LoC gate); re-export it here so
@@ -32,6 +33,47 @@ pub struct UsageConfig {
     /// hourly. See [`RetentionConfig`].
     #[serde(default)]
     pub retention: RetentionConfig,
+    /// #585: authenticated ingest configuration. Optional -- when absent, the authenticated
+    /// `/auth/v1/otel/*` routes are simply not mounted, and the existing unauthenticated
+    /// `/v1/otel/*` surface (the gateway exception, AC5) continues to serve as the only ingest
+    /// path.
+    ///
+    /// The mount-conditional is deliberate, if temporary: `build_ingest_router` derives it from
+    /// this field itself -- see the comment at that mount site -- so the routes and the config
+    /// that authorizes them cannot disagree in the first place.
+    #[serde(default)]
+    pub ingest_auth: Option<IngestAuthConfig>,
+}
+
+/// #585: the credential-binding rules for the authenticated ingest surface.
+#[derive(Debug, Clone, Deserialize)]
+pub struct IngestAuthConfig {
+    /// Strict mapping: JWT `sub` → the ONE `X-Source` value that principal may assert. Any other
+    /// `X-Source` from that principal → 403, and a `sub` absent from this map → 403.
+    /// Example: `{ "svc:collector-github-copilot": "github-copilot" }`
+    ///
+    /// Keys are refused at config load unless they look like a `client_credentials` subject
+    /// (`svc:`-prefixed) -- see `load_from_path`'s key check. `caller_kind` is still enforced
+    /// independently at request time, so a bad key is a fail-loud typo catch, not the security
+    /// boundary.
+    pub principals: HashMap<String, String>,
+    /// The audience this endpoint's tokens must name (#585 AC4). Required, and checked against
+    /// the validated token's own `aud` claim.
+    ///
+    /// This is what makes "the credential names the collector" actually hold: without it, any
+    /// valid `client_credentials` token from any client whose `sub` happens to be in `principals`
+    /// would be admitted, regardless of which resource it was minted for.
+    ///
+    /// **Deliberately not `oauth2.audience`.** That block is the shared `Oauth2` config the
+    /// query listener validates end-user bearer tokens against; pinning it here would silently
+    /// start requiring human tokens to carry a machine audience, 401ing the console. The two
+    /// audiences are different populations on the same process, so they get different fields.
+    ///
+    /// `authz-idp` already supports this with no change: a `client_credentials` token's `aud`
+    /// defaults to the client's own `client_id`, or to a value explicitly listed in that client's
+    /// `allowed_audiences` (RFC 8707 resource indicators, `token_exchange.rs`). A collector
+    /// therefore asks for `audience=<this value>` at the token endpoint.
+    pub audience: String,
 }
 
 /// HTTP client config for calling `authz-opa`'s `POST /idp/v1/authorize-usage-scope` (#570).
@@ -118,6 +160,83 @@ pub fn load_from_path<P: AsRef<std::path::Path>>(path: P) -> Result<UsageConfig>
             config.retention.rollup_days, config.retention.raw_days
         )));
     }
+
+    validate_ingest_auth(&config)?;
+
     debug!("loaded usage config successfully");
     Ok(config)
+}
+
+/// #585: fail-loud validation for the authenticated ingest surface.
+///
+/// Both halves of the `principals` map are checked here, and both exist to turn an operator typo
+/// into a startup failure rather than a mystery 400/403 at the moment a collector deploys:
+///
+/// - **values** must be a `normalizer::KNOWN_SOURCES` entry. The runtime gate combines two
+///   independent allowlists (`resolve_source`'s own `KNOWN_SOURCES` check, then equality with this
+///   mapping), so a value outside `KNOWN_SOURCES` means that principal can never successfully
+///   ingest -- every request would 400 ("unknown source") or 403 (mismatch).
+/// - **keys** must be `svc:`-prefixed and unpadded. A typo'd key (a missing prefix, a human
+///   subject, or a stray leading/trailing space from a copy-paste) would otherwise load fine and
+///   then simply never match, silently disabling that principal with nothing in the logs to say
+///   so. `caller_kind` is enforced separately at request time, so this is a typo catch, not the
+///   authorization boundary.
+/// - **`audience`** must be non-blank *and* unpadded. It is compared verbatim against each
+///   token's `aud` claim at request time, so a padded value is the one input that would pass an
+///   emptiness check and then refuse every single request -- exactly the failure this function
+///   exists to convert into a startup error.
+///
+/// The padding checks are here rather than a silent `.trim()` because every comparison downstream
+/// is exact-match: normalizing the config would work, but the operator would never learn their
+/// value was wrong, and the next exact-matched field would bite them the same way.
+fn validate_ingest_auth(config: &UsageConfig) -> Result<()> {
+    let Some(auth) = &config.ingest_auth else {
+        return Ok(());
+    };
+
+    if auth.principals.is_empty() {
+        return Err(lightbridge_authz_core::Error::BadRequest(
+            "ingest_auth is present but principals mapping is empty".to_string(),
+        ));
+    }
+
+    if auth.audience.trim().is_empty() {
+        return Err(lightbridge_authz_core::Error::BadRequest(
+            "ingest_auth.audience must not be empty -- it is the audience checked against every \
+             token on /auth/v1/otel/* (AC4); an empty value would match nothing and refuse every \
+             request"
+                .to_string(),
+        ));
+    }
+
+    if auth.audience != auth.audience.trim() {
+        return Err(lightbridge_authz_core::Error::BadRequest(
+            "ingest_auth.audience must not be padded with whitespace -- it is compared verbatim \
+             against every token's `aud` claim on /auth/v1/otel/*, so a padded value would load \
+             cleanly and then refuse every request"
+                .to_string(),
+        ));
+    }
+
+    for (sub, source) in &auth.principals {
+        if !sub.starts_with("svc:") || sub != sub.trim() {
+            return Err(lightbridge_authz_core::Error::BadRequest(format!(
+                "ingest_auth.principals: principal '{sub}' is not a service subject -- keys must \
+                 be `svc:`-prefixed and free of surrounding whitespace (they are matched \
+                 verbatim against a client_credentials token's `sub`)"
+            )));
+        }
+
+        if !crate::normalizer::KNOWN_SOURCES.contains(&source.as_str()) {
+            return Err(lightbridge_authz_core::Error::BadRequest(format!(
+                "ingest_auth.principals: mapped source '{}' for principal '{}' is not a \
+                 known source; valid sources are: {}",
+                source,
+                sub,
+                crate::normalizer::KNOWN_SOURCES.join(", ")
+            )));
+        }
+    }
+
+    Ok(())
 }
