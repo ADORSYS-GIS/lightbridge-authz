@@ -34,7 +34,6 @@ pub mod state;
 pub use config::{RetentionConfig, ScopeAuthorityConfig, UsageConfig, UsageServer, load_from_path};
 use repo::StoreRepo;
 use scope_authority::{RemoteScopeAuthority, ScopeAuthority};
-pub use usage_repo_trait::UsageRepoTrait;
 
 #[derive(Serialize, Deserialize)]
 struct RootResponse {
