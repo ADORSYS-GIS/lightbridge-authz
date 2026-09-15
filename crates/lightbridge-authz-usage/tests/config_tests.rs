@@ -356,7 +356,42 @@ fn config_with_empty_ingest_audience_fails_to_load() {
     );
 }
 
-/// The positive control for the two tests above: a well-formed `ingest_auth` block loads.
+/// #585: a key that is `svc:`-prefixed but padded passes the prefix check and still never matches
+/// a token's `sub` -- the same silently-disabled principal the prefix check exists to prevent,
+/// one copy-paste away. (The key is quoted in the YAML so the space survives parsing.)
+///
+/// Mutation this catches: dropping the padding half of the key check.
+#[test]
+fn config_with_whitespace_padded_ingest_principal_key_fails_to_load() {
+    let result = load_config_with_ingest_auth(
+        "ingest_auth:\n  audience: \"lightbridge-usage-ingest\"\n  principals:\n    \
+         \"svc:collector-github-copilot \": github-copilot\n",
+    );
+    assert!(
+        result.is_err(),
+        "a whitespace-padded principal key must fail to load, not silently disable that principal"
+    );
+}
+
+/// #585 AC4: `audience` is compared VERBATIM against each token's `aud` claim, so a padded value
+/// is worse than a blank one -- it passes the trim-based emptiness check above and then refuses
+/// every request, with nothing in the config to suggest why.
+///
+/// Mutation this catches: dropping the padding check, leaving the untrimmed value to be compared.
+#[test]
+fn config_with_whitespace_padded_ingest_audience_fails_to_load() {
+    let result = load_config_with_ingest_auth(
+        "ingest_auth:\n  audience: \" lightbridge-usage-ingest \"\n  principals:\n    \
+         svc:collector-github-copilot: github-copilot\n",
+    );
+    assert!(
+        result.is_err(),
+        "a whitespace-padded ingest_auth.audience must fail to load, not silently refuse every \
+         request"
+    );
+}
+
+/// The positive control for the tests above: a well-formed `ingest_auth` block loads.
 #[test]
 fn config_with_valid_ingest_auth_loads() {
     let result = load_config_with_ingest_auth(

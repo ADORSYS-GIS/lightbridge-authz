@@ -38,8 +38,9 @@ pub struct UsageConfig {
     /// `/v1/otel/*` surface (the gateway exception, AC5) continues to serve as the only ingest
     /// path.
     ///
-    /// See `build_ingest_router`'s `has_auth_ingest` parameter -- the mount-conditional is a
-    /// deliberate, if temporary, shape; it is documented there rather than left implicit.
+    /// The mount-conditional is deliberate, if temporary: `build_ingest_router` derives it from
+    /// this field itself -- see the comment at that mount site -- so the routes and the config
+    /// that authorizes them cannot disagree in the first place.
     #[serde(default)]
     pub ingest_auth: Option<IngestAuthConfig>,
 }
@@ -175,10 +176,19 @@ pub fn load_from_path<P: AsRef<std::path::Path>>(path: P) -> Result<UsageConfig>
 ///   independent allowlists (`resolve_source`'s own `KNOWN_SOURCES` check, then equality with this
 ///   mapping), so a value outside `KNOWN_SOURCES` means that principal can never successfully
 ///   ingest -- every request would 400 ("unknown source") or 403 (mismatch).
-/// - **keys** must be `svc:`-prefixed. A typo'd key (a missing prefix, or a human subject) would
-///   otherwise load fine and then simply never match, silently disabling that principal with
-///   nothing in the logs to say so. `caller_kind` is enforced separately at request time, so this
-///   is a typo catch, not the authorization boundary.
+/// - **keys** must be `svc:`-prefixed and unpadded. A typo'd key (a missing prefix, a human
+///   subject, or a stray leading/trailing space from a copy-paste) would otherwise load fine and
+///   then simply never match, silently disabling that principal with nothing in the logs to say
+///   so. `caller_kind` is enforced separately at request time, so this is a typo catch, not the
+///   authorization boundary.
+/// - **`audience`** must be non-blank *and* unpadded. It is compared verbatim against each
+///   token's `aud` claim at request time, so a padded value is the one input that would pass an
+///   emptiness check and then refuse every single request -- exactly the failure this function
+///   exists to convert into a startup error.
+///
+/// The padding checks are here rather than a silent `.trim()` because every comparison downstream
+/// is exact-match: normalizing the config would work, but the operator would never learn their
+/// value was wrong, and the next exact-matched field would bite them the same way.
 fn validate_ingest_auth(config: &UsageConfig) -> Result<()> {
     let Some(auth) = &config.ingest_auth else {
         return Ok(());
@@ -199,11 +209,21 @@ fn validate_ingest_auth(config: &UsageConfig) -> Result<()> {
         ));
     }
 
+    if auth.audience != auth.audience.trim() {
+        return Err(lightbridge_authz_core::Error::BadRequest(
+            "ingest_auth.audience must not be padded with whitespace -- it is compared verbatim \
+             against every token's `aud` claim on /auth/v1/otel/*, so a padded value would load \
+             cleanly and then refuse every request"
+                .to_string(),
+        ));
+    }
+
     for (sub, source) in &auth.principals {
-        if !sub.starts_with("svc:") {
+        if !sub.starts_with("svc:") || sub != sub.trim() {
             return Err(lightbridge_authz_core::Error::BadRequest(format!(
                 "ingest_auth.principals: principal '{sub}' is not a service subject -- keys must \
-                 be `svc:`-prefixed (they are matched against a client_credentials token's `sub`)"
+                 be `svc:`-prefixed and free of surrounding whitespace (they are matched \
+                 verbatim against a client_credentials token's `sub`)"
             )));
         }
 
