@@ -40,6 +40,7 @@ async fn app(pool: PgPool) -> axum::Router {
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
         ingest_principals: std::collections::HashMap::default(),
+        raw_days: Some(90),
     });
     build_query_router(state, readiness_pool, false)
 }
@@ -66,7 +67,6 @@ fn sample_event(account_id: &str, observed_at: DateTime<Utc>, total_cost: f64) -
         total_tokens: None,
         total_cost: Some(total_cost),
         latency_ms: None,
-        attributes: json!({}),
     }
 }
 
@@ -231,6 +231,7 @@ async fn usage_query_endpoint_application_logic_is_unaffected_by_mtls(pool: PgPo
             "acct_1",
         )),
         ingest_principals: std::collections::HashMap::default(),
+        raw_days: Some(90),
     });
     let router = build_query_router(state, readiness_pool, false);
 

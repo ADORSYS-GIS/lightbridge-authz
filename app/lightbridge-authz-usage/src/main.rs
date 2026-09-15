@@ -44,6 +44,7 @@ async fn main() -> Result<()> {
                 &config.oauth2,
                 &config.scope_authority,
                 config.ingest_auth.as_ref(),
+                &config.retention,
             )
             .await
         }

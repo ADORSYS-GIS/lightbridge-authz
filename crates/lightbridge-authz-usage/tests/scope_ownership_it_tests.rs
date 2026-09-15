@@ -70,7 +70,6 @@ fn sample_event(account_id: &str, project_id: &str, observed_at: DateTime<Utc>) 
         total_tokens: None,
         total_cost: Some(1.0),
         latency_ms: None,
-        attributes: json!({}),
     }
 }
 
@@ -97,6 +96,7 @@ fn app(
         bearer,
         scope_authority,
         ingest_principals: std::collections::HashMap::default(),
+        raw_days: Some(90),
     });
     build_query_router(state, readiness_pool, false)
 }
@@ -412,6 +412,7 @@ async fn spend_endpoint_refuses_bearer_carrying_requests(pool: PgPool) {
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
         ingest_principals: std::collections::HashMap::default(),
+        raw_days: Some(90),
     });
     let router = build_query_router(state, readiness_pool, false);
 
@@ -462,7 +463,6 @@ fn sample_event_for_user(user_id: &str, observed_at: DateTime<Utc>) -> UsageEven
         total_tokens: None,
         total_cost: Some(1.0),
         latency_ms: None,
-        attributes: json!({}),
     }
 }
 
