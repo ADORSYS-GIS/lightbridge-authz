@@ -52,10 +52,17 @@ scope_authority:
   username: "authorino"
   password: "change-me"
   insecure_skip_verify: true
+# #585: authenticated ingest, scoped to ADR-0028 D8 leg 3 only. The collector-mediated push
+# sources (claude-code, codex, opencode) are deliberately absent -- D8 leg 2 says the collector->usage
+# hop carries no second credential. Only sources with no collector in their path (out-of-cluster,
+# D8 leg 3) belong here. See config/usage.yaml for the full rationale.
+#
+# NOTE: this block is what makes the /auth/v1/otel/* routes mount at all, and this local stack's
+# `oauth2.jwks_url` above points at Keycloak -- while `svc:` tokens are minted by authz-idp. That
+# divergence is a known local-only follow-up tracked in .docker/authz/container.yaml; in the deployed
+# platform every authz resource server validates against authz-idp's JWKS.
 ingest_auth:
+  audience: "lightbridge-usage-ingest"
   principals:
-    "svc:collector-claude-code": "claude-code"
-    "svc:collector-codex": "codex"
-    "svc:collector-opencode": "opencode"
     "svc:collector-github-copilot": "github-copilot"
     "svc:collector-microsoft-foundry": "microsoft-foundry"

@@ -56,6 +56,23 @@ pub struct IngestAuthConfig {
     /// independently at request time, so a bad key is a fail-loud typo catch, not the security
     /// boundary.
     pub principals: HashMap<String, String>,
+    /// The audience this endpoint's tokens must name (#585 AC4). Required, and checked against
+    /// the validated token's own `aud` claim.
+    ///
+    /// This is what makes "the credential names the collector" actually hold: without it, any
+    /// valid `client_credentials` token from any client whose `sub` happens to be in `principals`
+    /// would be admitted, regardless of which resource it was minted for.
+    ///
+    /// **Deliberately not `oauth2.audience`.** That block is the shared `Oauth2` config the
+    /// query listener validates end-user bearer tokens against; pinning it here would silently
+    /// start requiring human tokens to carry a machine audience, 401ing the console. The two
+    /// audiences are different populations on the same process, so they get different fields.
+    ///
+    /// `authz-idp` already supports this with no change: a `client_credentials` token's `aud`
+    /// defaults to the client's own `client_id`, or to a value explicitly listed in that client's
+    /// `allowed_audiences` (RFC 8707 resource indicators, `token_exchange.rs`). A collector
+    /// therefore asks for `audience=<this value>` at the token endpoint.
+    pub audience: String,
 }
 
 /// HTTP client config for calling `authz-opa`'s `POST /idp/v1/authorize-usage-scope` (#570).
@@ -170,6 +187,15 @@ fn validate_ingest_auth(config: &UsageConfig) -> Result<()> {
     if auth.principals.is_empty() {
         return Err(lightbridge_authz_core::Error::BadRequest(
             "ingest_auth is present but principals mapping is empty".to_string(),
+        ));
+    }
+
+    if auth.audience.trim().is_empty() {
+        return Err(lightbridge_authz_core::Error::BadRequest(
+            "ingest_auth.audience must not be empty -- it is the audience checked against every \
+             token on /auth/v1/otel/* (AC4); an empty value would match nothing and refuse every \
+             request"
+                .to_string(),
         ));
     }
 

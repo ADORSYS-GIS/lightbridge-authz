@@ -55,13 +55,30 @@ scope_authority:
   password: "change-me"
   insecure_skip_verify: true
 
-# #585: authenticated ingest configuration.
-# Maps JWT subjects (M2M svc:collector-* tokens) to the single X-Source value they are allowed to assert.
+# #585: authenticated ingest configuration, scoped to ADR-0028 D8 LEG 3 ONLY.
+#
+# D8 settles the ingest-authentication topology (owner ruling, 2026-08-31): developer-attributed
+# push sources (Claude Code, Codex, OpenCode) reach this store through the EDGE OTEL collector, and
+# "the collector->usage hop carries no second credential" -- a token on a hop already pinned by
+# ClusterIP + NetworkPolicy "buys an audit line and a rotation liability, not a boundary", and "a
+# credential that is not a real boundary is worse than no credential, because it reads like one in a
+# review". Those three sources are therefore deliberately ABSENT here: configuring them to
+# authenticate directly at usage would implement the topology D8 rejects.
+#
+# What remains are genuine D8 leg-3 sources -- out-of-cluster, with no collector in their path --
+# which is exactly what authz-idp's `client_credentials` grant exists for (#534/ADR-0030).
+#
+# `audience` is the AC4 binding: the presented token must name this endpoint, which is what makes
+# "the credential names the collector" hold. authz-idp needs no change for this -- a
+# client_credentials token's `aud` defaults to its own client_id, or to a value listed in that
+# client's `allowed_audiences` (RFC 8707 resource indicators, token_exchange.rs); the collector
+# requests `audience=lightbridge-usage-ingest` at the token endpoint.
+#
+# Keys are JWT `sub` values and must be `svc:`-prefixed (a client_credentials token's sub is minted
+# as `svc:<client_id>`); values must be a KNOWN_SOURCES entry. Both are refused at config load.
 ingest_auth:
+  audience: "lightbridge-usage-ingest"
   principals:
-    "svc:collector-claude-code": "claude-code"
-    "svc:collector-codex": "codex"
-    "svc:collector-opencode": "opencode"
     "svc:collector-github-copilot": "github-copilot"
     "svc:collector-microsoft-foundry": "microsoft-foundry"
 # #549 AC2: retention/rollup for usage_events. Shipped uncommented so the knob is visible in the

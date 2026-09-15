@@ -42,13 +42,17 @@ pub struct UsageState {
     /// purged, so `usage_events` holds everything ingested and no range is truncated by retention
     /// -- the handler must not stamp `truncated: true` on a complete answer (P2).
     pub raw_days: Option<i64>,
-    /// The strict mapping of JWT `sub` -> `X-Source` for the authenticated ingest surface (#585).
+    /// The credential-binding rules for the authenticated ingest surface (#585): the strict
+    /// `sub` -> `X-Source` map and the required audience.
     ///
-    /// Empty when `ingest_auth` is absent from config -- in which case the `/auth/v1/otel/*`
-    /// routes are not mounted at all (`build_ingest_router`'s `has_auth_ingest`), so no request
-    /// can reach a handler that reads this. Deny-by-default: an empty map authorizes nobody, so a
-    /// misconfiguration that left the routes mounted would refuse rather than admit.
-    pub ingest_principals: std::collections::HashMap<String, String>,
+    /// `None` means `ingest_auth` was absent from config, and is the single source of truth for
+    /// whether the `/auth/v1/otel/*` routes are mounted at all -- `build_ingest_router` derives
+    /// that decision from this field rather than taking a parallel flag, so the two can never
+    /// disagree. See that call site for why the surface is config-conditional today.
+    ///
+    /// Deny-by-default regardless: an empty `principals` map authorizes nobody, so a route that
+    /// somehow stayed mounted would refuse rather than admit.
+    pub ingest_auth: Option<crate::config::IngestAuthConfig>,
 }
 
 #[async_trait]

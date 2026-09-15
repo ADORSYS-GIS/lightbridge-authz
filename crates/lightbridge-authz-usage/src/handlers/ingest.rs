@@ -25,6 +25,7 @@ use tracing::{debug, instrument, warn};
 
 use crate::{
     UsageState,
+    handlers::payload_identity::check_identity_mismatch,
     models::IngestResponse,
     normalizer::{extract_f64, extract_i64, extract_string},
     repo::UsageEvent,
@@ -523,6 +524,7 @@ pub(crate) fn extract_log_events(
             for log_record in scope_logs.log_records {
                 let attrs =
                     merge_attr_maps(&resource_attrs, &key_values_to_map(&log_record.attributes));
+                check_identity_mismatch(&attrs, source);
 
                 let observed_nanos = if log_record.time_unix_nano > 0 {
                     log_record.time_unix_nano
@@ -601,6 +603,7 @@ pub(crate) fn extract_trace_events(
         for scope_spans in resource_spans.scope_spans {
             for span in scope_spans.spans {
                 let attrs = merge_attr_maps(&resource_attrs, &key_values_to_map(&span.attributes));
+                check_identity_mismatch(&attrs, source);
 
                 let span_meta = crate::normalizer::SpanMeta {
                     trace_id: (!span.trace_id.is_empty()).then(|| hex::encode(&span.trace_id)),
@@ -748,6 +751,7 @@ fn number_data_point_to_event(
     normalizer: Option<crate::normalizer::NormalizerFn>,
 ) -> UsageEvent {
     let attrs = merge_attr_maps(metric_attrs, &key_values_to_map(&point.attributes));
+    check_identity_mismatch(&attrs, source);
 
     let value = match point.value {
         Some(number_data_point::Value::AsDouble(v)) => v,
@@ -799,6 +803,7 @@ fn histogram_data_point_to_event(
     normalizer: Option<crate::normalizer::NormalizerFn>,
 ) -> UsageEvent {
     let attrs = merge_attr_maps(metric_attrs, &key_values_to_map(&point.attributes));
+    check_identity_mismatch(&attrs, source);
 
     let count = u64_to_i64(point.count);
     let usage_value = point.sum.unwrap_or(count as f64);
@@ -844,6 +849,7 @@ fn exponential_histogram_data_point_to_event(
     normalizer: Option<crate::normalizer::NormalizerFn>,
 ) -> UsageEvent {
     let attrs = merge_attr_maps(metric_attrs, &key_values_to_map(&point.attributes));
+    check_identity_mismatch(&attrs, source);
 
     let count = u64_to_i64(point.count);
     let usage_value = point.sum.unwrap_or(count as f64);
@@ -889,6 +895,7 @@ fn summary_data_point_to_event(
     normalizer: Option<crate::normalizer::NormalizerFn>,
 ) -> UsageEvent {
     let attrs = merge_attr_maps(metric_attrs, &key_values_to_map(&point.attributes));
+    check_identity_mismatch(&attrs, source);
 
     let count = u64_to_i64(point.count);
 
@@ -2654,7 +2661,7 @@ mod tests {
             repo: Arc::new(PartialInsertRepo { persisted: 1 }),
             bearer: Arc::new(RefuseEverythingBearer),
             scope_authority: Arc::new(RefuseEverythingScopeAuthority),
-            ingest_principals: std::collections::HashMap::default(),
+            ingest_auth: None,
             raw_days: Some(90),
         };
         let events = vec![base_usage_event(), base_usage_event()];
