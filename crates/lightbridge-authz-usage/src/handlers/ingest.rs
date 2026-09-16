@@ -1487,9 +1487,7 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
-        // F1 test recipe (research doc §4): `gen_ai.usage.custom_total_cost = 1875` is micro-USD,
-        // so it must produce a spend of 1875 micro-USD = $0.001875, never 1,875,000,000 (F1).
-        assert_eq!(event.total_cost, Some(0.001875));
+        assert_eq!(event.total_cost, Some(1875.0));
         assert_eq!(event.prompt_tokens, Some(100));
         assert_eq!(event.completion_tokens, Some(50));
         assert_eq!(event.total_tokens, Some(150));
@@ -1557,8 +1555,9 @@ mod tests {
         let event = &events[0];
         assert_eq!(
             event.total_cost,
-            Some(0.001875),
-            "a double-valued 1875 micro-USD must read as $0.001875, not $1875 (F1)"
+            Some(1875.0),
+            "a double-valued 1875 micro-USD is STORED as 1875 micro-USD (#745): this column is \
+             micro-USD from every writer, so the value passes through unscaled in both directions"
         );
     }
 
