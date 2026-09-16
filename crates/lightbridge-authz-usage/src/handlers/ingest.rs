@@ -252,6 +252,17 @@ pub async fn ingest_traces(
     body: Bytes,
 ) -> Result<(StatusCode, Json<IngestResponse>)> {
     let source = crate::normalizer::resolve_source(&headers)?;
+    // Agent-tool traces are execution-grain (ADR-0027): route them to the execution-grain
+    // receiver, never the request-grain `usage_events` path (#588, AC2).
+    if crate::normalizer::execution_grain::is_execution_grain_source(source) {
+        return crate::handlers::execution_ingest::ingest_execution_grain_traces(
+            State(state),
+            headers,
+            body,
+            source,
+        )
+        .await;
+    }
     let payload =
         decode_otlp_request_async::<ExportTraceServiceRequest>(headers, body, "trace").await?;
     let events = extract_trace_events(payload, source);
@@ -312,6 +323,10 @@ pub async fn ingest_logs(
     body: Bytes,
 ) -> Result<(StatusCode, Json<IngestResponse>)> {
     let source = crate::normalizer::resolve_source(&headers)?;
+    if source == crate::normalizer::day_grain::DAY_GRAIN_SOURCE {
+        return crate::handlers::day_grain::ingest_day_grain_logs(State(state), headers, body)
+            .await;
+    }
     let payload =
         decode_otlp_request_async::<ExportLogsServiceRequest>(headers, body, "logs").await?;
     let events = extract_log_events(payload, source);
@@ -979,7 +994,7 @@ fn nanos_to_datetime(nanos: u64) -> DateTime<Utc> {
     DateTime::from_timestamp(secs, sub_nanos).unwrap_or_else(Utc::now)
 }
 
-fn key_values_to_map(values: &[KeyValue]) -> HashMap<String, Value> {
+pub(crate) fn key_values_to_map(values: &[KeyValue]) -> HashMap<String, Value> {
     let mut map = HashMap::new();
     for kv in values {
         let value = kv
@@ -992,7 +1007,7 @@ fn key_values_to_map(values: &[KeyValue]) -> HashMap<String, Value> {
     map
 }
 
-fn merge_attr_maps(
+pub(crate) fn merge_attr_maps(
     base: &HashMap<String, Value>,
     additional: &HashMap<String, Value>,
 ) -> HashMap<String, Value> {
@@ -2620,6 +2635,27 @@ mod tests {
         impl crate::UsageRepoTrait for PartialInsertRepo {
             async fn insert_usage_events(&self, _events: &[UsageEvent]) -> Result<usize> {
                 Ok(self.persisted)
+            }
+
+            async fn upsert_day_facts(
+                &self,
+                _facts: &[crate::models::day_seat::DayFact],
+            ) -> Result<usize> {
+                Ok(0)
+            }
+
+            async fn upsert_seat_snapshots(
+                &self,
+                _snapshots: &[crate::models::day_seat::SeatSnapshot],
+            ) -> Result<usize> {
+                Ok(0)
+            }
+
+            async fn upsert_execution_grain(
+                &self,
+                _batch: &crate::models::execution_ingest::ExecutionGrainBatch,
+            ) -> Result<usize> {
+                Ok(0)
             }
 
             async fn query_usage(

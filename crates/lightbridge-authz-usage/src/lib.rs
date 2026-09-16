@@ -30,6 +30,7 @@ pub mod routers;
 pub mod scope_authority;
 pub mod spend;
 pub mod state;
+pub mod verify;
 
 pub use config::{RetentionConfig, ScopeAuthorityConfig, UsageConfig, UsageServer, load_from_path};
 use repo::StoreRepo;

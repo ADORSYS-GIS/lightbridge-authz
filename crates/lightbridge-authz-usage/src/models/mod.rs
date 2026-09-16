@@ -5,6 +5,7 @@ use utoipa::ToSchema;
 
 pub mod day_seat;
 pub mod execution;
+pub mod execution_ingest;
 #[derive(Debug, Serialize, ToSchema)]
 pub struct IngestResponse {
     pub accepted_events: usize,

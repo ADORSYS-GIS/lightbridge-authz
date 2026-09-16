@@ -21,6 +21,7 @@ async fn main() -> Result<()> {
         Some(Commands::Serve { config_path }) => Some(config_path),
         Some(Commands::Migrate { config_path }) => Some(config_path),
         Some(Commands::Config { config_path }) => Some(config_path),
+        Some(Commands::VerifyCounts { config_path, .. }) => Some(config_path),
         // `version` reads no config on purpose -- see the subcommand's doc comment.
         Some(Commands::Version) => None,
         None => None,
@@ -54,6 +55,40 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Config { config_path }) => {
             let _ = load_from_path(&config_path)?;
+            Ok(())
+        }
+        Some(Commands::VerifyCounts {
+            config_path,
+            manifest_path,
+        }) => {
+            let config = load_from_path(&config_path)?;
+            let pool = lightbridge_authz_core::db::DbPool::new(&config.database).await?;
+            let manifest_text = tokio::fs::read_to_string(&manifest_path).await?;
+            let manifest: lightbridge_authz_usage_rest::verify::VerifyManifest =
+                serde_json::from_str(&manifest_text).map_err(|e| {
+                    lightbridge_authz_core::Error::Server(format!(
+                        "failed to parse manifest {}: {e}",
+                        manifest_path
+                    ))
+                })?;
+            let report = lightbridge_authz_usage_rest::verify::verify_counts(
+                lightbridge_authz_core::db::DbPoolTrait::pool(&pool),
+                &manifest,
+            )
+            .await?;
+            let report_json = serde_json::to_string_pretty(&report).map_err(|e| {
+                lightbridge_authz_core::Error::Server(format!(
+                    "failed to serialize verification report: {e}"
+                ))
+            })?;
+            println!("{report_json}");
+            if !report.passed {
+                return Err(lightbridge_authz_core::Error::Server(
+                    "count verification failed: usage store counts do not match the governance \
+                     manifest"
+                        .to_string(),
+                ));
+            }
             Ok(())
         }
         Some(Commands::Version) => {

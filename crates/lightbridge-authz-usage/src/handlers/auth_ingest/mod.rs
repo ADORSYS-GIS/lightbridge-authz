@@ -71,6 +71,35 @@ where
         Err(refusal) => return (*refusal).into_response(),
     };
 
+    // Copilot data arrives via the day-grain pull path (RFC-0001), never the request-grain push
+    // path. On the logs signal, route a `github-copilot` source to the day-grain receiver (#588).
+    if persist_signal == "log" && source == crate::normalizer::day_grain::DAY_GRAIN_SOURCE {
+        return match crate::handlers::day_grain::ingest_day_grain_logs(State(state), headers, body)
+            .await
+        {
+            Ok((status, json)) => (status, json).into_response(),
+            Err(e) => e.into_response(),
+        };
+    }
+
+    // Agent-tool traces are execution-grain (ADR-0027): route them to the execution-grain
+    // receiver, never the request-grain `usage_events` path (#588, AC2).
+    if persist_signal == "trace"
+        && crate::normalizer::execution_grain::is_execution_grain_source(source)
+    {
+        return match crate::handlers::execution_ingest::ingest_execution_grain_traces(
+            State(state),
+            headers,
+            body,
+            source,
+        )
+        .await
+        {
+            Ok((status, json)) => (status, json).into_response(),
+            Err(e) => e.into_response(),
+        };
+    }
+
     let payload = match decode_otlp_request_async::<P>(headers, body, decode_signal).await {
         Ok(payload) => payload,
         Err(e) => return e.into_response(),
