@@ -1,8 +1,14 @@
-//! Self-service account provisioning at first federated login (the mint-on-login branch ADR-0024's
-//! 2026-08-25 correction removed from `/idp/callback`, with nothing to replace it in production).
+//! Self-service account provisioning at first federated login -- the mint-on-login branch
+//! ADR-0024's 2026-08-25 correction removed, with nothing to replace it in production (#739).
+//! Its own file because `repo.rs` sits on its LoC-gate baseline: touchable, not growable.
 //!
-//! Its own file because `repo.rs` sits on its committed LoC-gate baseline and may be touched but
-//! not grown.
+//! ADR-0038: hand-written SQL because no table here is expressible through the generated client.
+//! `federated_identities` is ABSENT from `authz.cstack` by design (ADR-0024 Q4,
+//! credential-bearing); `accounts` deliberately has no `@@allow("create", ...)` and
+//! `model.Account.create` is denied at the RBAC layer besides (ADR-0006, procedure-only, which is
+//! why `create_account`/`provision_account` are hand-written too); `projects` HAS an
+//! `@@allow("create", ...)`, but every conjunct is unsatisfiable at `/idp/callback`, where there is
+//! no `auth()` context at all. Full argument: AGENTS.md's ADR-0038 exception list.
 
 use chrono::Utc;
 use lightbridge_authz_core::cuid::cuid2;
@@ -12,9 +18,8 @@ use tracing::instrument;
 use crate::db::StoreRepo;
 use crate::entities::federated_identity_row::{FederatedIdentityRow, UpsertFederatedIdentity};
 
-/// Whether the account existed already, or had to be minted (with its default project) in the
-/// same transaction -- `persist_federated_identity` needs this to decide whether the login's
-/// #697 starting grant needs booking; only a BRAND NEW account is unfunded.
+/// Whether the account existed, or was minted (with its default project) in the same transaction.
+/// `persist_federated_identity` books the #697 starting grant only when it was minted.
 #[derive(Debug)]
 pub struct FederatedIdentityOutcome {
     pub row: FederatedIdentityRow,
@@ -23,19 +28,15 @@ pub struct FederatedIdentityOutcome {
 
 impl StoreRepo {
     /// The provisioning-capable sibling of [`Self::upsert_federated_identity`]: identical
-    /// UPDATE-on-existing behaviour and identical ADR-0025 issuer pin (a subject presented by any
-    /// issuer other than `grandfather_issuer` is still refused, never provisioned), but where that
-    /// method refuses a `subject` with no `accounts` row, this one provisions the anchor account
-    /// and its default project in the SAME transaction -- mirroring [`Self::provision_account`]'s
-    /// two INSERTs -- then runs the identical `federated_identities` INSERT either way, so
-    /// `account_id` is always `subject` regardless of which branch ran. The original method is
-    /// untouched and still serves its own callers verbatim; this is the new funnel
-    /// `KeycloakRelyingParty::persist_federated_identity` calls instead.
+    /// UPDATE-on-existing behaviour and identical ADR-0025 issuer pin (any issuer other than
+    /// `grandfather_issuer` is still refused, never provisioned), but where that method refuses a
+    /// `subject` with no `accounts` row, this one provisions the anchor account and its default
+    /// project in the SAME transaction -- mirroring [`Self::provision_account`]'s two INSERTs --
+    /// then runs the identical `federated_identities` INSERT either way. The original is untouched.
     ///
-    /// `billing_identity` (globally UNIQUE on `projects`) is the ID token's `email` only when
-    /// `email_verified == Some(true)`; otherwise it is `subject` verbatim. Trusting an unverified
-    /// email would let one user squat another's billing identity before ever proving they own it;
-    /// `subject` is always safe to fall back to -- unique and non-squattable -- so a user with no
+    /// `billing_identity` (globally UNIQUE) is the ID token's `email` only when `email_verified ==
+    /// Some(true)`, else `subject` verbatim: trusting an unverified email would let one user squat
+    /// another's billing identity, and `subject` is unique and non-squattable, so a user with no
     /// verified email (9 of the 42 affected in production) can still sign in.
     #[instrument(skip(self, input))]
     pub async fn upsert_federated_identity_and_provision(
@@ -187,9 +188,8 @@ impl StoreRepo {
     }
 }
 
-/// Shared `23505` mapping for the two provisioning INSERTs above -- the narrow race of two
-/// concurrent first logins for the same never-seen subject. Same posture as
-/// [`StoreRepo::provision_account`]'s identical race: a `Conflict`, not self-healed.
+/// Shared `23505` mapping for the two provisioning INSERTs -- the narrow race of two concurrent
+/// first logins for one never-seen subject. Same posture as `provision_account`'s identical race.
 fn provisioning_conflict(e: sqlx::Error, message: &str) -> Error {
     if let sqlx::Error::Database(db_err) = &e
         && db_err.code().as_deref() == Some("23505")

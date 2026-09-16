@@ -1130,8 +1130,24 @@ hand-written SQL and direct `sqlx` dependencies.
     with no bypass -- an estate-wide admin label lookup is exactly the query that policy cannot
     express, and widening the shared clause would widen `model.Account.list`/`model.Project.list`
     for every other caller too. Gated instead by the dedicated `user:read` permission at the RPC
-    layer; see `docs/admin-identity-resolution.md`. Reads only -- every write to these tables still
-    goes through the generated client or the pre-existing exceptions.
+    layer; see `docs/admin-identity-resolution.md`. Reads only for #647 -- the one WRITE exception
+    is the first-login provisioning entry immediately below.
+  - `accounts`/`projects`, WRITE, at first federated login only (#739):
+    `StoreRepo::upsert_federated_identity_and_provision`
+    (`crates/lightbridge-authz-api-key/src/federated_provisioning.rs`) mints the anchor account and
+    its default project for a grandfather-issuer subject signing in for the first time. Three
+    independent reasons, none of them "not got round to it": (1) it must commit atomically with the
+    `federated_identities` INSERT -- itself absent from the schema, above -- and `cratestack-pg`
+    exposes no API for joining a caller-owned `sqlx` transaction; (2) `Account` deliberately carries
+    NO `@@allow("create", ...)`, and `model.Account.create` is denied unconditionally at the RBAC
+    layer besides, because account creation is procedure-only by design (ADR-0006) -- which is why
+    `create_account` and `provision_account` are hand-written too; routing this through the
+    generated client would mean WIDENING `@@allow("create")` on `Account`, exposing account creation
+    as a generic CRUD verb to every caller, which is strictly worse; (3) `Project` DOES carry
+    `@@allow("create", (account.userId == auth().id) && auth().rpcScope == "crud" &&
+    auth().permProjectCreate == true)`, but every conjunct is unsatisfiable on this path: at
+    `/idp/callback` there is no `auth()` context at all -- the caller holds no lightbridge token
+    yet, and obtaining one is precisely what this unblocks.
   - `platform_role_grants` (ADR-0033): who holds a platform role, read at token mint by
     `ClaimSource::PlatformRoles`. Two independent reasons: the hot read runs on the mint path
     inside `authz-idp`, which builds no cratestack client at all; and the grant's idempotency is an
@@ -1163,7 +1179,7 @@ hand-written SQL and direct `sqlx` dependencies.
     (`ON CONFLICT`) semantics that generated CRUD cannot express, in the usage DB which is
     already hand-written SQL (see `usage_events`). Same exception class as `secret_claims`;
     justified in each migration header under `migrations-usage/2026090700000{1,2,3,4}_*.sql`.
-- This repo runs cratestack (`cratestack-pg`) `=0.10.0` (pinned exactly in the root `Cargo.toml`,
+- This repo runs cratestack (`cratestack-pg`) `=0.11.0` (pinned exactly in the root `Cargo.toml`,
   which also documents why the pin cannot float past it -- see that file's `cratestack-core =
   "=0.10.0"` block); ADR-0038's capability findings were verified against 0.7.8. Re-verify any
   capability claim against `0.10.0` here before relying on it -- this line has gone stale at every
