@@ -152,8 +152,8 @@ should fail loudly.
   "budget_account_id": "cuid2…",
   "period": "2026-09",
   "ceiling_micros": 24000000,     // effective_balance: expiry/revocation-aware SUM(budget_grants)
-  "spent_micros": 3210000,        // /usage/v1/spend/query's SUM(usage_events.total_cost) [dollars],
-                                   // scaled to micro-USD below
+  "spent_micros": 3210000,        // /usage/v1/spend/query's SUM(usage_events.total_cost) --
+                                   // already micro-USD; validated, not scaled, below
   "remaining_micros": 20790000,   // signed, NOT clamped — negative means overspend
   "next_reset_at": "2026-10-01T00:00:00Z",
   "source_lag_seconds": null      // null = no cache age to report; NOT "zero staleness"
@@ -168,21 +168,30 @@ should fail loudly.
 
 Six things about that payload are decisions, not details:
 
-- **`spent_micros` is dollars-on-the-wire, scaled to micro-USD here.**
-  `/usage/v1/spend/query` answers with `SUM(usage_events.total_cost)` in **dollars**, per
-  `docs/lightbridge-query-api.md`'s documented contract (`"total_cost": 12.34` at
-  `docs/lightbridge-query-api.md:250`) — `usage_events.total_cost` is written in dollars by
-  `apply_normalizer` (`crates/lightbridge-authz-usage/src/handlers/ingest.rs:492-495`).
-  `UsageServiceSpendReader` converts that dollar figure into `i64` micro-USD via
-  `validate_total_cost_micros` (`crates/lightbridge-authz-budget/src/spend_units.rs`) before it
-  becomes this endpoint's `spent_micros`. This wasn't always true: PR
-  [#488](https://github.com/ADORSYS-GIS/lightbridge-authz/pull/488) (`0dde42f`, 2026-08-25) was
-  correct when written — `usage_events.total_cost` really was already micro-USD then, and
-  `validate_total_cost_micros` correctly stopped scaling it. Commit `6413db1` ("feat: implement
-  normalizer registry and opencode pricing", 2026-09-08) changed `apply_normalizer` to store
-  dollars instead, invalidating #488's premise without anyone re-auditing this reader; PR
+- **`spent_micros` is micro-USD on the wire, validated but not scaled.**
+  `/usage/v1/spend/query` answers with `SUM(usage_events.total_cost)`, and that column is
+  **micro-USD from every writer** — settled, after two rounds of getting only half the picture
+  right, by PR [#745](https://github.com/ADORSYS-GIS/lightbridge-authz/pull/745)/
+  [#746](https://github.com/ADORSYS-GIS/lightbridge-authz/pull/746)
+  (`f061d1e`, 2026-09-16). `UsageServiceSpendReader` passes that figure straight into `i64` via
+  `validate_total_cost_micros` (`crates/lightbridge-authz-budget/src/spend_units.rs`) — it checks
+  finiteness/sign/overflow and rounds, it does not scale. The history, so nobody re-derives it a
+  fourth time: PR [#488](https://github.com/ADORSYS-GIS/lightbridge-authz/pull/488) (`0dde42f`,
+  2026-08-25) removed a `* 1_000_000.0` here, correct at the time because `apply_normalizer`
+  really was a verbatim pass-through then. Commit `6413db1` ("feat: implement normalizer registry
+  and opencode pricing", 2026-09-08) later made `apply_normalizer`'s normalizer-backed branch
+  divide by `1_000_000.0` before storing, silently making the column dollars for *that* branch
+  only — its other branch (the raw-CEL-value fallback) kept writing micro-USD unchanged, so the
+  column held two different units depending on which branch produced a given row. PR
   [#737](https://github.com/ADORSYS-GIS/lightbridge-authz/pull/737) (closing
-  [#736](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/736)) restored the scaling.
+  [#736](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/736)) re-added the scaling here,
+  which fixed the normalizer-backed rows and silently broke the fallback-backed ones the opposite
+  way — a real production incident (40 of 49 accounts hit `budget_exhausted`, spend read ~10^6x
+  inflated). #745/#746 fixed the actual defect — the writer, not this reader — so both
+  `apply_normalizer` branches now agree on micro-USD, a migration rescaled the rows written in the
+  wrong unit during the incident window, and this function is back to validate-only for good. If
+  spend ever looks ~10^6x wrong again, the bug is a writer that started scaling, not this
+  function — check `apply_normalizer` first.
 - **`ceiling_micros` is `BudgetRepo::effective_balance`**, not the raw
   `budget_balances.effective_budget_micros` projection. The projection counts grants that have
   since expired or been revoked (it reproduces `BudgetRepo::grant`'s unconditional `UPDATE`

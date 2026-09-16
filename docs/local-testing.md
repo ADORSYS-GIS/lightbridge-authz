@@ -389,21 +389,25 @@ This brings up `timescaledb` + `authz-usage-migrate` + `authz-usage`, then runs
   supports (seconds/minutes/hours/days) has data.
 - **Covers 3 projects, 2 accounts, 2 users, 2 API keys, and 5 models** so `group_by` is exercised.
 - **Uses production-semantics magnitudes**: token counts in the hundreds-to-thousands, latency in
-  milliseconds, and realistic per-request **dollar** costs (`MODEL_PRICING`'s dollars-per-1K-token
-  table, `scripts/seed-usage-events.py:63-69`). The script itself computes that dollar figure as a
-  micro-USD integer and sends it under the raw gateway attribute
-  `io.envoy.ai_gateway.llm_custom_total_cost` (`scripts/seed-usage-events.py:148,170`) — its own
-  docstring still frames this as seeding "micro-USD" (`scripts/seed-usage-events.py:21-26`,
-  predating the unit change below and not corrected here since this is a docs-only pass). What
-  actually lands in `usage_events.total_cost` is **dollars**: the `eaig` normalizer
+  milliseconds, and realistic per-request costs computed from `MODEL_PRICING`'s dollars-per-1K-token
+  table (`scripts/seed-usage-events.py:63-69`), then converted to a **micro-USD** integer before it
+  ever goes on the wire. The script sends that micro-USD figure under the raw gateway attribute
+  `io.envoy.ai_gateway.llm_custom_total_cost` (`scripts/seed-usage-events.py:148,170`), matching its
+  own docstring, which frames this as seeding "micro-USD" (`scripts/seed-usage-events.py:21-26`).
+  What lands in `usage_events.total_cost` is **also micro-USD**: the `eaig` normalizer
   (`crates/lightbridge-authz-usage/src/normalizer/eaig.rs:20-23,50-54`) reads that attribute as
-  `cost_micros`, and `apply_normalizer` (`crates/lightbridge-authz-usage/src/handlers/ingest.rs:492-495`)
-  divides it by `1_000_000.0` before storage — so the round trip lands back at the original dollar
-  amount, matching the query API's documented dollar-scale contract
-  (`docs/lightbridge-query-api.md:250`, `"total_cost": 12.34`). See
-  [ADR-0034 §3](adr/0034-dynamic-budget-limiter.md) for why this matters on the budget side:
-  `validate_total_cost_micros` (`crates/lightbridge-authz-budget/src/spend_units.rs`) is what
-  scales this dollar figure into micro-USD for the ledger, not the ingest/seed path.
+  `cost_micros`, and `apply_normalizer` (`crates/lightbridge-authz-usage/src/handlers/ingest.rs`)
+  now stores it verbatim, with no scaling — matching the query API's documented micro-USD contract
+  (`docs/lightbridge-query-api.md`'s `total_cost` field row). This wasn't always true: between
+  2026-09-08 and 2026-09-16, `apply_normalizer` divided this figure by `1_000_000.0` before
+  storage, silently making the column dollars for this write path while a second code path (the
+  raw-CEL-value fallback) kept writing micro-USD — a real production incident, fixed by PR
+  [#745](https://github.com/ADORSYS-GIS/lightbridge-authz/pull/745)/
+  [#746](https://github.com/ADORSYS-GIS/lightbridge-authz/pull/746). See
+  [ADR-0034 §3](adr/0034-dynamic-budget-limiter.md) for the full history and why it matters on the
+  budget side: `validate_total_cost_micros` (`crates/lightbridge-authz-budget/src/spend_units.rs`)
+  validates this figure but does not scale it — the ingest writer is the single source of truth
+  for the unit now, not this reader.
 
 The script takes optional flags:
 
