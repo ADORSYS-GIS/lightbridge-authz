@@ -534,11 +534,14 @@ model Session {
 // op-id it does not list is denied unconditionally.
 //
 // `federated_identities` -- the sibling table this same migration creates, carrying the sealed
-// Keycloak token envelope -- is deliberately ABSENT from this schema entirely, not merely
-// `@@allow`-less: same class of exception as `signing_keys`/`exchange_refresh_tokens`/
-// `device_authorizations`/`authorization_codes` (see this file's and AGENTS.md's "Persistence"
-// section) -- a credential-bearing table must be unreachable from any generated read path, not
-// just unreachable via the coarse-RBAC gate a present-but-unallowed model would still have.
+// Keycloak token envelope -- is now modelled immediately below as `FederatedIdentity`, reversing
+// the earlier "deliberately absent" position (ADR-0024 Q4 REVERSAL, #740, explicit owner
+// directive -- see that model's own comment for the full reasoning, and AGENTS.md's
+// "Persistence" section for the ADR-0038 exception-list entry). It is `@@allow`-less exactly
+// like `User` here, not merely restricted, and the two credential columns
+// (`tokenEnvelope`/`tokenSealedAt`) are deliberately never declared at all -- which is what keeps
+// a credential-bearing table unreachable from any generated read path, not just gated behind the
+// coarse-RBAC check a present-but-unallowed model would still have.
 //
 // No relations on this model (no `federatedIdentities FederatedIdentity[]`, and `Account` does
 // NOT gain a `user User @relation(...)` field either): this repo already hit a real, measured
@@ -555,6 +558,77 @@ model User {
 
   id String @id
   status String @readonly
+}
+
+// ADR-0024 Q4 REVERSAL (#740, explicit owner directive): `federated_identities` used to be
+// deliberately absent from this schema entirely (see `User`'s comment immediately above, now
+// corrected on this point). Verbatim: "add federated_identities to .cstack file, just remove
+// permissions. Then let creation only via system users, what would be done using a procedure."
+// This model is that -- the table becomes schema-of-record while staying exactly as unreachable
+// through generated CRUD as it was while absent.
+//
+// Deliberately NO `@@allow` clause, mirroring `User` immediately above field for field: there is
+// no RPC surface for federated identities (no read/create/update/delete permission exists to
+// gate on), so the absence of any `@@allow` already fail-closes every generic
+// `model.FederatedIdentity.*` verb by construction. Two independent deny layers, same as `User`:
+// cratestack's own policy evaluator grants nothing when a model declares no `@@allow` for the
+// verb in question, and `rpc_authorize.rs`'s `required_permission` map needs no new entry
+// either, since an op-id it does not list (this one never will be) is denied unconditionally --
+// pinned by `federated_identity_schema_tests.rs`.
+//
+// DELIBERATELY OMITTED: `tokenEnvelope` and `tokenSealedAt`. Both columns carry the sealed
+// Keycloak credential (AES-256-GCM, `lightbridge_authz_core::crypto`) and exist on the real
+// table, but are read/written EXCLUSIVELY through hand-written SQL
+// (`crates/lightbridge-authz-api-key/src/federated_provisioning.rs`,
+// `crates/lightbridge-authz-api-key/src/repo.rs`) -- never declare them here. Omitting them is
+// stronger than `@@allow`-less: a field this model never names cannot be exposed by any FUTURE
+// accidental `@@allow`, which is precisely the risk ADR-0024 Q4 cited to keep the whole table
+// out in the first place. Making either column reachable through cratestack is reopening
+// ADR-0024 Q4, not a one-line schema edit.
+//
+// No relations (no `account Account @relation(...)`, no `federatedIdentities
+// FederatedIdentity[]` added to `Account`/`User`): the same measured cratestack codegen blowup
+// (~51GB RAM, 36 minutes, CI-killed) `User`'s comment above cites -- a second relation path
+// between two already-connected models. Nothing needs one: this model has no `@@allow` to write
+// a relation-based predicate with, and every field below is a plain scalar.
+//
+// Source-only, does not drive DDL (ADR-0003 convention, same as `User`/`Session` above): the
+// real table is owned by the hand-written migration
+// `migrations/20260825000001_users_and_federated_identities.sql` and its later corrections
+// (`20260825000002_federated_identities_link_accounts_not_users.sql`,
+// `20260830000001_federated_identities_add_profile_claims.sql`,
+// `20260902000003_federated_identities_display_claim_indexes.sql`). Field shape mirrors
+// `FederatedIdentityRow`
+// (`crates/lightbridge-authz-api-key/src/entities/federated_identity_row.rs`) minus the two
+// omitted credential columns above. Must never be handed to cratestack's migration
+// generator/diff tool, same caveat as `ProjectMember` immediately below.
+//
+// Writes stay hand-written, unaffected by this model now existing: `accountId` is `NOT NULL`
+// (2026-08-25 correction) and adopted by at most one federated identity ever (a partial unique
+// index the migration owns, not expressible here). `upsert_federated_identity`/
+// `upsert_federated_identity_and_provision` are the only writers; AGENTS.md's `accounts`/
+// `projects` WRITE bullet (#739) already records the three reasons the first-login provisioning
+// path can't go through cratestack either -- not duplicated here. "Creation only via system
+// users" (the owner directive above) is exactly what that hand-written path already is: there is
+// no `auth()` context at all at `/idp/callback`, and now that this model exists,
+// `model.FederatedIdentity.create` is ALSO denied unconditionally (the same two layers as
+// `.list` above) -- so nothing about routing creation through generated CRUD becomes possible
+// just because the table is now modelled.
+model FederatedIdentity {
+  @use(AuditFields)
+
+  id String @id
+  issuer String
+  subject String
+  accountId String
+  accessExpiresAt DateTime?
+  refreshExpiresAt DateTime?
+  scope String?
+  email String?
+  emailVerified Boolean?
+  preferredUsername String?
+  name String?
+  lastAuthenticatedAt DateTime
 }
 
 // Relation target ONLY. The real `project_members` table (owned by
@@ -1280,8 +1354,9 @@ procedure simulateBudgetPolicy(args: SimulateBudgetPolicyInput): Decision
 // clause in this schema references it, and none may -- authorization for every procedure below is
 // the coarse RBAC permission on the caller's own token, never a value read back off a stored row.
 // Resolving it to a display name/email is deliberately NOT this type's job (story A2's
-// `resolveUserProfiles` does that against `federated_identities`, which is absent from this schema
-// on purpose -- see the `User` model comment).
+// `resolveUserProfiles` does that against `federated_identities` via hand-written SQL -- that
+// model carries zero `@@allow` clauses, so there is still no generated read path to reach it
+// through -- see the `FederatedIdentity` model comment).
 type AugmentationRequest {
   id String
   budgetAccountId String
@@ -1880,9 +1955,11 @@ procedure getEffectiveResetSchedule(args: GetEffectiveResetScheduleInput): Effec
 // `crates/lightbridge-authz-api-key/src/identity_resolution.rs`, not by the generated model
 // client, for two independent reasons:
 //   1. `federated_identities` -- the ONLY source of display claims (`name`/`email`/
-//      `preferred_username`; `users` carries no display data at all) -- is deliberately absent
-//      from this schema entirely, because it also carries the sealed Keycloak token envelope
-//      (ADR-0024 Q4). There is no generated read path to reach it through, by design.
+//      `preferred_username`; `users` carries no display data at all) -- is modelled in this
+//      schema with zero `@@allow` clauses (ADR-0024 Q4 REVERSAL, #740; see the
+//      `FederatedIdentity` model comment), and the sealed Keycloak token envelope stays
+//      undeclared regardless. There is still no generated read path to reach it through, by
+//      design.
 //   2. `Account`/`Project`'s `@@allow("read", ...)` clauses are ownership-scoped
 //      (`userId == auth().id`), and cratestack folds them into the query unconditionally with no
 //      bypass (see `listMyExpiringApiKeys`'s own doc comment). An estate-wide admin label lookup

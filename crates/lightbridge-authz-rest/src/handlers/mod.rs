@@ -55,7 +55,12 @@ pub struct AuthzStoreImpl {
 /// The starting-grant service every [`AuthzStoreImpl`] carries (#697), over the same pool the
 /// handler already holds. The policy set id and evaluation budget are this crate's own, so the
 /// budget crate needs no second copy of either — see `budget_services`.
-fn build_starting_grant_service(
+///
+/// `pub(crate)`, not private: `start_idp_server` (`lib.rs`) builds its own
+/// `KeycloakRelyingParty`-owned copy from this SAME constructor rather than a second hand-rolled
+/// one, so the policy set id / evaluation budget can never drift between the RPC surface's starting
+/// grants and the browser-SSO-provisioning ones.
+pub(crate) fn build_starting_grant_service(
     pool: Arc<dyn DbPoolTrait>,
 ) -> lightbridge_authz_budget::StartingGrantService {
     lightbridge_authz_budget::StartingGrantService::new(

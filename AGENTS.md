@@ -458,8 +458,10 @@ Tables (see `migrations/`):
   them into the roles claim alongside `ClaimSource::ProjectRole`; `lightbridge-authz rbac grant` is
   the bootstrap writer (there is no admin to grant the first admin). Before this, prod mapped
   `owner -> lightbridge-admin`, which under ADR-0026 minted admin for every signed-in person.
-- `federated_identities` (ADR-0024, corrected 2026-08-25; deliberately absent from `authz.cstack`
-  — see "Persistence" below): keyed by `(issuer, subject)`, the login federation key. Carries the
+- `federated_identities` (ADR-0024, corrected 2026-08-25; ADR-0024 Q4 reversed 2026-09-16 by
+  explicit owner directive, #740 — now modelled in `authz.cstack` with zero `@@allow` clauses,
+  same as `User`; see "Persistence" below): keyed by `(issuer, subject)`, the login federation
+  key. Carries the
   sealed Keycloak token set (`token_envelope`, AES-256-GCM, `lightbridge_authz_core::crypto`) —
   refresh token plus a non-access-token ID-token claims snapshot, never the access token.
   `account_id` is `NOT NULL` (no `user_id` column — the user is always derived) and adopted by AT
@@ -1091,6 +1093,21 @@ Two rules once a collision has happened:
   the record of what actually ran there. The file that moves is the one that has *not* been applied
   anywhere durable. If both have, renumbering is not available and the fix is a new forward
   migration.
+
+  **This rule existed and was still broken (#741, 2026-09-16), so it needs a procedure, not just a
+  statement.** Before renumbering ANY migration, ask the database which file actually holds that
+  version — do not infer it from the repo:
+
+  ```bash
+  kubectl --context hetzner-prod exec -n converse lightbridge-main-db-1 -c postgres --     psql -U postgres -d usage -c     "SELECT version, description, installed_on FROM _sqlx_migrations ORDER BY version DESC LIMIT 10;"
+  ```
+
+  (`-d app` for the authz database.) #733 renumbered `usage_retention_state` off `20260911000001`
+  without checking; production had applied it under that exact version two days earlier, so the
+  version then resolved to a different file with a different checksum, and every subsequent
+  `lightbridge-usage-migrate` run aborted — leaving the usage store with nothing applied since
+  2026-09-11 and the crashloop unnoticed until an operator looked. Match the numbering to what the
+  database already ran, and move the file that has run nowhere.
 - **An applied migration's bytes are frozen.** SQLx stores a checksum per migration and validates
   it on every run, so editing one — *even to add a comment* — aborts the next migrate with a
   version mismatch. Corrections go in the owning ADR, not in the file.
@@ -1144,12 +1161,19 @@ hand-written SQL and direct `sqlx` dependencies.
     `create_hypertable`, `add_retention_policy`, `add_compression_policy`, or `ON CONFLICT
     (composite, including partition column) DO UPDATE`. Justified in the migration headers as an
     ADR-0038 exception per the grain-partitioned time-series + CAS/upsert exception class.
-  - `federated_identities`: deliberately ABSENT from `authz.cstack` entirely, not merely
-    `@@allow`-less -- it carries the sealed Keycloak token envelope, so a credential-bearing table
-    must be unreachable from any generated read path, not just gated behind the coarse-RBAC check
-    a present-but-unallowed model would still have (ADR-0024 Q4; created by
-    `migrations/20260825000001_users_and_federated_identities.sql`; justified in the `User` model
-    comment in `crates/lightbridge-authz-api/schema/authz.cstack`).
+  - `federated_identities`: modelled in `authz.cstack` as `FederatedIdentity` since the ADR-0024
+    Q4 reversal (#740, explicit owner directive) — schema-of-record now, but carrying ZERO
+    `@@allow` clauses, the same two independent deny layers as `User` (cratestack's own
+    no-`@@allow`-means-no-access, plus `rpc_authorize.rs`'s `required_permission` denying any
+    unmapped op-id unconditionally). The sealed Keycloak token envelope
+    (`tokenEnvelope`/`tokenSealedAt`) is still never declared at all — stronger than
+    `@@allow`-less, since a column this model never names cannot be exposed by a future accidental
+    `@@allow`. Every actual read and write still goes through hand-written SQL
+    (`crates/lightbridge-authz-api-key/src/federated_provisioning.rs`, `repo.rs`, and
+    `identity_resolution.rs`'s free-text search over its three display columns), never the
+    generated client — the model exists for policy/documentation, not data access. Justified in
+    the `FederatedIdentity` model comment in
+    `crates/lightbridge-authz-api/schema/authz.cstack`.
   - `accounts`/`projects`, READ-ONLY, for admin identity resolution only (#647): the estate-wide
     label lookups in `crates/lightbridge-authz-api-key/src/identity_resolution.rs`
     (`resolve_account_labels`/`resolve_project_labels`, and the `accounts` hop
@@ -1159,8 +1183,25 @@ hand-written SQL and direct `sqlx` dependencies.
     with no bypass -- an estate-wide admin label lookup is exactly the query that policy cannot
     express, and widening the shared clause would widen `model.Account.list`/`model.Project.list`
     for every other caller too. Gated instead by the dedicated `user:read` permission at the RPC
-    layer; see `docs/admin-identity-resolution.md`. Reads only -- every write to these tables still
-    goes through the generated client or the pre-existing exceptions.
+    layer; see `docs/admin-identity-resolution.md`. Reads only for #647 -- the one WRITE exception
+    is the first-login provisioning entry immediately below.
+  - `accounts`/`projects`, WRITE, at first federated login only (#739):
+    `StoreRepo::upsert_federated_identity_and_provision`
+    (`crates/lightbridge-authz-api-key/src/federated_provisioning.rs`) mints the anchor account and
+    its default project for a grandfather-issuer subject signing in for the first time. Three
+    independent reasons, none of them "not got round to it": (1) it must commit atomically with the
+    `federated_identities` INSERT -- that model is `@@allow`-less and denied unconditionally too
+    (per the entry above) -- and `cratestack-pg` exposes no API for joining a caller-owned `sqlx`
+    transaction; (2) `Account` deliberately carries
+    NO `@@allow("create", ...)`, and `model.Account.create` is denied unconditionally at the RBAC
+    layer besides, because account creation is procedure-only by design (ADR-0006) -- which is why
+    `create_account` and `provision_account` are hand-written too; routing this through the
+    generated client would mean WIDENING `@@allow("create")` on `Account`, exposing account creation
+    as a generic CRUD verb to every caller, which is strictly worse; (3) `Project` DOES carry
+    `@@allow("create", (account.userId == auth().id) && auth().rpcScope == "crud" &&
+    auth().permProjectCreate == true)`, but every conjunct is unsatisfiable on this path: at
+    `/idp/callback` there is no `auth()` context at all -- the caller holds no lightbridge token
+    yet, and obtaining one is precisely what this unblocks.
   - `platform_role_grants` (ADR-0033): who holds a platform role, read at token mint by
     `ClaimSource::PlatformRoles`. Two independent reasons: the hot read runs on the mint path
     inside `authz-idp`, which builds no cratestack client at all; and the grant's idempotency is an
@@ -1192,7 +1233,7 @@ hand-written SQL and direct `sqlx` dependencies.
     (`ON CONFLICT`) semantics that generated CRUD cannot express, in the usage DB which is
     already hand-written SQL (see `usage_events`). Same exception class as `secret_claims`;
     justified in each migration header under `migrations-usage/2026090700000{1,2,3,4}_*.sql`.
-- This repo runs cratestack (`cratestack-pg`) `=0.10.0` (pinned exactly in the root `Cargo.toml`,
+- This repo runs cratestack (`cratestack-pg`) `=0.11.0` (pinned exactly in the root `Cargo.toml`,
   which also documents why the pin cannot float past it -- see that file's `cratestack-core =
   "=0.10.0"` block); ADR-0038's capability findings were verified against 0.7.8. Re-verify any
   capability claim against `0.10.0` here before relying on it -- this line has gone stale at every

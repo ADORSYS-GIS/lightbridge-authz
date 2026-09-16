@@ -52,6 +52,15 @@ fn rate_limiter() -> Arc<dyn RateLimitStore> {
     Arc::new(InMemoryRateLimitStore::new())
 }
 
+fn starting_grant(pool: PgPool) -> Arc<lightbridge_authz_budget::StartingGrantService> {
+    let pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::from_pool(pool));
+    Arc::new(lightbridge_authz_budget::StartingGrantService::new(
+        pool,
+        lightbridge_authz_rest::budget_services::BUDGET_POLICY_SET_ID,
+        lightbridge_authz_rest::budget_services::BUDGET_POLICY_EVALUATION_BUDGET,
+    ))
+}
+
 /// Fixed caller address injected into every request built below, standing in for the real
 /// `ConnectInfo<SocketAddr>` `axum-server` normally populates from the live TCP connection --
 /// `.oneshot()` bypasses that entirely, so tests insert it themselves via
@@ -239,8 +248,9 @@ async fn verify_page_sanitizes_user_code_for_the_handoff(pool: PgPool) {
             rp_config(&keycloak),
             keycloak.base_url(),
             keycloak.base_url(),
-            repo(pool),
+            repo(pool.clone()),
             rate_limiter(),
+            starting_grant(pool.clone()),
             None,
         )
         .unwrap(),
@@ -296,7 +306,7 @@ async fn discover_dials_discovery_url_but_validates_issuer_against_identity(pool
             then.status(200).json_body(discovery_body(&keycloak));
         })
         .await;
-    let repo = repo(pool);
+    let repo = repo(pool.clone());
     let identity_issuer = "https://unreachable-identity.example.test".to_string();
     let rp = KeycloakRelyingParty::new(
         rp_config(&keycloak),
@@ -304,6 +314,7 @@ async fn discover_dials_discovery_url_but_validates_issuer_against_identity(pool
         keycloak.base_url(),
         repo,
         rate_limiter(),
+        starting_grant(pool.clone()),
         None,
     )
     .unwrap();
@@ -335,7 +346,7 @@ async fn verified_keycloak_callback_transitions_pending_device_code_to_approved(
                 .json_body(serde_json::json!({ "keys": [key.public_jwk] }));
         })
         .await;
-    let repo = repo(pool);
+    let repo = repo(pool.clone());
     // ADR-0024 Correction (2026-08-25): upsert_federated_identity now refuses a subject with no
     // pre-existing account, so this callback's identity must have one to adopt.
     repo.create_account(
@@ -358,6 +369,7 @@ async fn verified_keycloak_callback_transitions_pending_device_code_to_approved(
             keycloak.base_url(),
             repo.clone(),
             rate_limiter(),
+            starting_grant(pool.clone()),
             None,
         )
         .unwrap(),
@@ -443,7 +455,7 @@ async fn keycloak_token_failure_leaves_device_code_pending(pool: PgPool) {
             then.status(503).body("unavailable");
         })
         .await;
-    let repo = repo(pool);
+    let repo = repo(pool.clone());
     let store = DbDeviceCodeStore::new(repo.clone());
     store.store_device_code(session()).await.unwrap();
     let rp = Arc::new(
@@ -453,6 +465,7 @@ async fn keycloak_token_failure_leaves_device_code_pending(pool: PgPool) {
             keycloak.base_url(),
             repo.clone(),
             rate_limiter(),
+            starting_grant(pool.clone()),
             None,
         )
         .unwrap(),
@@ -494,11 +507,12 @@ async fn invalid_device_codes_have_one_uniform_response_and_frame_protection(poo
             keycloak.base_url(),
             repo(pool.clone()),
             rate_limiter(),
+            starting_grant(pool.clone()),
             None,
         )
         .is_err()
     );
-    let repo = repo(pool);
+    let repo = repo(pool.clone());
     let store = DbDeviceCodeStore::new(repo.clone());
     let mut expired = session();
     expired.device_code = "expired-device-code".to_string();
@@ -531,6 +545,7 @@ async fn invalid_device_codes_have_one_uniform_response_and_frame_protection(poo
             keycloak.base_url(),
             repo,
             rate_limiter(),
+            starting_grant(pool.clone()),
             None,
         )
         .unwrap(),
@@ -604,7 +619,7 @@ async fn invalid_device_codes_have_one_uniform_response_and_frame_protection(poo
 #[sqlx::test(migrations = "../../migrations")]
 async fn verify_continue_requires_the_confirmation_cookie_from_verify_submit(pool: PgPool) {
     let keycloak = MockServer::start_async().await;
-    let repo = repo(pool);
+    let repo = repo(pool.clone());
     let store = DbDeviceCodeStore::new(repo.clone());
     store.store_device_code(session()).await.unwrap();
     let mut other = session();
@@ -619,6 +634,7 @@ async fn verify_continue_requires_the_confirmation_cookie_from_verify_submit(poo
             keycloak.base_url(),
             repo,
             rate_limiter(),
+            starting_grant(pool.clone()),
             None,
         )
         .unwrap(),
@@ -710,7 +726,7 @@ async fn verify_continue_requires_the_confirmation_cookie_from_verify_submit(poo
 #[sqlx::test(migrations = "../../migrations")]
 async fn verify_context_is_a_uniform_404_without_the_confirm_cookie(pool: PgPool) {
     let keycloak = MockServer::start_async().await;
-    let repo = repo(pool);
+    let repo = repo(pool.clone());
     let store = DbDeviceCodeStore::new(repo.clone());
     store.store_device_code(session()).await.unwrap();
 
@@ -721,6 +737,7 @@ async fn verify_context_is_a_uniform_404_without_the_confirm_cookie(pool: PgPool
             keycloak.base_url(),
             repo,
             rate_limiter(),
+            starting_grant(pool.clone()),
             None,
         )
         .unwrap(),
@@ -805,7 +822,7 @@ async fn verify_context_is_a_uniform_404_without_the_confirm_cookie(pool: PgPool
 #[sqlx::test(migrations = "../../migrations")]
 async fn verify_context_never_returns_the_device_code(pool: PgPool) {
     let keycloak = MockServer::start_async().await;
-    let repo = repo(pool);
+    let repo = repo(pool.clone());
     let store = DbDeviceCodeStore::new(repo.clone());
     store.store_device_code(session()).await.unwrap();
 
@@ -816,6 +833,7 @@ async fn verify_context_never_returns_the_device_code(pool: PgPool) {
             keycloak.base_url(),
             repo,
             rate_limiter(),
+            starting_grant(pool.clone()),
             None,
         )
         .unwrap(),
@@ -881,6 +899,7 @@ async fn relying_party_rejects_non_positive_runtime_limits(pool: PgPool) {
             keycloak.base_url(),
             repo(pool.clone()),
             rate_limiter(),
+            starting_grant(pool.clone()),
             None,
         )
         .is_err()
@@ -893,8 +912,9 @@ async fn relying_party_rejects_non_positive_runtime_limits(pool: PgPool) {
             zero_browser_ttl,
             keycloak.base_url(),
             keycloak.base_url(),
-            repo(pool),
+            repo(pool.clone()),
             rate_limiter(),
+            starting_grant(pool.clone()),
             None,
         )
         .is_err()
@@ -919,8 +939,9 @@ async fn begin_browser_rejects_backslash_open_redirect_variants(pool: PgPool) {
         rp_config(&keycloak),
         keycloak.base_url(),
         keycloak.base_url(),
-        repo(pool),
+        repo(pool.clone()),
         rate_limiter(),
+        starting_grant(pool.clone()),
         None,
     )
     .unwrap();
@@ -964,8 +985,9 @@ async fn callback_rejects_state_cookie_mismatch_before_contacting_keycloak(pool:
             rp_config(&keycloak),
             keycloak.base_url(),
             keycloak.base_url(),
-            repo(pool),
+            repo(pool.clone()),
             rate_limiter(),
+            starting_grant(pool.clone()),
             None,
         )
         .unwrap(),
@@ -1020,8 +1042,9 @@ async fn invalid_id_token_profiles_fail_closed(pool: PgPool) {
             rp_config(&keycloak),
             keycloak.base_url(),
             keycloak.base_url(),
-            repo(pool),
+            repo(pool.clone()),
             rate_limiter(),
+            starting_grant(pool.clone()),
             None,
         )
         .unwrap(),
@@ -1206,6 +1229,7 @@ async fn browser_session_is_bound_to_the_verified_subject_context(pool: PgPool) 
             keycloak.base_url(),
             repo.clone(),
             rate_limiter(),
+            starting_grant(pool.clone()),
             None,
         )
         .unwrap(),
@@ -1446,6 +1470,7 @@ async fn suspended_account_is_refused_a_browser_session(pool: PgPool) {
             keycloak.base_url(),
             repo.clone(),
             rate_limiter(),
+            starting_grant(pool.clone()),
             None,
         )
         .unwrap(),
@@ -1590,6 +1615,7 @@ async fn inactive_project_is_refused_a_browser_session(pool: PgPool) {
             keycloak.base_url(),
             repo.clone(),
             rate_limiter(),
+            starting_grant(pool.clone()),
             None,
         )
         .unwrap(),
@@ -1745,6 +1771,7 @@ async fn browser_session_persists_the_real_authenticated_member_subject(pool: Pg
             keycloak.base_url(),
             repo.clone(),
             rate_limiter(),
+            starting_grant(pool.clone()),
             None,
         )
         .unwrap(),
@@ -1894,6 +1921,7 @@ async fn browser_session_subject_is_the_acting_account_not_the_keycloak_sub(pool
             keycloak.base_url(),
             repo.clone(),
             rate_limiter(),
+            starting_grant(pool.clone()),
             None,
         )
         .unwrap(),
@@ -2111,6 +2139,7 @@ async fn device_pairing_callback_persists_a_federated_identity_for_an_existing_a
             keycloak.base_url(),
             repo.clone(),
             rate_limiter(),
+            starting_grant(pool.clone()),
             None,
         )
         .unwrap(),
@@ -2230,6 +2259,7 @@ async fn id_token_keys_come_from_the_discovered_jwks_uri_not_a_configured_one(po
             keycloak.base_url(),
             repo.clone(),
             rate_limiter(),
+            starting_grant(pool.clone()),
             None,
         )
         .unwrap(),
@@ -2274,13 +2304,30 @@ async fn id_token_keys_come_from_the_discovered_jwks_uri_not_a_configured_one(po
         .expect("the ID token must have been verified against the DISCOVERED jwks_uri");
 }
 
+/// Superseded 2026-09-15: this test used to be
+/// `device_pairing_callback_is_refused_for_a_subject_with_no_account`, pinning "a subject with no
+/// pre-existing account must be refused, not paired" for BOTH flow arms `complete()` shares. That
+/// was accurate for the accountless-refusal window between ADR-0024's 2026-08-25 correction and
+/// this fix, but the fix restores self-service provisioning at `persist_federated_identity` --
+/// `complete()`'s single funnel (Q3's own framing) for both device pairing and browser SSO -- with
+/// no flow-specific carve-out, exactly mirroring the ORIGINAL pre-correction "mint on login"
+/// behaviour ADR-0024 itself documents as never having been flow-specific either ("device pairing
+/// deliberately requires none (ADR-0012)"). A grandfather-issuer subject pairing a device for the
+/// first time is exactly as legitimate a first login as a browser session, so it is now
+/// provisioned too, not refused. The still-refused case (a non-grandfather issuer) is proven at
+/// the repo seam by
+/// `provisioning_still_refuses_a_non_grandfather_issuer_with_no_account` in
+/// `crates/lightbridge-authz-api-key/tests/federated_identity_account_link_tests.rs`.
 #[sqlx::test(migrations = "../../migrations")]
-async fn device_pairing_callback_is_refused_for_a_subject_with_no_account(pool: PgPool) {
+async fn device_pairing_callback_provisions_a_grandfather_issuer_subject_with_no_account(
+    pool: PgPool,
+) {
     let keycloak = MockServer::start_async().await;
     let key = generate_rs256_key().unwrap();
     mock_discovery_and_jwks(&keycloak, &key).await;
     let repo = repo(pool.clone());
-    // Deliberately no repo.create_account() call -- this subject has no pre-existing account.
+    // Deliberately no repo.create_account() call -- this subject has no pre-existing account;
+    // self-service provisioning must create one.
     let store = DbDeviceCodeStore::new(repo.clone());
     store.store_device_code(session()).await.unwrap();
     let rp = Arc::new(
@@ -2290,15 +2337,17 @@ async fn device_pairing_callback_is_refused_for_a_subject_with_no_account(pool: 
             keycloak.base_url(),
             repo.clone(),
             rate_limiter(),
+            starting_grant(pool.clone()),
             None,
         )
         .unwrap(),
     );
     let (router, state, cookie) = begin_pairing(router(rp)).await;
     let decoded = OAuth2State::decrypt(&state, &state_key_bytes()).unwrap();
+    let subject = "self-service-provisioned-device-subject";
     let token = sign_id_token(
         &key,
-        "accountless-device-subject",
+        subject,
         &keycloak.base_url(),
         decoded.nonce.as_deref().unwrap(),
     );
@@ -2306,7 +2355,7 @@ async fn device_pairing_callback_is_refused_for_a_subject_with_no_account(pool: 
         .mock_async(|when, then| {
             when.method(POST).path("/token").body_includes("code=code");
             then.status(200)
-                .json_body(rich_token_response(&token, "accountless-device-refresh"));
+                .json_body(rich_token_response(&token, "self-service-device-refresh"));
         })
         .await;
     let response = router
@@ -2319,43 +2368,44 @@ async fn device_pairing_callback_is_refused_for_a_subject_with_no_account(pool: 
         )
         .await
         .unwrap();
-    // #598/D8: same 303-to-/ui/error collapse as every other `complete()` failure.
-    // Prove-fail-first: fails upstream, inside `begin_pairing` (see that helper's own doc
-    // comment) -- `left: 200`, `right: 303` at the confirmation-status assertion.
     assert_eq!(
         response.status(),
         StatusCode::SEE_OTHER,
-        "a subject with no pre-existing account must be refused, not paired"
+        "a grandfather-issuer subject with no pre-existing account must now be SELF-SERVICE \
+         provisioned and paired, not refused"
     );
     assert_eq!(
         response.headers().get(header::LOCATION).unwrap(),
-        "/ui/error"
+        "/ui/device/success"
     );
 
     let federation = repo
-        .find_federated_identity(&keycloak.base_url(), "accountless-device-subject")
+        .find_federated_identity(&keycloak.base_url(), subject)
         .await
-        .unwrap();
-    assert!(
-        federation.is_none(),
-        "the refused login must leave no federated_identities row behind"
+        .unwrap()
+        .expect("a federated identity row must exist after a successful device pairing callback");
+    assert_eq!(
+        federation.account_id, subject,
+        "the self-service-provisioned account's id must be the subject itself"
     );
 
-    let user_count: i64 = sqlx::query_scalar("SELECT count(*) FROM users")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(
-        user_count, 0,
-        "the refused login must never mint a users row -- there is no mint-a-user branch any more"
+    let account_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM accounts WHERE id = $1)")
+            .bind(subject)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        account_exists,
+        "the callback must have provisioned an accounts row for a never-seen subject"
     );
 
     let store = DbDeviceCodeStore::new(repo);
     let fetched = store.get_device_code("device-code").await.unwrap().unwrap();
     assert!(
-        matches!(fetched.status, DeviceCodeStatus::Pending),
-        "the gate precedes the flow arm's own side effect -- the device code must remain Pending, \
-         never Approved, expected Pending got {:?}",
+        matches!(fetched.status, DeviceCodeStatus::Approved(_)),
+        "provisioning succeeds before the flow arm's own side effect runs, so the device code \
+         must move to Approved, expected Approved got {:?}",
         fetched.status
     );
 }
@@ -2398,6 +2448,7 @@ async fn browser_sso_callback_persists_the_same_federated_identity(pool: PgPool)
             keycloak.base_url(),
             repo.clone(),
             rate_limiter(),
+            starting_grant(pool.clone()),
             None,
         )
         .unwrap(),
@@ -2482,6 +2533,7 @@ async fn provisioned_subject_completes_browser_sso_callback(pool: PgPool) {
             keycloak.base_url(),
             repo.clone(),
             rate_limiter(),
+            starting_grant(pool.clone()),
             None,
         )
         .unwrap(),
@@ -2542,6 +2594,119 @@ async fn provisioned_subject_completes_browser_sso_callback(pool: PgPool) {
     );
 }
 
+/// THE incident this change fixes, end to end, with NO admin pre-provisioning step: a
+/// grandfather-issuer subject who has never authenticated before completes `/idp/callback` and
+/// ends up with a real account AND its default project by SELF-SERVICE provisioning, instead of
+/// the permanent `Error::Forbidden("federated subject has no lightbridge account")` -> `303
+/// /ui/error` that ADR-0024's 2026-08-25 correction left behind for production once the
+/// mint-on-login branch was removed and nothing replaced it (measured 2026-09-15 against
+/// hetzner-prod: 42 of 96 enabled `camer-digital` Keycloak users permanently blocked this way).
+/// Unlike [`provisioned_subject_completes_browser_sso_callback`] above (the #720 admin-provisioned
+/// regression test), this test deliberately calls neither `provision_account` nor `create_account`
+/// first -- the callback itself must do the provisioning.
+#[sqlx::test(migrations = "../../migrations")]
+async fn self_service_provisioning_completes_browser_sso_callback_for_a_never_seen_subject(
+    pool: PgPool,
+) {
+    let keycloak = MockServer::start_async().await;
+    let key = generate_rs256_key().unwrap();
+    mock_discovery_and_jwks(&keycloak, &key).await;
+    let repo = repo(pool.clone());
+    let subject = "self-service-provisioned-subject";
+    let rp = Arc::new(
+        KeycloakRelyingParty::new(
+            rp_config(&keycloak),
+            keycloak.base_url(),
+            keycloak.base_url(),
+            repo.clone(),
+            rate_limiter(),
+            starting_grant(pool.clone()),
+            None,
+        )
+        .unwrap(),
+    );
+    let (location, cookie) = rp
+        .begin_browser(BrowserLoginTarget {
+            project_id: None,
+            resume_path: "/browser".to_string(),
+            client_id: BROWSER_CLIENT_ID.to_string(),
+        })
+        .await
+        .unwrap();
+    let state = reqwest::Url::parse(&location)
+        .unwrap()
+        .query_pairs()
+        .find_map(|(key, value)| (key == "state").then(|| value.into_owned()))
+        .unwrap();
+    let decoded = OAuth2State::decrypt(&state, &state_key_bytes()).unwrap();
+    let token = sign_id_token(
+        &key,
+        subject,
+        &keycloak.base_url(),
+        decoded.nonce.as_deref().unwrap(),
+    );
+    keycloak
+        .mock_async(|when, then| {
+            when.method(POST).path("/token").body_includes("code=code");
+            then.status(200)
+                .json_body(rich_token_response(&token, "self-service-refresh"));
+        })
+        .await;
+    let response = router(rp.clone())
+        .oneshot(
+            Request::builder()
+                .uri(callback_uri(&state))
+                .header(header::COOKIE, cookie.to_string())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::SEE_OTHER,
+        "a never-seen grandfather-issuer subject must complete browser SSO by SELF-SERVICE \
+         provisioning -- a status other than 303 here means the incident is not fixed"
+    );
+
+    let federation = repo
+        .find_federated_identity(&keycloak.base_url(), subject)
+        .await
+        .unwrap()
+        .expect("a federated identity row must exist after a successful browser SSO callback");
+    assert_eq!(
+        federation.account_id,
+        subject.to_string(),
+        "the self-service-provisioned account's id must be the subject itself (the anchor \
+         account shape, ADR-0006)"
+    );
+
+    let account_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM accounts WHERE id = $1)")
+            .bind(subject)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        account_exists,
+        "the callback must have provisioned an accounts row for a never-seen subject"
+    );
+
+    let project_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM projects WHERE account_id = $1 AND is_default)",
+    )
+    .bind(subject)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        project_exists,
+        "the callback must have provisioned the account's default project too -- without it, \
+         find_default_project_id would still dead-end sign-in one step later even though the \
+         account itself now exists"
+    );
+}
+
 /// ADR-0024 Q2 already documents plaintext, queryable metadata sitting alongside the sealed
 /// envelope (`issuer`/`subject`/`scope`/the expiry columns); migration
 /// `20260830000001_federated_identities_add_profile_claims.sql` adds
@@ -2598,6 +2763,7 @@ async fn federated_identities_persists_the_plaintext_profile_claim_snapshot(pool
             keycloak.base_url(),
             repo.clone(),
             rate_limiter(),
+            starting_grant(pool.clone()),
             None,
         )
         .unwrap(),
@@ -2703,6 +2869,7 @@ async fn stored_token_envelope_is_not_plaintext_at_rest(pool: PgPool) {
             keycloak.base_url(),
             repo.clone(),
             rate_limiter(),
+            starting_grant(pool.clone()),
             None,
         )
         .unwrap(),
@@ -2790,6 +2957,7 @@ async fn token_envelope_does_not_open_under_the_state_encryption_key(pool: PgPoo
             keycloak.base_url(),
             repo.clone(),
             rate_limiter(),
+            starting_grant(pool.clone()),
             None,
         )
         .unwrap(),
@@ -2881,6 +3049,7 @@ async fn a_second_login_updates_the_same_federated_identity_row_and_reseals(pool
             keycloak.base_url(),
             repo.clone(),
             rate_limiter(),
+            starting_grant(pool.clone()),
             None,
         )
         .unwrap(),
@@ -3076,6 +3245,7 @@ async fn a_second_issuer_with_a_colliding_subject_is_refused_not_merged(pool: Pg
             keycloak_a.base_url(),
             repo.clone(),
             rate_limiter(),
+            starting_grant(pool.clone()),
             None,
         )
         .unwrap(),
@@ -3087,6 +3257,7 @@ async fn a_second_issuer_with_a_colliding_subject_is_refused_not_merged(pool: Pg
             keycloak_b.base_url(),
             repo.clone(),
             rate_limiter(),
+            starting_grant(pool.clone()),
             None,
         )
         .unwrap(),
