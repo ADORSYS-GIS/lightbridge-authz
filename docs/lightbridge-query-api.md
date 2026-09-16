@@ -247,7 +247,7 @@ Successful response is HTTP `200` with JSON:
       "signal_type": "metric",
       "requests": 120,
       "usage_value": 34567.0,
-      "total_cost": 12.34,
+      "total_cost": 12340000.0,
       "prompt_tokens": 20000,
       "completion_tokens": 14567,
       "total_tokens": 34567,
@@ -305,7 +305,7 @@ Each point is an aggregate across matching `usage_events` rows for:
 | `billing_plan` | string or null | yes | Present when `group_by` includes `billing_plan`, else null (#648).
 | `requests` | int64 | yes | `SUM(request_count)`.
 | `usage_value` | float64 | yes | `SUM(usage_value)`.
-| `total_cost` | float64 or null | yes | `SUM(total_cost)`. `null` when no row in this bucket carried a cost -- never `0.0`, because "cost unknown" and "cost was zero" are different facts (governance#188). |
+| `total_cost` | float64 (micro-USD) or null | yes | `SUM(total_cost)`. **Micro-USD, not dollars** -- `usage_events.total_cost` is the budget domain's own unit (integer-scale money, carried here as `f64` because it is a `SUM`); divide by `1_000_000` to display USD. This was argued back and forth across #488, #737, and settled for good by #745/#746/#747 (2026-09-16), which fixed the ingest writer so every source agrees on the unit -- see `crates/lightbridge-authz-budget/src/spend_units.rs`'s doc comment for the full history. `null` when no row in this bucket carried a cost -- never `0.0`, because "cost unknown" and "cost was zero" are different facts (governance#188). |
 | `prompt_tokens` | int64 | yes | `SUM(prompt_tokens)`.
 | `completion_tokens` | int64 | yes | `SUM(completion_tokens)`.
 | `total_tokens` | int64 | yes | `SUM(total_tokens)`.
@@ -503,7 +503,7 @@ Annotated response (single point):
       "signal_type": null,
       "requests": 1234,
       "usage_value": 0.0,
-      "total_cost": 98.76,
+      "total_cost": 98760000.0,
       "prompt_tokens": 500000,
       "completion_tokens": 250000,
       "total_tokens": 750000
@@ -544,7 +544,7 @@ Annotated response (one point per model):
     {
       "bucket_start": "2026-02-01T00:00:00Z",
       "model": "gpt-4.1-mini",
-      "total_cost": 12.34,
+      "total_cost": 12340000.0,
       "requests": 100,
       "total_tokens": 20000,
       "usage_value": 20000.0,

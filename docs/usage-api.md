@@ -343,10 +343,16 @@ the `usage_events_daily` aggregate table, then deletes them — in one transacti
   `usage_events_daily`, so a spend query is correct whether its rows are still raw or have aged
   into the rollup. The current billing period is always within the raw window, so budget decisions
   do not shift as data ages (AC3).
-- **Money semantics are preserved.** `usage_events.total_cost` is `NOT NULL DEFAULT 0` and ingest
-  collapses an unknown cost to `0.0` at write time, so `SUM` over raw rows is never NULL. The
-  rollup column is nullable only defensively; the `Spend::Known` / `Spend::Unavailable` split is
-  unchanged across the boundary.
+- **Money semantics follow the honesty rule, not a collapsed zero.** `usage_events.total_cost` is
+  nullable (`NOT NULL` dropped by `migrations-usage/20260916000001_usage_events_total_cost_nullable.sql`,
+  #729): a bucket with no matching event is `null`, never a fabricated `0.0` -- see
+  `docs/lightbridge-query-api.md`'s `total_cost` field row for the wire contract, and
+  `crates/lightbridge-authz-budget/src/spend_units.rs` for why the column is micro-USD, not
+  dollars (settled by #745/#746/#747 after #488/#737 each got half the unit right). `SUM(total_cost)`
+  over a range whose rows are entirely null is itself SQL `NULL`, and `UsageServiceSpendReader` maps
+  that to `Spend::Unavailable`, never `Spend::Known(0)`. The rollup column was already nullable
+  defensively before #729; the `Spend::Known` / `Spend::Unavailable` split is unchanged across the
+  raw/rollup boundary.
 - **Only complete days are rolled up**, so a re-run is idempotent. The rollup is a single
   `DELETE ... RETURNING` feeding an `INSERT ... ON CONFLICT DO UPDATE` (one statement, so the
   rollup and purge can never drift under READ COMMITTED), and a late-arriving event for an
