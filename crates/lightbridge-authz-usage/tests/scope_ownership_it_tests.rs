@@ -95,6 +95,7 @@ fn app(
         repo,
         bearer,
         scope_authority,
+        ingest_auth: None,
         raw_days: Some(90),
     });
     build_query_router(state, readiness_pool, false)
@@ -410,6 +411,7 @@ async fn spend_endpoint_refuses_bearer_carrying_requests(pool: PgPool) {
         repo,
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        ingest_auth: None,
         raw_days: Some(90),
     });
     let router = build_query_router(state, readiness_pool, false);

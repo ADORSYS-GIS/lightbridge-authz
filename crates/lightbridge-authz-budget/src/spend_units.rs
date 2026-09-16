@@ -10,35 +10,31 @@ use chrono::{DateTime, NaiveDate, Utc};
 use crate::error::BudgetError;
 use crate::period::Period;
 
-/// Validates and losslessly narrows a `total_cost` value -- **already micro-USD**, as stored in
-/// `usage_events.total_cost` -- into `i64`.
+/// Validates a `total_cost` value -- **micro-USD**, as stored in `usage_events.total_cost` --
+/// and losslessly narrows it into `i64`. It does NOT scale: the stored value is already the
+/// budget domain's unit.
 ///
-/// ## Unit contract (#488)
+/// ## Unit contract, settled (#488 -> #736/#737 -> #745)
 ///
-/// `usage_events.total_cost` is micro-USD, not US dollars. The gateway's `llm_custom_total_cost`
-/// CEL is the only production writer of this column (via
-/// `crates/lightbridge-authz-usage/src/handlers/ingest.rs`'s `COST_KEYS` extraction, landed
-/// verbatim, no scaling applied on the way in) and it emits micro-USD -- see the ai-helm
-/// cost-tracking doc (`docs/models-chart-docs/cost-tracking.md`, *"Micro-USD ... the chart stores
-/// request cost in this unit"*) in the `ADORSYS-GIS/ai-helm` repo. This function used to multiply
-/// by `1_000_000.0` here, which was correct only if the stored value were US dollars -- it is
-/// not, so that multiplication inflated every reported spend figure by roughly 10^6 and drove
-/// self-service refill decisions to the fail-closed floor. See
-/// https://github.com/ADORSYS-GIS/lightbridge-authz/issues/488.
+/// This constant has now been argued three times, so the reasoning is recorded once, here:
 ///
-/// This function therefore does not scale its input at all -- it only validates. The value still
-/// arrives as `f64` over the wire (`SpendQueryResponse::total_cost`, a SQL `double precision`
-/// `SUM`), so it must still be checked for the same three failure modes as before: non-finite
-/// (`NaN`/`±inf`), negative (a cost can never be negative), and too large to round-trip into
-/// `i64` exactly. All three are treated as an unusable response from the usage service by
-/// `UsageServiceSpendReader` (see its doc comment), which routes them to `Spend::Unavailable`
-/// rather than propagating an error.
+/// * **#488** removed a `* 1_000_000.0`, reading the column as micro-USD. Correct for the
+///   gateway's `llm_custom_total_cost` CEL writer, which is micro-USD.
+/// * **#737** put the scaling back, reading the column as dollars. Correct for the normalizer
+///   writer, which at the time divided `cost_micros` by `1_000_000.0` before storing.
+/// * Both were half right, because `apply_normalizer`
+///   (`crates/lightbridge-authz-usage/src/handlers/ingest.rs`) had TWO branches writing TWO
+///   units into ONE column. No constant chosen here can be correct for both: this function sees
+///   a bare `f64` and cannot tell which writer produced the row.
 ///
-/// Rounding: `f64` cannot represent every integer micro-USD value exactly (float summation drift
-/// from `SUM(total_cost)` over many rows), so this rounds to the nearest whole micro-USD using
-/// `f64::round` -- ties round away from zero (e.g. `1234.5` -> `1235`), not round-half-even. This
-/// is the same rounding semantics the pre-#488 code already used for its (wrong-unit) conversion;
-/// only the scaling factor changed, not the rounding rule.
+/// **#745 fixed the writer, not the reader.** Both ingest branches now emit micro-USD, the
+/// 30,845 dollar-scale rows written between 2026-09-15 and 2026-09-16 were rescaled by
+/// `migrations-usage/20260916000002_usage_events_total_cost_micro_usd.sql`, and this function is
+/// back to validate-only. If spend ever looks ~10^6 out again, the bug is a writer that scaled,
+/// not this function -- check `apply_normalizer` first.
+///
+/// Rounding is `f64::round` (ties away from zero), which matters because `SUM(total_cost)` over
+/// many rows accumulates float drift. Overflow is rejected at `i64::MAX` micro-USD.
 pub(crate) fn validate_total_cost_micros(total_cost: f64) -> Result<i64, BudgetError> {
     if !total_cost.is_finite() {
         return Err(BudgetError::StorageFailed(format!(
@@ -101,19 +97,18 @@ mod tests {
         assert_eq!(validate_total_cost_micros(0.0).unwrap(), 0);
     }
 
-    /// #488 prove-fail (test 1): a realistic gateway payload figure -- a request costing 1,234
-    /// micro-USD (~$0.001234) -- passes through unchanged as 1,234 micro-USD. Break the fix by
-    /// reintroducing `* 1_000_000.0` in `validate_total_cost_micros` and this fails with
-    /// `1_234_000_000` instead.
+    /// #745: the value is ALREADY micro-USD and must pass through unscaled. A row carrying
+    /// `1234.0` is 1,234 micro-USD (about a tenth of a cent), never $1,234. Reintroducing a
+    /// `* 1_000_000.0` here turns this into `1_234_000_000` and is exactly the incident that
+    /// drove 40 of 49 production accounts to `budget_exhausted` on 2026-09-16.
     #[test]
-    fn validate_total_cost_micros_passes_gateway_micro_usd_through_unscaled() {
+    fn validate_total_cost_micros_does_not_scale_an_already_micro_usd_value() {
         assert_eq!(validate_total_cost_micros(1234.0).unwrap(), 1_234);
     }
 
-    /// #488 prove-fail (test 3): fractional micro-USD (float summation drift from `SUM` over many
-    /// rows) rounds to the nearest whole micro-USD, ties away from zero -- `f64::round`'s
-    /// semantics, documented on `validate_total_cost_micros` and unchanged by this fix (only the
-    /// scaling factor was removed, not the rounding rule).
+    /// A fractional micro-USD can only come from float drift in `SUM(total_cost)` over many
+    /// rows -- no writer emits one. It rounds to the nearest whole micro-USD, ties away from
+    /// zero, per `f64::round`.
     #[test]
     fn validate_total_cost_micros_rounds_fractional_micro_usd_half_away_from_zero() {
         assert_eq!(validate_total_cost_micros(1234.6).unwrap(), 1_235);
@@ -132,9 +127,14 @@ mod tests {
         assert!(validate_total_cost_micros(f64::NEG_INFINITY).is_err());
     }
 
+    /// #745: with no scaling, the boundary is `i64::MAX` micro-USD itself (~9.223e18). `1e19`
+    /// is over it; `1e13` -- which #736's boundary test relied on ONLY because it was multiplied
+    /// by `1_000_000.0` -- is now comfortably valid, and asserting it still errors would be
+    /// asserting the very scaling this fix removed.
     #[test]
     fn validate_total_cost_micros_rejects_i64_overflow() {
         assert!(validate_total_cost_micros(1e19).is_err());
+        assert!(validate_total_cost_micros(1e13).is_ok());
     }
 
     #[test]

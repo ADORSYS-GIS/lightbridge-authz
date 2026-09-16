@@ -1,5 +1,9 @@
 //! Keycloak OIDC relying-party leg shared by device verification and browser SSO.
 
+mod logout;
+
+pub use logout::UpstreamLogout;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -133,6 +137,11 @@ pub struct KeycloakRelyingParty {
     /// (`start_idp_server` builds it via `ratelimit_redis::build_redis_rate_limit_store`), so
     /// throttling state is shared across every `authz-idp` replica rather than per-process.
     rate_limiter: Arc<dyn RateLimitStore>,
+    /// #697: books a NEW account's starting grant the moment self-service provisioning mints one
+    /// (see [`Self::persist_federated_identity`]) -- without it a freshly provisioned account
+    /// reads `remaining = 0` at the enforcing gateway until the next weekly reset, the #697/#701
+    /// failure mode. Never touched for a login that merely adopted an already-existing account.
+    starting_grant: Arc<lightbridge_authz_budget::StartingGrantService>,
 }
 
 #[derive(Deserialize)]
@@ -282,35 +291,6 @@ impl std::fmt::Debug for KeycloakTokenSet {
     }
 }
 
-/// The one OIDC discovery field this codebase needs that `authkestra_engine`'s
-/// [`ProviderMetadata`] does not model: as of authkestra-engine 0.6.3 that struct is
-/// `#[non_exhaustive]` and carries no `end_session_endpoint`, so the RP-initiated-logout leg
-/// parses the same document itself rather than hand-building a Keycloak-shaped URL. `issuer` is
-/// carried along for exactly one reason -- so this fetch performs the SAME identity-vs-location
-/// check [`KeycloakRelyingParty::discover`] does: dial `discovery_url` (LOCATION), trust only a
-/// document that names [`KeycloakRelyingParty::issuer`] (IDENTITY).
-#[derive(Deserialize)]
-struct LogoutMetadata {
-    issuer: String,
-    end_session_endpoint: Option<String>,
-}
-
-/// What [`KeycloakRelyingParty::end_upstream_session`] actually managed to do. Two outcomes rather
-/// than a bare `()` because the caller (`end_session.rs`) treats them differently: "there was
-/// nothing to log out with" is the ordinary state of a subject whose stored envelope predates a
-/// `token_encryption_key` rotation or who never had a refresh token, and saying so at `info`
-/// keeps a real upstream fault -- which is a `warn` -- legible in the log.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UpstreamLogout {
-    /// Keycloak accepted the back-channel logout: the upstream SSO session is terminated.
-    Terminated,
-    /// No usable stored refresh token for this subject -- no `federated_identities` row, no sealed
-    /// envelope, an envelope that would not open (rotated `token_encryption_key`), or a stored
-    /// token set that never carried a refresh token. Per `lightbridge_authz_core::crypto`'s
-    /// documented `open()` contract every one of those is "no stored credential", never an error.
-    NoStoredCredential,
-}
-
 #[derive(Serialize, Deserialize)]
 enum PendingFlow {
     Device { device_code: String },
@@ -347,6 +327,7 @@ impl KeycloakRelyingParty {
         discovery_url: String,
         repo: Arc<StoreRepo>,
         rate_limiter: Arc<dyn RateLimitStore>,
+        starting_grant: Arc<lightbridge_authz_budget::StartingGrantService>,
         jwks_ca_bundle_path: Option<String>,
     ) -> Result<Self> {
         if config.timeout_ms == 0 {
@@ -431,6 +412,7 @@ impl KeycloakRelyingParty {
             jwks: Arc::new(std::sync::OnceLock::new()),
             repo,
             rate_limiter,
+            starting_grant,
         })
     }
 
@@ -664,14 +646,21 @@ impl KeycloakRelyingParty {
     /// ADR-0024 (corrected 2026-08-25): seals `token`'s refresh token + `claims`' non-access-token
     /// profile fields under `self.token_key` (never the access token, never the raw ID token JWT
     /// -- see [`KeycloakTokenSet`]'s doc comment) and persists it via
-    /// [`StoreRepo::upsert_federated_identity`], keyed by `(claims.iss, claims.sub)`. Called from
-    /// [`Self::complete`] after ID-token validation, before either flow arm -- see that call
-    /// site's own doc comment for why. Fail-closed: any error here (serialization, sealing, or
+    /// [`StoreRepo::upsert_federated_identity_and_provision`], keyed by `(claims.iss, claims.sub)`.
+    /// Called from [`Self::complete`] after ID-token validation, before either flow arm -- see that
+    /// call site's own doc comment for why. Fail-closed: any error here (serialization, sealing, or
     /// the repo call) propagates via `?` to `complete`'s caller, never silently skipped. The
-    /// propagated errors now include `Error::Forbidden` (the subject has no `accounts` row)
-    /// alongside `Error::Conflict` (a colliding second issuer) -- both reach the caller as the same
-    /// generic `BAD_GATEWAY` (uniform: this response never reveals whether a subject has an
-    /// account).
+    /// propagated errors include `Error::Forbidden` (a non-grandfather issuer) alongside
+    /// `Error::Conflict` (a colliding second issuer, or a provisioning race) -- both reach the
+    /// caller as the same generic `BAD_GATEWAY` (uniform: this response never reveals whether a
+    /// subject has an account).
+    ///
+    /// Restores self-service provisioning for the grandfather issuer -- the incident this fixes: a
+    /// subject with no `accounts` row was refused unconditionally after ADR-0024's 2026-08-25
+    /// correction removed the mint-on-login branch, and nothing replaced it for production. A login
+    /// that PROVISIONS books the new account's #697 starting grant right here, fail-soft (see
+    /// [`Self::book_starting_grant`]); a login that merely adopts an existing account never touches
+    /// the budget domain at all.
     async fn persist_federated_identity(
         &self,
         claims: &IdTokenClaims,
@@ -702,8 +691,9 @@ impl KeycloakRelyingParty {
         let aad = format!("{}\u{1f}{}", claims.iss, claims.sub);
         let envelope = lightbridge_authz_core::crypto::seal(&self.token_key, &aad, &plaintext)?;
         let now = Utc::now();
-        self.repo
-            .upsert_federated_identity(
+        let outcome = self
+            .repo
+            .upsert_federated_identity_and_provision(
                 UpsertFederatedIdentity {
                     issuer: claims.iss.clone(),
                     subject: claims.sub.clone(),
@@ -735,130 +725,32 @@ impl KeycloakRelyingParty {
                 // `oauth2.relying_party.issuer` to drift from it).
                 &self.issuer,
             )
-            .await
+            .await?;
+        if outcome.provisioned {
+            self.book_starting_grant(&outcome.row.account_id).await;
+        }
+        Ok(outcome.row)
     }
 
-    /// Back-channel-terminates the upstream Keycloak SSO session held by `subject`. ADR-0024's
-    /// follow-up 4: the first production consumer of a sealed `federated_identities.token_envelope`,
-    /// and the reason [`StoreRepo::find_federated_identity`] was written ahead of a caller.
-    ///
-    /// **A `POST` to the discovered `end_session_endpoint`, never a browser redirect to it.**
-    /// [`KeycloakTokenSet`] deliberately stores no raw ID token (it would be replayable as a
-    /// `subject_token` into this service's own RFC 8693 endpoint -- see that type's doc comment),
-    /// so there is no `id_token_hint` to redirect with; and a redirect *without* a hint makes
-    /// Keycloak render a confirmation interstitial on every single logout. The back-channel form
-    /// carries `client_id` + `refresh_token`, plus `client_secret` when this deployment registered
-    /// a confidential client, and Keycloak ends the SSO session server-side with no user
-    /// interaction at all.
-    ///
-    /// **Every failure here is the caller's to swallow.** Local revocation has already happened by
-    /// the time this runs (`end_session.rs`), and an unreachable Keycloak must never turn a
-    /// completed local logout into a `500`. The two directions are split accordingly: anything
-    /// meaning "there is nothing to log out with" is `Ok(UpstreamLogout::NoStoredCredential)`,
-    /// and only a real upstream fault (discovery down, logout endpoint refusing) is an `Err`.
-    ///
-    /// Bounded by `oauth2.relying_party.timeout_ms`: `self.client` was built with it as a request
-    /// timeout, so a slow Keycloak cannot hang logout.
-    pub async fn end_upstream_session(&self, subject: &str) -> Result<UpstreamLogout> {
-        let Some(refresh_token) = self.stored_refresh_token(subject).await? else {
-            return Ok(UpstreamLogout::NoStoredCredential);
-        };
-        let endpoint = self.discover_end_session_endpoint().await?;
-        let mut form = vec![
-            ("client_id", self.config.client_id.as_str()),
-            ("refresh_token", refresh_token.as_str()),
-        ];
-        if let Some(secret) = self.config.client_secret.as_deref() {
-            form.push(("client_secret", secret));
-        }
-        let response = self
-            .client
-            .post(endpoint)
-            .form(&form)
-            .send()
-            .await
-            .map_err(|_| Error::Server("Keycloak logout endpoint unavailable".to_string()))?;
-        if !response.status().is_success() {
-            // Status only. The body is never read into the error: this request carried a refresh
-            // token, and Keycloak's error documents are free to echo request detail back.
-            return Err(Error::Server(format!(
-                "Keycloak logout endpoint refused back-channel logout: {}",
-                response.status()
-            )));
-        }
-        Ok(UpstreamLogout::Terminated)
-    }
-
-    /// The refresh token sealed for `(self.issuer, subject)`, or `None` for every shape of "no
-    /// usable stored credential" (see [`UpstreamLogout::NoStoredCredential`]). Only the lookup
-    /// itself failing is an `Err`: a query that could not run is not the same answer as one that
-    /// found nothing, and the caller's log line should not claim it was.
-    async fn stored_refresh_token(&self, subject: &str) -> Result<Option<String>> {
-        let Some(identity) = self
-            .repo
-            .find_federated_identity(&self.issuer, subject)
-            .await?
-        else {
-            return Ok(None);
-        };
-        let Some(envelope) = identity.token_envelope.as_deref() else {
-            return Ok(None);
-        };
-        // The SAME AAD `persist_federated_identity` sealed under -- the federation key, not the
-        // row id (see `lightbridge_authz_core::crypto::seal`'s doc comment for why).
-        let aad = format!("{}\u{1f}{}", identity.issuer, identity.subject);
-        let Ok(plaintext) = lightbridge_authz_core::crypto::open(&self.token_key, &aad, envelope)
-        else {
-            // `lightbridge_authz_core::crypto`'s module doc states this contract for the first
-            // production caller, which is this one: treat any open failure as "no stored
-            // credential", log at most the AAD components, and never touch the row. A rotated
-            // `token_encryption_key` makes every older envelope permanently unopenable BY DESIGN;
-            // the row sits inert until the next login re-seals it.
-            tracing::warn!(
-                issuer = %identity.issuer,
-                subject = %identity.subject,
-                "stored Keycloak token envelope could not be opened; upstream logout skipped"
+    /// Books a freshly PROVISIONED account's starting grant (#697), mirroring
+    /// `AuthzStoreImpl::book_starting_grant` (`handlers/accounts.rs`) exactly: logged, never
+    /// propagated. `persist_federated_identity` has already committed the account and its
+    /// federated identity by the time this runs, so failing the login over an unfunded budget
+    /// would turn one accountless subject into one funded-nowhere account instead -- the same
+    /// argument that method's own doc comment makes. The backstops are identical too: the
+    /// idempotency key (`budget-start-<period>-<account id>`), the account's own reset schedule,
+    /// and this `error!` line, which is what a runbook alerts on.
+    async fn book_starting_grant(&self, account_id: &str) {
+        if let Err(err) = self.starting_grant.book(account_id, Utc::now()).await {
+            tracing::error!(
+                operation = "persist_federated_identity",
+                account_id = %account_id,
+                error = %err,
+                "a newly provisioned account's starting grant could not be booked -- it will \
+                 read remaining = 0 at the gateway until a reset schedule or an operator funds it \
+                 (idempotency key: budget-start-<period>-<account id>)"
             );
-            return Ok(None);
-        };
-        let Ok(token_set) = serde_json::from_slice::<KeycloakTokenSet>(&plaintext) else {
-            tracing::warn!(
-                issuer = %identity.issuer,
-                subject = %identity.subject,
-                "stored Keycloak token set is not in the expected format; upstream logout skipped"
-            );
-            return Ok(None);
-        };
-        Ok(token_set.refresh_token)
-    }
-
-    /// Reads `end_session_endpoint` off the provider's own discovery document rather than
-    /// composing a Keycloak-shaped URL by hand -- a hand-built path silently rots the moment the
-    /// upstream realm base, or the upstream product, changes.
-    async fn discover_end_session_endpoint(&self) -> Result<String> {
-        let url = discovery_document_url(&self.discovery_url)?;
-        let metadata = self
-            .client
-            .get(url)
-            .send()
-            .await
-            .map_err(|_| Error::Server("Keycloak discovery unavailable".to_string()))?
-            .json::<LogoutMetadata>()
-            .await
-            .map_err(|_| {
-                Error::Server("Keycloak discovery returned an unreadable document".to_string())
-            })?;
-        // Identical to `discover()`'s check, and for the identical reason: never relax this to
-        // compare against `discovery_url`, or a deployment's internal dial target silently
-        // becomes the trusted issuer.
-        if metadata.issuer != self.issuer {
-            return Err(Error::Server(
-                "Keycloak discovery issuer mismatch".to_string(),
-            ));
         }
-        metadata.end_session_endpoint.ok_or_else(|| {
-            Error::Server("Keycloak discovery advertises no end_session_endpoint".to_string())
-        })
     }
 
     /// `jwks_uri` comes from the SAME discovery document whose `issuer` was just checked against
