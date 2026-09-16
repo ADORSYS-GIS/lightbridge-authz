@@ -504,7 +504,8 @@ listed here is denied unconditionally (fail closed).**
 `authz.cstack` carries no `@@allow` clause at all (same precedent as `Session`), so every generic
 `model.User.*` verb is denied unconditionally by the rule above; no new entry was needed here or
 in `rpc_authorize.rs`. `federated_identities` has no RPC surface either, and never will through the
-generated CRUD path — it is deliberately absent from `authz.cstack` entirely (see
+generated CRUD path — since #739 it IS modelled (as `FederatedIdentity`) but likewise carries no
+`@@allow` clause at all, and its two credential columns are not declared on the model (see
 [`docs/architecture/data-model.md`](./architecture/data-model.md#users-and-federated-identities-adr-0024-corrected-2026-08-25)).
 
 **Every `budget:*` row below is served at `POST /budget/rpc/{op_id}` on the separate
