@@ -14,7 +14,7 @@ use tracing::{debug, instrument};
 struct DayFactQueryRow {
     bucket_start: DateTime<Utc>,
     source: Option<String>,
-    subject_kind: Option<String>,
+    subject_kind: String,
     subject_id: Option<String>,
     is_aggregate_only: bool,
     total_suggestions: Option<i64>,
@@ -82,8 +82,10 @@ impl StoreRepo {
 /// explicit `AT TIME ZONE 'UTC'` pins the cast so it does not depend on the database session's
 /// `TimeZone` (the same class `retention.rs` already fixed).
 ///
-/// `is_aggregate_only` is ALWAYS a group key (see the inline comment): aggregate-only rows and
-/// per-entity rows are overlapping populations and must never be summed into one bucket.
+/// `subject_kind` and `is_aggregate_only` are ALWAYS group keys (see the inline comments):
+/// `usage_day_facts` holds overlapping populations at different hierarchy levels (an org row is
+/// the aggregate over its member repo/user rows), so rows at different `subject_kind` levels or
+/// with different `is_aggregate_only` flags must never be summed into one bucket.
 fn build_day_fact_query(input: &DayFactQueryRequest) -> QueryBuilder<Postgres> {
     let group_set: HashSet<DayFactGroupBy> = input.group_by.iter().cloned().collect();
     let limit = i64::from(input.limit);
@@ -104,11 +106,14 @@ fn build_day_fact_query(input: &DayFactQueryRequest) -> QueryBuilder<Postgres> {
     } else {
         builder.push(", NULL::text AS source");
     }
-    if group_set.contains(&DayFactGroupBy::SubjectKind) {
-        builder.push(", df.subject_kind");
-    } else {
-        builder.push(", NULL::text AS subject_kind");
-    }
+    // `subject_kind` is ALWAYS a group key, not a conditional dimension: the CHECK vocabulary is
+    // org/user/repo/user_team, and repo- and team-level rows are aggregate-only rollups that
+    // overlap their parent org's total (the same 5-seat-floor API shape as the org row itself).
+    // Summing an org row with its member repo rows would double-count the org's own total, one
+    // `subject_kind` layer over the org/user case. Partitioning by `subject_kind` keeps each
+    // hierarchy level in its own point, so the default (no filter, no group_by) never silently
+    // adds overlapping populations together.
+    builder.push(", df.subject_kind");
     if group_set.contains(&DayFactGroupBy::SubjectId) {
         builder.push(", df.subject_id");
     } else {
@@ -139,9 +144,7 @@ fn build_day_fact_query(input: &DayFactQueryRequest) -> QueryBuilder<Postgres> {
     if group_set.contains(&DayFactGroupBy::Source) {
         builder.push(", df.source");
     }
-    if group_set.contains(&DayFactGroupBy::SubjectKind) {
-        builder.push(", df.subject_kind");
-    }
+    builder.push(", df.subject_kind");
     if group_set.contains(&DayFactGroupBy::SubjectId) {
         builder.push(", df.subject_id");
     }

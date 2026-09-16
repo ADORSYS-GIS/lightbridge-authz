@@ -266,6 +266,69 @@ async fn aggregate_only_and_per_entity_rows_are_not_summed_together(pool: PgPool
     assert_eq!(per.cost_micro_usd, Some(1_000));
 }
 
+/// P1 regression (#733 review, follow-up): `is_aggregate_only` alone is not enough -- an org row
+/// and its member repo rows are BOTH aggregate-only, so they share `bucket_start` AND
+/// `is_aggregate_only` and would still be summed together. `subject_kind` must also be a group key
+/// so each hierarchy level stays in its own point. An org daily (1000 suggestions) plus two repo
+/// dailies inside it (200 + 150), all `is_aggregate_only = TRUE` on the same day, must come back as
+/// two points -- org 1000 and repo 350 (the two disjoint repos sum; the org is NOT added on top).
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn org_and_repo_aggregate_only_rows_are_not_summed_together(pool: PgPool) {
+    let d = day(2026, 8, 15);
+    for (kind, id, suggestions) in [
+        ("org", "org-1", 1000_i64),
+        ("repo", "repo-a", 200_i64),
+        ("repo", "repo-b", 150_i64),
+    ] {
+        sqlx::query(
+            "INSERT INTO usage_day_facts \
+             (source, day, subject_kind, subject_id, provider_user_id, total_suggestions_count, is_aggregate_only) \
+             VALUES ($1, $2, $3, $4, $5, $6, TRUE)",
+        )
+        .bind(SOURCE)
+        .bind(d)
+        .bind(kind)
+        .bind(id)
+        .bind(Option::<&str>::None)
+        .bind(suggestions)
+        .execute(&pool)
+        .await
+        .expect("insert aggregate-only fact");
+    }
+
+    let (points, _) = repo(&pool)
+        .query_day_facts(&request(
+            UsageScope::All,
+            "",
+            ts(2026, 8, 1),
+            ts(2026, 9, 1),
+            vec![],
+            100,
+        ))
+        .await
+        .expect("query must succeed");
+
+    assert_eq!(
+        points.len(),
+        2,
+        "org and repo must be separate points, not summed"
+    );
+    let org = points
+        .iter()
+        .find(|p| p.subject_kind == "org")
+        .expect("org point");
+    let repo = points
+        .iter()
+        .find(|p| p.subject_kind == "repo")
+        .expect("repo point");
+    assert_eq!(org.total_suggestions, Some(1000));
+    assert_eq!(
+        repo.total_suggestions,
+        Some(350),
+        "the two disjoint repos sum (200 + 150); the org is not added on top"
+    );
+}
+
 /// P1 regression (#733 review): `total_active_users` is a per-day distinct count, not additive.
 /// Summing it across a multi-day bucket would multiply it by the number of days; it must be
 /// reported as the peak daily active users in the bucket (MAX), never the sum.
@@ -532,11 +595,11 @@ async fn group_by_subject_kind_splits_into_one_point_per_kind(pool: PgPool) {
     assert_eq!(points.len(), 2, "one point per subject kind");
     let user = points
         .iter()
-        .find(|p| p.subject_kind.as_deref() == Some("user"))
+        .find(|p| p.subject_kind == "user")
         .expect("user group");
     let org = points
         .iter()
-        .find(|p| p.subject_kind.as_deref() == Some("org"))
+        .find(|p| p.subject_kind == "org")
         .expect("org group");
     assert_eq!(user.total_suggestions, Some(100));
     assert_eq!(org.total_suggestions, Some(500));

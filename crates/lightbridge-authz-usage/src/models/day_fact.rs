@@ -64,14 +64,14 @@ pub enum DayFactGroupBy {
 
 /// One aggregated time bucket of the day grain.
 ///
-/// `source`/`subject_kind`/`subject_id` are `Some` when the corresponding dimension is in
-/// `group_by`, `null` otherwise -- exactly like every dimension echo on the legacy
-/// `UsageSeriesPoint`.
+/// `source`/`subject_id` are `Some` when the corresponding dimension is in `group_by`, `null`
+/// otherwise -- exactly like every dimension echo on the legacy `UsageSeriesPoint`.
 ///
-/// `is_aggregate_only` is always present and is a real group key: aggregate-only rows (e.g. a
-/// GitHub Copilot org daily, which is the aggregate over its member user dailies) and per-entity
-/// rows are overlapping populations, so they are never summed into one bucket. A caller who wants
-/// the total across both must add the two points themselves.
+/// `subject_kind` and `is_aggregate_only` are always present and are real group keys:
+/// `usage_day_facts` holds overlapping populations at different hierarchy levels (an org row is
+/// the aggregate over its member repo/user rows), so rows at different `subject_kind` levels or
+/// with different `is_aggregate_only` flags are never summed into one bucket. A caller who wants
+/// the total across them must add the points themselves.
 ///
 /// Every measure is `Option<i64>`: `NULL` = unknown, never `0` (governance#188). A source that
 /// does not report a measure leaves it `null`, and a bucket whose rows all carry `NULL` cost
@@ -81,7 +81,7 @@ pub enum DayFactGroupBy {
 pub struct DayFactSeriesPoint {
     pub bucket_start: DateTime<Utc>,
     pub source: Option<String>,
-    pub subject_kind: Option<String>,
+    pub subject_kind: String,
     pub subject_id: Option<String>,
     pub is_aggregate_only: bool,
     pub total_suggestions: Option<i64>,
