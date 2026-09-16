@@ -47,8 +47,12 @@ This repository provides API key management plus usage analytics:
   `sub = "svc:<client_id>"`, carries no `roles` claim, and therefore holds zero permissions against
   every RPC op-id.
 - `lightbridge-mcp`: OAuth2/JWT-protected MCP server exposing the authz surface as MCP tools over streamable HTTP (`/mcp`).
-- `lightbridge-authz-usage`: split across two listeners (#347) — an unprotected OTLP/HTTP ingest
-  API (`/v1/otel/traces`, `/v1/otel/metrics`, `/v1/otel/logs`) and an mTLS-required query listener
+- `lightbridge-authz-usage`: split across two listeners (#347) — an ingest listener carrying an
+  unprotected OTLP/HTTP API (`/v1/otel/traces`, `/v1/otel/metrics`, `/v1/otel/logs`, the one
+  deliberate gateway exception) **plus** an authenticated mirror of it,
+  `/auth/v1/otel/*` (#585), mounted only when `ingest_auth` is configured and binding the stored
+  `source` to a `client_credentials` credential rather than to a caller-set header — and an
+  mTLS-required query listener
   serving the usage query API (`/usage/v1/usage/query`, which since #570 also requires an end-user
   bearer token plus an ownership check — see "Security Notes" below) and the budget domain's
   service-to-service spend read (`/usage/v1/spend/query`, mTLS-only) — backed by Timescale/Postgres.
@@ -689,6 +693,15 @@ Key config fields:
   `client_cert_path`/`client_key_path`/`timeout_ms` defaulted) for calling `authz-opa`'s
   `POST /idp/v1/authorize-usage-scope` — the ownership authority `/usage/v1/usage/query` calls for
   `account`/`project` scopes (#570).
+- `ingest_auth` (`lightbridge-authz-usage` only, **optional**, `Option<IngestAuthConfig>`): the
+  credential-binding rules for the authenticated ingest surface (#585). Absent, `/auth/v1/otel/*`
+  is not mounted at all and the unauthenticated `/v1/otel/*` stays the only ingest path. Carries
+  `audience` (required, non-empty — the `aud` every token on that surface must name, AC4) and
+  `principals` (required, non-empty — a `sub` → `X-Source` map whose keys must be `svc:`-prefixed
+  and whose values must be `KNOWN_SOURCES` entries). All four of those constraints are enforced in
+  `load_from_path`, so a typo fails config load (and therefore the `migrate` Job) rather than
+  producing per-request 400/403s. See "Security Notes" below for the gate order and ADR-0028 D8 for
+  which sources belong in `principals` (leg-3 out-of-cluster only).
 - `database.url`: Postgres connection string
 - `oauth2.jwks_url`: JWKS endpoint (Keycloak in local compose)
 - `redis.url`: mandatory for `authz-api`, `authz-idp`, `authz-budget` — see below.
@@ -998,6 +1011,22 @@ Traces capture the full lifecycle of a validation request, including database lo
   `crates/lightbridge-authz-budget/src/spend.rs`'s `UsageServiceSpendReader` doc comments for the
   full posture and the fail-closed contract (a rejected/missing/expired client cert resolves to
   `Spend::Unavailable`, never a silent bypass).
+  - **The ingest listener gained an AUTHENTICATED route block in #585:**
+    `/auth/v1/otel/{traces,metrics,logs}`, the credential-bound mirror of `/v1/otel/*` (which
+    stays the one documented exception, AC5). It is mounted only when `ingest_auth` is configured;
+    a request must present a `client_credentials` bearer token that validates against JWKS,
+    carries `caller_kind: service`, and carries an `aud` naming `ingest_auth.audience` — then
+    `X-Source` must equal the source that token's `sub` is mapped to in `ingest_auth.principals`.
+    Every failure mode resolves to `401`/`403`, never to permit, including an unreachable JWKS
+    (AGENTS.md's "Failure modes" rule). Keys must be `svc:`-prefixed and values must be
+    `KNOWN_SOURCES` entries; both are refused at config load, so a typo fails the `migrate` Job
+    rather than surfacing per-request. **Scope is ADR-0028 D8 leg 3 only** — collector-mediated
+    sources (claude-code, codex, opencode) must NOT be listed, because D8 leg 2 says the
+    collector→usage hop carries no second credential; only out-of-cluster sources with no
+    collector in their path belong there. A payload asserting a different `governance.source`/
+    `service.namespace` is warned about and stored with the trusted source, never obeyed
+    (`handlers::payload_identity`, AC4's "alert, never overwrite"). See `docs/usage-api.md`'s
+    "Authenticated ingest" section for the full gate order.
   - **`/usage/v1/usage/query` now ALSO requires an end-user bearer token plus an ownership check
     (#570/#603/#605), closing the cross-tenant gap mTLS alone left open.** On top of mTLS, the
     handler (`crates/lightbridge-authz-usage/src/handlers/query.rs`) requires
