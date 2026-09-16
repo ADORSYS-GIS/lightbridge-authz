@@ -1064,6 +1064,21 @@ Two rules once a collision has happened:
   the record of what actually ran there. The file that moves is the one that has *not* been applied
   anywhere durable. If both have, renumbering is not available and the fix is a new forward
   migration.
+
+  **This rule existed and was still broken (#741, 2026-09-16), so it needs a procedure, not just a
+  statement.** Before renumbering ANY migration, ask the database which file actually holds that
+  version — do not infer it from the repo:
+
+  ```bash
+  kubectl --context hetzner-prod exec -n converse lightbridge-main-db-1 -c postgres --     psql -U postgres -d usage -c     "SELECT version, description, installed_on FROM _sqlx_migrations ORDER BY version DESC LIMIT 10;"
+  ```
+
+  (`-d app` for the authz database.) #733 renumbered `usage_retention_state` off `20260911000001`
+  without checking; production had applied it under that exact version two days earlier, so the
+  version then resolved to a different file with a different checksum, and every subsequent
+  `lightbridge-usage-migrate` run aborted — leaving the usage store with nothing applied since
+  2026-09-11 and the crashloop unnoticed until an operator looked. Match the numbering to what the
+  database already ran, and move the file that has run nowhere.
 - **An applied migration's bytes are frozen.** SQLx stores a checksum per migration and validates
   it on every run, so editing one — *even to add a comment* — aborts the next migrate with a
   version mismatch. Corrections go in the owning ADR, not in the file.
