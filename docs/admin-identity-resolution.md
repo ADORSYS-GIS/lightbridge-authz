@@ -213,7 +213,8 @@ client, for two independent reasons:
 
 1. `federated_identities` is modelled in `authz.cstack` as `FederatedIdentity` but carries **zero
    `@@allow` clauses**, so every generic `model.FederatedIdentity.*` verb is denied unconditionally
-   at both the policy layer and `rpc_authorize.rs` (#739, reversing ADR-0024 Q4's "absent entirely").
+   at both the policy layer and `rpc_authorize.rs` (ADR-0024 Q4 REVERSAL, #740, explicit owner
+   directive, reversing that ADR's "deliberately absent from `authz.cstack` entirely").
    The sealed Keycloak token envelope is not even declared on the model — `tokenEnvelope` and
    `tokenSealedAt` exist only in the table, reachable solely through hand-written SQL — so no
    generated path can reach the claims, by construction rather than by omission.
