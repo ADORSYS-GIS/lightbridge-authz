@@ -454,8 +454,10 @@ Tables (see `migrations/`):
   them into the roles claim alongside `ClaimSource::ProjectRole`; `lightbridge-authz rbac grant` is
   the bootstrap writer (there is no admin to grant the first admin). Before this, prod mapped
   `owner -> lightbridge-admin`, which under ADR-0026 minted admin for every signed-in person.
-- `federated_identities` (ADR-0024, corrected 2026-08-25; deliberately absent from `authz.cstack`
-  — see "Persistence" below): keyed by `(issuer, subject)`, the login federation key. Carries the
+- `federated_identities` (ADR-0024, corrected 2026-08-25; ADR-0024 Q4 reversed 2026-09-16 by
+  explicit owner directive, #740 — now modelled in `authz.cstack` with zero `@@allow` clauses,
+  same as `User`; see "Persistence" below): keyed by `(issuer, subject)`, the login federation
+  key. Carries the
   sealed Keycloak token set (`token_envelope`, AES-256-GCM, `lightbridge_authz_core::crypto`) —
   refresh token plus a non-access-token ID-token claims snapshot, never the access token.
   `account_id` is `NOT NULL` (no `user_id` column — the user is always derived) and adopted by AT
@@ -1115,12 +1117,19 @@ hand-written SQL and direct `sqlx` dependencies.
     `create_hypertable`, `add_retention_policy`, `add_compression_policy`, or `ON CONFLICT
     (composite, including partition column) DO UPDATE`. Justified in the migration headers as an
     ADR-0038 exception per the grain-partitioned time-series + CAS/upsert exception class.
-  - `federated_identities`: deliberately ABSENT from `authz.cstack` entirely, not merely
-    `@@allow`-less -- it carries the sealed Keycloak token envelope, so a credential-bearing table
-    must be unreachable from any generated read path, not just gated behind the coarse-RBAC check
-    a present-but-unallowed model would still have (ADR-0024 Q4; created by
-    `migrations/20260825000001_users_and_federated_identities.sql`; justified in the `User` model
-    comment in `crates/lightbridge-authz-api/schema/authz.cstack`).
+  - `federated_identities`: modelled in `authz.cstack` as `FederatedIdentity` since the ADR-0024
+    Q4 reversal (#740, explicit owner directive) — schema-of-record now, but carrying ZERO
+    `@@allow` clauses, the same two independent deny layers as `User` (cratestack's own
+    no-`@@allow`-means-no-access, plus `rpc_authorize.rs`'s `required_permission` denying any
+    unmapped op-id unconditionally). The sealed Keycloak token envelope
+    (`tokenEnvelope`/`tokenSealedAt`) is still never declared at all — stronger than
+    `@@allow`-less, since a column this model never names cannot be exposed by a future accidental
+    `@@allow`. Every actual read and write still goes through hand-written SQL
+    (`crates/lightbridge-authz-api-key/src/federated_provisioning.rs`, `repo.rs`, and
+    `identity_resolution.rs`'s free-text search over its three display columns), never the
+    generated client — the model exists for policy/documentation, not data access. Justified in
+    the `FederatedIdentity` model comment in
+    `crates/lightbridge-authz-api/schema/authz.cstack`.
   - `accounts`/`projects`, READ-ONLY, for admin identity resolution only (#647): the estate-wide
     label lookups in `crates/lightbridge-authz-api-key/src/identity_resolution.rs`
     (`resolve_account_labels`/`resolve_project_labels`, and the `accounts` hop
@@ -1137,8 +1146,9 @@ hand-written SQL and direct `sqlx` dependencies.
     (`crates/lightbridge-authz-api-key/src/federated_provisioning.rs`) mints the anchor account and
     its default project for a grandfather-issuer subject signing in for the first time. Three
     independent reasons, none of them "not got round to it": (1) it must commit atomically with the
-    `federated_identities` INSERT -- itself absent from the schema, above -- and `cratestack-pg`
-    exposes no API for joining a caller-owned `sqlx` transaction; (2) `Account` deliberately carries
+    `federated_identities` INSERT -- that model is `@@allow`-less and denied unconditionally too
+    (per the entry above) -- and `cratestack-pg` exposes no API for joining a caller-owned `sqlx`
+    transaction; (2) `Account` deliberately carries
     NO `@@allow("create", ...)`, and `model.Account.create` is denied unconditionally at the RBAC
     layer besides, because account creation is procedure-only by design (ADR-0006) -- which is why
     `create_account` and `provision_account` are hand-written too; routing this through the
