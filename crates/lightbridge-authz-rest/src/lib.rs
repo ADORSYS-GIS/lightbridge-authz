@@ -4,8 +4,8 @@ use lightbridge_authz_core::{
     RotateApiKey, async_trait,
     config::{
         ApiKeyExpiry, ApiServer, BasicAuth, Billing, BudgetInternalServer, BudgetServer,
-        Federation, IdpServer, JwtSigning, ModelCatalog, Oauth2, OauthClient, OauthClientType,
-        OpaServer, QuotaTiers, Redis, UsageServiceClient,
+        Federation, IdpServer, JwtSigning, ModelCatalog, Oauth2, OpaServer, QuotaTiers, Redis,
+        UsageServiceClient,
     },
     db::DbPoolTrait,
     error::{Error, Result},
@@ -41,6 +41,7 @@ pub mod loopback;
 pub mod middleware;
 pub mod models;
 pub mod my_access;
+pub mod oauth2_client_validation;
 pub mod oauth2_op;
 pub mod platform_roles_directory;
 pub mod post_logout;
@@ -3118,8 +3119,11 @@ fn build_token_exchange_state(
                 .to_string(),
         ));
     }
-    validate_authorization_code_clients(&oauth2.clients, signing.audience.as_deref())?;
-    validate_client_credentials_and_service_clients(&oauth2.clients)?;
+    oauth2_client_validation::validate_authorization_code_clients(
+        &oauth2.clients,
+        signing.audience.as_deref(),
+    )?;
+    oauth2_client_validation::validate_client_credentials_and_service_clients(&oauth2.clients)?;
     let signer = signing::ApiKeyJwtSigner::from_config(signing, repo.clone())?;
 
     // ADR-0025 Stage 1/2: `start_idp_server` (this function's sole production caller) already
@@ -3178,7 +3182,7 @@ fn build_token_exchange_state(
         device_code_ttl_secs: cfg.device_code_ttl_seconds as u64,
         token_exchange_enabled: cfg.enabled,
     };
-    let cors_origins = token_endpoint_cors_origins(&oauth2.clients)?;
+    let cors_origins = oauth2_client_validation::token_endpoint_cors_origins(&oauth2.clients)?;
     Ok(Some(
         token_exchange::TokenExchangeState::new(
             signer,
@@ -3191,163 +3195,6 @@ fn build_token_exchange_state(
         .with_cors_origins(cors_origins)
         .with_client_credentials_ttl_seconds(cfg.client_credentials_ttl_seconds),
     ))
-}
-
-fn token_endpoint_cors_origins(clients: &[OauthClient]) -> Result<Vec<String>> {
-    clients
-        .iter()
-        .filter(|client| {
-            client.client_type == OauthClientType::Public
-                && client.require_pkce
-                && client
-                    .grant_types
-                    .iter()
-                    .any(|grant| grant == "authorization_code")
-        })
-        .flat_map(|client| client.redirect_uris.iter())
-        .map(|redirect_uri| redirect_origin(redirect_uri))
-        .collect::<Result<std::collections::BTreeSet<_>>>()
-        .map(|origins| origins.into_iter().collect())
-}
-
-/// OAuth 2.1 and RFC 9700 (OAuth Security Best Current Practice) recommend PKCE for every client
-/// type, not only public ones, specifically to close authorization-code-injection attacks -- a
-/// confidential client's client-authentication step at the token endpoint proves who is redeeming
-/// the code, not that the code being redeemed is the one THIS session actually requested. This
-/// gate therefore applies to every `authorization_code` client regardless of `client_type`; do not
-/// reintroduce a `client_type == Public` condition here.
-///
-/// Also enforces an invariant the introspection endpoint's module doc comment
-/// (`token_exchange.rs`) relies on but nothing previously checked: no registered client's
-/// `client_id` may equal `oauth2.signing.audience`. That equality is exactly the condition under
-/// which a self-signed API-key JWT's `azp` (always the fixed `oauth2.signing.audience` value)
-/// would collide with a real OAuth2 client id, making an API-key JWT pass
-/// `introspect_endpoint`'s `azp == caller's client_id` gate and introspect as a live token-
-/// exchange access token -- defeating the "API keys are structurally not introspectable" claim
-/// that doc comment makes. Refusing to start is preferable to a config that silently invalidates
-/// that claim.
-fn validate_authorization_code_clients(
-    clients: &[OauthClient],
-    signing_audience: Option<&str>,
-) -> Result<()> {
-    for client in clients {
-        for redirect_uri in &client.redirect_uris {
-            redirect_origin(redirect_uri)?;
-        }
-        if client
-            .grant_types
-            .iter()
-            .any(|grant| grant == "authorization_code")
-            && (!client.require_pkce || client.redirect_uris.is_empty())
-        {
-            return Err(Error::Server(
-                "authorization_code clients require PKCE and at least one redirect_uri".to_string(),
-            ));
-        }
-        if let Some(audience) = signing_audience
-            && client.client_id == audience
-        {
-            return Err(Error::Server(format!(
-                "oauth2.clients client_id {:?} equals oauth2.signing.audience -- a self-signed \
-                 API-key JWT's azp would collide with this client id, making API keys \
-                 introspectable as token-exchange access tokens",
-                client.client_id
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// Startup guard for `client_credentials`-capable and `confidential`/`service` clients (#534,
-/// ADR-0030), called from [`build_token_exchange_state`] -- `start_idp_server`'s sole production
-/// caller of that function, so this runs unconditionally at `authz-idp` startup exactly like
-/// [`validate_authorization_code_clients`] above it. Two independent, previously-latent footguns:
-///
-/// 1. **A `public` client listing `client_credentials` would mint a machine token with NO
-///    credential at all.** `oauth2_op::client_store::to_registration` maps `public` to `NoAuth`.
-///    This check is the SOLE control against that combination, not a second line of defense behind
-///    the pre-dispatch intercept: `token_exchange::client_credentials_token_endpoint`'s own
-///    `authenticate_presented_client` has, as its first match arm, `(Some(NoAuth), NoCredential) =>
-///    Ok(())` -- the same rule every other grant relies on for public clients -- so a `public`
-///    client that somehow reached this endpoint with `client_credentials` in its `grant_types`
-///    would authenticate with `Ok(())` and then pass the `allows_grant_type` check, reproducing the
-///    exact footgun the intercept might otherwise be assumed to guard against. This startup check
-///    is the only thing that stops that combination from ever minting a token.
-/// 2. **A `confidential`/`service` client whose `jwks` does not actually parse to a usable key**
-///    would previously start successfully: `find_client` would keep answering
-///    `token_endpoint_auth_method: Some(PrivateKeyJwt)` for it, while
-///    `signing::ClientAuthenticationMetadata::from_oauth2` silently dropped it from
-///    `token_endpoint_auth_methods_supported` in discovery -- the client store and the discovery
-///    document disagreeing about whether the client can ever actually authenticate. Refusing to
-///    start closes that gap for `confidential` AND `service` clients alike. This check uses
-///    [`signing::client_has_a_parseable_jwk`]; `from_oauth2` keeps its own inline filter chain
-///    rather than calling that same function (it needs to walk every key to collect signing
-///    algorithms, not just answer "is there at least one"), but both bottom out in the same
-///    `parse_public_jwk` call, so a JWK either function accepts/rejects is judged identically.
-///    `ConfigClientStore::has_confidential_client`/
-///    `TokenExchangeOpStore::has_confidential_client` -- the aggregate "is there at least one"
-///    query this per-client check replaces -- are removed as part of this fix; neither could have
-///    driven a check this specific, and both were otherwise unused outside their own tests.
-///
-/// `client_credentials` clients additionally may not register `redirect_uris`: RFC 6749 §4.4 is a
-/// non-browser, non-redirect grant by construction, so a client combining the two is either a
-/// config mistake or two client roles smuggled into one registration.
-fn validate_client_credentials_and_service_clients(clients: &[OauthClient]) -> Result<()> {
-    for client in clients {
-        if matches!(
-            client.client_type,
-            OauthClientType::Confidential | OauthClientType::Service
-        ) && !signing::client_has_a_parseable_jwk(client.jwks.as_ref())
-        {
-            return Err(Error::Server(format!(
-                "oauth2.clients client_id {:?} is {:?} (bound to private_key_jwt) but its jwks \
-                 does not contain at least one parseable JWK -- it could never actually \
-                 authenticate",
-                client.client_id, client.client_type
-            )));
-        }
-        if client
-            .grant_types
-            .iter()
-            .any(|grant| grant == token_exchange::CLIENT_CREDENTIALS_GRANT)
-        {
-            if client.client_type == OauthClientType::Public {
-                return Err(Error::Server(format!(
-                    "oauth2.clients client_id {:?} is type: public but lists the \
-                     client_credentials grant -- a public client authenticates with no credential \
-                     at all, so this would mint a machine token nobody has to prove they own; use \
-                     type: service with a private_key_jwt keypair instead",
-                    client.client_id
-                )));
-            }
-            if !client.redirect_uris.is_empty() {
-                return Err(Error::Server(format!(
-                    "oauth2.clients client_id {:?} lists the client_credentials grant but also \
-                     registers redirect_uris -- client_credentials is a non-browser, \
-                     non-redirect grant (RFC 6749 §4.4)",
-                    client.client_id
-                )));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn redirect_origin(redirect_uri: &str) -> Result<String> {
-    let url = reqwest::Url::parse(redirect_uri).map_err(|_| {
-        Error::Server("authorization-code redirect_uri must be an absolute URL".to_string())
-    })?;
-    if !matches!(url.scheme(), "https" | "http")
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.host_str().is_none_or(|host| host.contains('*'))
-    {
-        return Err(Error::Server(
-            "authorization-code redirect_uri must have an HTTP(S) origin without credentials"
-                .to_string(),
-        ));
-    }
-    Ok(url.origin().ascii_serialization())
 }
 
 /// ADR-0025 Stage 1: every serving component -- `authz-api`, `authz-idp`, `authz-opa`,
@@ -3792,12 +3639,21 @@ pub async fn start_idp_server(
     // `KeycloakRelyingParty::discover`'s doc comment for why that dial target and the identity
     // issuer are kept separate. `oauth2.jwks_url` is deliberately NOT passed -- on authz-idp it
     // is the OPPOSITE trust root; see `KeycloakRelyingParty::jwks` (conflating them broke prod).
+    //
+    // #697/#701, via the SAME `handlers::build_starting_grant_service` constructor
+    // `AuthzStoreImpl::with_pool` uses, so the policy set id / evaluation budget can never drift
+    // between the RPC surface's starting grants and browser-SSO self-service provisioning's: a
+    // login that provisions a brand new account (restored self-service provisioning, see
+    // `relying_party::KeycloakRelyingParty::persist_federated_identity`) books its starting grant
+    // the same way `createAccount` does, so it does not read `remaining = 0` at the gateway.
+    let starting_grant = Arc::new(handlers::build_starting_grant_service(pool.clone()));
     let relying_party = Arc::new(relying_party::KeycloakRelyingParty::new(
         rp_config,
         federation.issuer.clone(),
         federation.effective_discovery_url().to_string(),
         Arc::new(StoreRepo::new(pool.clone())),
         device_verify_rate_limit_store,
+        starting_grant,
         oauth2.jwks_ca_bundle_path.clone(),
     )?);
 
@@ -4258,7 +4114,9 @@ mod tests {
     use super::*;
     use axum::http::StatusCode;
     use lightbridge_authz_bearer::{BearerTokenServiceTrait, TokenInfo};
-    use lightbridge_authz_core::config::{Oauth2TokenExchange, Oauth2Type};
+    use lightbridge_authz_core::config::{
+        Oauth2TokenExchange, Oauth2Type, OauthClient, OauthClientType,
+    };
     use serde_json::Value;
     use sqlx::postgres::PgPoolOptions;
 

@@ -211,9 +211,12 @@ The four estate-wide queries are hand-written SQL
 (`crates/lightbridge-authz-api-key/src/identity_resolution.rs`), not the generated cratestack
 client, for two independent reasons:
 
-1. `federated_identities` is deliberately absent from `authz.cstack` entirely — it also carries the
-   sealed Keycloak token envelope, so a credential-bearing table must be unreachable from any
-   generated read path (ADR-0024 Q4). There is no generated path to reach the claims through.
+1. `federated_identities` is modelled in `authz.cstack` as `FederatedIdentity` but carries **zero
+   `@@allow` clauses**, so every generic `model.FederatedIdentity.*` verb is denied unconditionally
+   at both the policy layer and `rpc_authorize.rs` (#739, reversing ADR-0024 Q4's "absent entirely").
+   The sealed Keycloak token envelope is not even declared on the model — `tokenEnvelope` and
+   `tokenSealedAt` exist only in the table, reachable solely through hand-written SQL — so no
+   generated path can reach the claims, by construction rather than by omission.
 2. `Account`/`Project`'s `@@allow("read", …)` clauses are ownership-scoped (`userId == auth().id`)
    and cratestack folds them into every query unconditionally with no bypass. An estate-wide admin
    label lookup is exactly the query that policy cannot express, and widening the shared clause

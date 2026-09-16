@@ -145,6 +145,11 @@ yet (Follow-ups); reads are on-demand only, once a consumer exists.
 
 ### Q4 — ADR-0038: `federated_identities` stays hand-written SQL
 
+> **AMENDED 2026-09-16 (#739).** The "absent from `authz.cstack` entirely" half of this section no
+> longer holds: the table IS modelled, `@@allow`-less, with the credential columns undeclared. The
+> hand-written-SQL ruling and the no-relations ruling both stand. Read the
+> **"Amendment (2026-09-16)"** section below before relying on anything here.
+
 Documented exception in `migrations/`, same header-comment convention as
 `20260823000002_sessions.sql`. `federated_identities` is deliberately **absent** from
 `authz.cstack` entirely — not merely `@@allow`-less — the same class of exception as
@@ -310,6 +315,64 @@ NULL`. The token-sealing mechanism (Q2), the `authz.cstack` exception (Q4, still
 schema entirely, and `accounts.user_id` still never written through the generated client), the
 backfill (Q5, unaffected — it only ever touched `accounts`/`users`, never `federated_identities`),
 and the config/deployment requirement (Q7) are all untouched.
+
+## Amendment (2026-09-16): `federated_identities` IS modelled — `@@allow`-less, credential columns undeclared
+
+**What Q4 got wrong.** Q4 above ruled that `federated_identities` must be **absent** from
+`authz.cstack` entirely — "not merely `@@allow`-less" — on the grounds that a credential-bearing
+table must be structurally unreachable from any generated read path, and that a present-but-
+unallowed model would still be reachable through "the coarse-RBAC gate" it would carry.
+
+That distinction does not survive contact with the schema Q4 itself describes two paragraphs
+later. `users` is modelled with **no `@@allow` at all**, and Q4 endorses precisely that as
+sufficient: "the absence of any `@@allow` clause already fail-closes every generic `model.User.*`
+verb by construction, and `rpc_authorize.rs`'s `required_permission` map needs no new entry, since
+an op-id it does not list is denied unconditionally." Those are two independent deny layers, and
+they apply verbatim to `FederatedIdentity`. Q4 asserted a difference between the two tables'
+reachability that the mechanism does not actually produce.
+
+**What is decided now (#739).** `federated_identities` is modelled as `FederatedIdentity` in
+`authz.cstack`, carrying **zero `@@allow` clauses**, exactly like `User`.
+
+**The credential columns are not declared on the model at all.** `token_envelope` and
+`token_sealed_at` exist in the table and are read and written exclusively through hand-written SQL
+(`crates/lightbridge-authz-api-key/src/federated_provisioning.rs`, `repo.rs`). Omitting them is
+what actually delivers the guarantee Q4 was reaching for, and delivers it more durably than
+absence did: a future accidental `@@allow("read", ...)` on this model could not expose the sealed
+Keycloak token set, because the sealed token set is not expressible in the generated surface. Under
+Q4's rule the same accident — someone adding the model back, with a clause — would have exposed it.
+
+```mermaid
+stateDiagram-v2
+    [*] --> GenericVerb: model.FederatedIdentity.list / get / create / update / delete
+    GenericVerb --> DeniedByPolicy: no @@allow clause on the model
+    GenericVerb --> DeniedByRbac: op-id absent from required_permission
+    DeniedByPolicy --> [*]: 403
+    DeniedByRbac --> [*]: 403
+
+    [*] --> SealedEnvelope: token_envelope / token_sealed_at
+    SealedEnvelope --> NotExpressible: never declared on the model
+    NotExpressible --> [*]: no generated path can name the column
+
+    note right of NotExpressible
+        This is the edge Q4 wanted and did not get.
+        Absence protected the columns only while
+        the model stayed absent; undeclared columns
+        stay protected even if the model gains a clause.
+    end note
+```
+
+**What Q4 still rules, unchanged.** The write path stays hand-written SQL — see AGENTS.md's
+ADR-0038 exception list for the three reasons the generated client cannot carry it (atomicity
+across three tables with no cratestack transaction API; `Account` deliberately has no
+`@@allow("create")`; `Project`'s create clause is unsatisfiable where there is no `auth()`). And Q4's
+relation ruling stands in full: `FederatedIdentity` declares **no relations**, and neither `Account`
+nor `User` gains one to it — the measured ~51GB/36-minute codegen blowup is the reason, and it has
+not changed.
+
+**Enforcement.** `crates/lightbridge-authz-rest/tests/federated_identity_schema_tests.rs` fails if
+the model gains an `@@allow` clause or declares either credential column, and asserts every
+`model.FederatedIdentity.*` op-id resolves to no permission.
 
 ## Consequences
 
