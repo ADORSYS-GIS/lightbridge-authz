@@ -630,6 +630,7 @@ fn app_with_authority(
         bearer,
         scope_authority,
         raw_days: Some(90),
+        ingest_auth: None,
     });
     build_query_router(state, readiness_pool, false)
 }

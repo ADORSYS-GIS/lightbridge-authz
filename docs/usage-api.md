@@ -3,13 +3,20 @@
 `lightbridge-authz-usage` ingests OTLP/HTTP traces + metrics + logs from AI Envoy/OpenTelemetry exporters and stores normalized usage events in Timescale/Postgres.
 
 > [!WARNING]
-> **The ingest routes are unauthenticated.** This service splits its TLS surface
+> **The legacy `/v1/otel/*` ingest routes are unauthenticated. The `/auth/v1/otel/*` ones are
+> not.** This service splits its TLS surface
 > across two listeners (#347, `UsageServerGroup` in
 > [`crates/lightbridge-authz-usage/src/config.rs`](../crates/lightbridge-authz-usage/src/config.rs)):
-> an **ingest listener** (`/v1/otel/*`, `routers::ingest_router()`) that applies no JWT,
-> Basic-auth, or mTLS check — its caller is an AI Envoy/OpenTelemetry exporter outside
-> this repo's deploy surface, so anyone who can reach it can write fabricated
-> usage/billing records for any account or project — and a **query listener**
+> an **ingest listener** carrying TWO ingest route blocks — an **unauthenticated** one
+> (`/v1/otel/*`, `routers::ingest_router()`) that applies no JWT, Basic-auth, or mTLS check,
+> whose caller is an AI Envoy/OpenTelemetry exporter outside this repo's deploy surface, so
+> anyone who can reach it can write fabricated usage/billing records for any account or project
+> (this is the one deliberate exception, #585 AC5, sound only under the `ClusterIP`-only /
+> no-ingress casing below) — and an **authenticated** one (`/auth/v1/otel/*`, #585) that requires
+> a `client_credentials` bearer token whose audience names the endpoint plus an `X-Source`
+> matching the source that token's `sub` is configured for. The authenticated block is mounted
+> only when `ingest_auth` is configured; see "Authenticated ingest" below — and a **query
+> listener**
 > (`/usage/v1/usage/query` + `/usage/v1/spend/query`, `routers::query_router()`) that
 > **requires and verifies a client certificate (mTLS)**. This service is
 > `ClusterIP`-only in prod with no external route regardless — see
@@ -56,6 +63,10 @@
   - Accepts `application/x-protobuf` or OTLP JSON payloads compatible with `ExportMetricsServiceRequest`.
 - `POST /v1/otel/logs`
   - Accepts `application/x-protobuf` or OTLP JSON payloads compatible with `ExportLogsServiceRequest`.
+- `POST /auth/v1/otel/traces`, `/auth/v1/otel/metrics`, `/auth/v1/otel/logs` (#585)
+  - The authenticated mirror of the three routes above: same payloads, same extraction, same
+    response — but the source is bound to the presented credential instead of a caller-set
+    header. Mounted only when `ingest_auth` is configured. See "Authenticated ingest" below.
 - `POST /usage/v1/usage/query`
   - Single query endpoint for scoped, bucketed usage retrieval. Requires
     `Authorization: Bearer <end-user access token>` (#570) — see the warning above.
@@ -64,6 +75,59 @@
     `UsageServiceSpendReader`. mTLS-only, no bearer token, no per-caller ownership check (it is a
     legitimate cross-account service-to-service reader) — and since #603 REFUSES any request
     carrying an `Authorization` header, returning `403`.
+
+## Authenticated ingest (#585)
+
+`POST /auth/v1/otel/{traces,metrics,logs}` exists so that a non-gateway source's telemetry enters
+through a door whose credential — not the payload — names the collector. It is the same handler
+body as the unauthenticated routes, with the source resolved from the credential.
+
+**Configuration.** Optional. When `ingest_auth` is absent from config the routes are not mounted
+at all, and nothing advertises them; absent means absent, never "mounted but permissive". The
+block has two required keys, and both are validated at config load (a bad one fails the `migrate`
+Job first, so it fails the whole deployment rather than surfacing as a per-request 400/403):
+
+```yaml
+ingest_auth:
+  audience: "lightbridge-usage-ingest"
+  principals:
+    "svc:collector-github-copilot": "github-copilot"
+```
+
+`principals` maps a machine token's `sub` to the ONE `X-Source` it may assert. Keys must be
+`svc:`-prefixed (that is how `authz-idp` mints a `client_credentials` `sub`) and values must be a
+`KNOWN_SOURCES` entry.
+
+**The gate order, all of it fail-closed.** A request must present an `Authorization: Bearer`
+token that (1) validates against JWKS — any failure, including an unreachable JWKS, is a `401`,
+never a default; (2) carries `caller_kind: service`, so a human login or an API-key-derived token
+whose `sub` collides with a configured principal is refused; (3) carries an `aud` naming
+`ingest_auth.audience` — this is what makes "the credential names the collector" hold, and it is
+checked here rather than via `oauth2.audience` because that block is the shared one the query
+listener validates end-user tokens against. Only then is `X-Source` resolved (an unknown or
+missing one is a `400`) and required to equal the source that `sub` is mapped to; an unmapped
+`sub`, or a mapped one asserting a different source, is a `403`.
+
+`authz-idp` already supports the audience with no change: a `client_credentials` token's `aud`
+defaults to its own `client_id`, or to a value listed in that client's `allowed_audiences`
+(RFC 8707 resource indicators), so a collector asks for `audience=lightbridge-usage-ingest` at the
+token endpoint.
+
+**Scope — ADR-0028 D8 leg 3 only.** ADR-0028 D8 settles the ingest-authentication topology: the
+door for collector-mediated push sources (Claude Code, Codex, OpenCode) is the **edge OTEL
+collector**, and "the collector→usage hop carries no second credential" — a token on a hop already
+pinned by `ClusterIP` + NetworkPolicy "buys an audit line and a rotation liability, not a
+boundary". Those sources therefore do **not** belong in `ingest_auth.principals`. What does belong
+are the out-of-cluster sources with no collector in their path (today: GitHub Copilot and
+Microsoft Foundry), which is exactly what `client_credentials` exists for.
+
+**A payload that disagrees is alerted on, never obeyed.** If a payload carries its own
+`governance.source` or `service.namespace` that differs from the credential-derived source, the
+batch is still accepted and stored, the stored `source` is the trusted one, and a warning is
+emitted naming both values (`handlers::payload_identity`, AC4's "alert, never overwrite" half).
+It is deliberately not a refusal: a payload attribute is attacker-controlled input on an otherwise
+authenticated path, and rejecting on it would hand a caller who can craft one a way to deny
+service to an honest collector's real telemetry.
 
 ## Query request
 
