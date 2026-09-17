@@ -1,16 +1,6 @@
 //! The execution-grain receiver's normalizer (#588, AC2): parses OTLP trace spans into
-//! `usage_executions` / `usage_model_calls` / `usage_tool_calls` rows (plus `usage_identities`).
-//!
-//! The execution grain is the agent-tool hierarchy (ADR-0027): a parent execution span with
-//! model-call and tool-call child spans. A span is classified by what its source normalizer
-//! extracts — a `tool_name` makes it a tool call, a `model` makes it a model call, else execution.
-//!
-//! OTLP exports child spans before the parent execution span, so when a model/tool call's parent
-//! is not in the same batch this normalizer mints a STUB `usage_executions` row (provider/
-//! duration/raw_schema_version NULL) so the child's `execution_id` FK is satisfiable in the same
-//! transaction; the real execution span later fills it via the repo's `ON CONFLICT DO UPDATE`.
-//! Fail-loud: a tool-call span with no resolvable duration is refused (`Err`) — never silently
-//! dropped — `usage_tool_calls.duration_ms` is `NOT NULL`, and a fabricated zero reads as "instant".
+//! `usage_executions` / `usage_model_calls` / `usage_tool_calls` rows (plus `usage_identities`),
+//! minting a STUB execution for a child whose parent is not in the same batch (stub-before-parent).
 
 use std::collections::{HashMap, HashSet};
 
@@ -95,6 +85,11 @@ pub fn parse_execution_grain(
                         .or(norm.latency_ms.map(|v| v as i64));
 
                 if let Some(tool_name) = norm.tool_name {
+                    if parent_span_id.is_empty() {
+                        return Err(Error::BadRequest(format!(
+                            "tool-call span {trace_id}/{span_id} has no parent execution"
+                        )));
+                    }
                     let duration_ms = duration_ms.ok_or_else(|| {
                         Error::BadRequest(format!(
                             "tool-call span {trace_id}/{span_id} has no duration"
@@ -114,6 +109,11 @@ pub fn parse_execution_grain(
                         duration_ms,
                     });
                 } else if let Some(model) = norm.model {
+                    if parent_span_id.is_empty() {
+                        return Err(Error::BadRequest(format!(
+                            "model-call span {trace_id}/{span_id} has no parent execution"
+                        )));
+                    }
                     let parent_id = execution_id(source, &trace_id, &parent_span_id);
                     stubs.entry(parent_id.clone()).or_insert_with(|| {
                         stub_execution(source, &trace_id, &parent_span_id, observed_at)

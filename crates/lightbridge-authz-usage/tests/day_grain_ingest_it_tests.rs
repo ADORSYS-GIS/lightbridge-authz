@@ -147,6 +147,49 @@ async fn duplicate_day_fact_in_one_batch_does_not_21000(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations-usage")]
+async fn ingest_day_grain_logs_refuses_a_record_without_report(pool: PgPool) {
+    let router = app(pool.clone());
+    // A github-copilot source emits only day-grain records per RFC-0001, so a record missing the
+    // `report` attribute is malformed and must be refused (fail-loud), never silently dropped.
+    let body = json!({
+        "resourceLogs": [{
+            "scopeLogs": [{
+                "logRecords": [
+                    {
+                        "timeUnixNano": "1735689600000000000",
+                        "attributes": [
+                            {"key":"source","value":{"stringValue":"github-copilot"}},
+                            {"key":"day","value":{"stringValue":"2026-09-01"}},
+                            {"key":"subject_kind","value":{"stringValue":"org"}},
+                            {"key":"subject_id","value":{"stringValue":"g1"}}
+                        ]
+                    }
+                ]
+            }]
+        }]
+    });
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/otel/logs")
+                .header("x-source", "github-copilot")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "a record without a report attribute must be refused, not dropped"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations-usage")]
 async fn ingest_day_grain_logs_end_to_end(pool: PgPool) {
     let router = app(pool.clone());
     let body = json!({

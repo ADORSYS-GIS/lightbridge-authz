@@ -18,7 +18,7 @@ use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
 };
-use lightbridge_authz_core::Result;
+use lightbridge_authz_core::{Error, Result};
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 
 use crate::{
@@ -58,9 +58,11 @@ pub async fn ingest_day_grain_logs(
 
 /// Split an OTLP logs payload into day facts and seat snapshots.
 ///
-/// Records without a `report` attribute are not day-grain and are skipped (a `github-copilot`
-/// source emits only day-grain records per RFC-0001). A record that IS day-grain but malformed
-/// returns `Err` — the whole request is refused rather than partially applied.
+/// Every record on this path must be day-grain: a `github-copilot` source emits only day-grain
+/// records per RFC-0001, and this handler is only dispatched for that source. A record without a
+/// `report` attribute, or one that IS day-grain but malformed, returns `Err` — the whole request
+/// is refused rather than partially applied (fail-loud; the cutover's count assertions depend on
+/// every emitted record landing or the run failing).
 ///
 /// `source` is the trusted source; the payload's own `source` assertion is cross-checked per
 /// record (AC4) and never trusted for the stored row.
@@ -84,7 +86,11 @@ fn extract_day_grain(
                 match parse_day_grain(&attrs, source)? {
                     Some(DayGrainRecord::DayFact(f)) => facts.push(f),
                     Some(DayGrainRecord::SeatSnapshot(s)) => seats.push(s),
-                    None => {}
+                    None => {
+                        return Err(Error::BadRequest(
+                            "day-grain record missing report attribute".into(),
+                        ));
+                    }
                 }
             }
         }

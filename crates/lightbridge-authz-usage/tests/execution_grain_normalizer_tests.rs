@@ -166,6 +166,22 @@ fn refuses_a_tool_call_with_no_duration() {
 }
 
 #[test]
+fn refuses_a_tool_call_with_no_parent_execution() {
+    // A tool call with an empty parent span id would otherwise mint a phantom stub execution
+    // for the empty parent (`exec_{source}_{trace}_{}`) — refuse instead of fabricating a row.
+    let p = payload(json!([span(
+        TC_SPAN,
+        "",
+        "tool.use",
+        "1735689600000000000",
+        "1735689600200000000",
+        json!([{"key":"tool_name","value":{"stringValue":"bash"}}])
+    )]));
+    let err = parse_execution_grain(p, "claude-code").expect_err("no parent must be refused");
+    assert!(err.to_string().contains("no parent"));
+}
+
+#[test]
 fn refuses_a_span_with_no_timestamp() {
     // Fail-loud on a missing timestamp (P2): `usage_executions.observed_at` is NOT NULL and built
     // from new code, so a zero timestamp must be refused, never silently replaced with wall-clock
