@@ -19,6 +19,8 @@ pub mod handlers;
 pub mod instrumentation;
 pub mod models;
 pub mod normalizer;
+pub mod replay;
+pub mod replay_types;
 pub mod repo;
 pub mod retention;
 pub mod retention_config;
