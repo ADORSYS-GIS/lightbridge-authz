@@ -2,10 +2,10 @@ use chrono::{DateTime, Utc};
 use lightbridge_authz_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
-
 pub mod day_fact;
 pub mod day_seat;
 pub mod execution;
+pub mod seat;
 #[derive(Debug, Serialize, ToSchema)]
 pub struct IngestResponse {
     pub accepted_events: usize,
