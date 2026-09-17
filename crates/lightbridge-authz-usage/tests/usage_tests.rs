@@ -147,6 +147,7 @@ fn mock_state() -> Arc<UsageState> {
             &UsageScope::Project,
             "proj_1",
         )),
+        ingest_auth: None,
         raw_days: Some(90),
     })
 }
@@ -420,6 +421,7 @@ async fn query_usage_returns_timeseries_points_when_query_is_valid() {
             &UsageScope::Project,
             "proj_1",
         )),
+        ingest_auth: None,
         raw_days: Some(90),
     });
 
@@ -480,6 +482,7 @@ async fn query_usage_serializes_null_total_cost_as_null_not_zero() {
             &UsageScope::Project,
             "proj_1",
         )),
+        ingest_auth: None,
         raw_days: Some(90),
     });
 
@@ -531,6 +534,7 @@ async fn query_usage_sets_truncated_when_start_time_predates_the_raw_retention_w
             &UsageScope::Project,
             "proj_1",
         )),
+        ingest_auth: None,
         raw_days: Some(90),
     });
     let mut req = base_request();
@@ -571,6 +575,7 @@ async fn query_usage_does_not_flag_truncated_when_start_time_is_after_the_persis
             &UsageScope::Project,
             "proj_1",
         )),
+        ingest_auth: None,
         raw_days: Some(90),
     });
     let mut req = base_request();
@@ -612,6 +617,7 @@ async fn query_usage_does_not_flag_truncated_when_retention_is_disabled() {
             &UsageScope::Project,
             "proj_1",
         )),
+        ingest_auth: None,
         raw_days: None,
     });
     let mut req = base_request();
@@ -756,6 +762,7 @@ async fn query_usage_refuses_when_scope_authority_declines() {
         }),
         bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
         scope_authority: support::refuse_everything_scope_authority(),
+        ingest_auth: None,
         raw_days: Some(90),
     });
 
@@ -788,6 +795,7 @@ async fn query_usage_refuses_api_key_scope_unconditionally() {
         repo: Arc::new(MockUsageRepo::default()),
         bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
         scope_authority: Arc::new(AuthorizeEverything),
+        ingest_auth: None,
         raw_days: Some(90),
     });
 
@@ -822,6 +830,7 @@ async fn query_usage_allows_own_user_scope() {
         }),
         bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
         scope_authority: support::refuse_everything_scope_authority(),
+        ingest_auth: None,
         raw_days: Some(90),
     });
 
@@ -843,6 +852,7 @@ async fn query_usage_refuses_other_subjects_user_scope() {
         repo: Arc::new(MockUsageRepo::default()),
         bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
         scope_authority: Arc::new(AuthorizeEverything),
+        ingest_auth: None,
         raw_days: Some(90),
     });
 
@@ -865,6 +875,7 @@ async fn query_usage_refuses_all_scope_without_permission() {
         repo: Arc::new(MockUsageRepo::default()),
         bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
         scope_authority: Arc::new(AuthorizeEverything),
+        ingest_auth: None,
         raw_days: Some(90),
     });
 
@@ -893,6 +904,7 @@ async fn query_usage_allows_all_scope_with_permission() {
             ]),
         ),
         scope_authority: support::refuse_everything_scope_authority(),
+        ingest_auth: None,
         raw_days: Some(90),
     });
 
@@ -925,6 +937,7 @@ async fn query_usage_all_scope_does_not_require_scope_id() {
                 ]),
             ),
             scope_authority: support::refuse_everything_scope_authority(),
+            ingest_auth: None,
             raw_days: Some(90),
         })),
         authorized_headers(),
@@ -982,6 +995,7 @@ async fn query_executions_returns_points_when_valid() {
         }),
         bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
         scope_authority: support::refuse_everything_scope_authority(),
+        ingest_auth: None,
         raw_days: Some(90),
     });
 
@@ -1020,6 +1034,7 @@ async fn query_executions_refuses_other_subjects_user_scope_with_403() {
         repo: Arc::new(MockUsageRepo::default()),
         bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
         scope_authority: Arc::new(AuthorizeEverything),
+        ingest_auth: None,
         raw_days: Some(90),
     });
 
@@ -1040,6 +1055,7 @@ async fn query_executions_rejects_account_scope_with_400() {
         repo: Arc::new(MockUsageRepo::default()),
         bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
         scope_authority: Arc::new(AuthorizeEverything),
+        ingest_auth: None,
         raw_days: Some(90),
     });
 
@@ -1077,6 +1093,7 @@ async fn query_executions_null_cost_serializes_as_null() {
         }),
         bearer: support::bearer_with(TEST_TOKEN, TEST_ISSUER, TEST_SUBJECT),
         scope_authority: support::refuse_everything_scope_authority(),
+        ingest_auth: None,
         raw_days: Some(90),
     });
 
@@ -1126,6 +1143,7 @@ async fn ingest_logs_treats_noop_insert_as_success() {
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        ingest_auth: None,
         raw_days: Some(90),
     });
 
@@ -1155,6 +1173,7 @@ async fn ingest_logs_rejects_invalid_protobuf_as_bad_request() {
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        ingest_auth: None,
         raw_days: Some(90),
     });
 
@@ -1186,6 +1205,7 @@ async fn ingest_logs_rejects_unknown_source() {
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        ingest_auth: None,
         raw_days: None,
     });
 
@@ -1215,6 +1235,7 @@ async fn ingest_logs_rejects_missing_source_header() {
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        ingest_auth: None,
         raw_days: None,
     });
 
@@ -1361,6 +1382,7 @@ async fn ingest_traces_treats_noop_insert_as_success() {
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        ingest_auth: None,
         raw_days: Some(90),
     });
 
@@ -1390,6 +1412,7 @@ async fn ingest_traces_rejects_invalid_protobuf_as_bad_request() {
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        ingest_auth: None,
         raw_days: Some(90),
     });
 
@@ -1421,6 +1444,7 @@ async fn ingest_traces_rejects_unknown_source() {
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        ingest_auth: None,
         raw_days: None,
     });
 
@@ -1455,6 +1479,7 @@ async fn ingest_metrics_treats_noop_insert_as_success() {
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        ingest_auth: None,
         raw_days: Some(90),
     });
 
@@ -1484,6 +1509,7 @@ async fn ingest_metrics_rejects_invalid_protobuf_as_bad_request() {
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        ingest_auth: None,
         raw_days: Some(90),
     });
 
@@ -1515,6 +1541,7 @@ async fn ingest_metrics_rejects_unknown_source() {
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        ingest_auth: None,
         raw_days: None,
     });
 
@@ -1549,6 +1576,7 @@ async fn ingest_logs_accepts_json_content_type_payload() {
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        ingest_auth: None,
         raw_days: Some(90),
     });
 
@@ -1603,6 +1631,7 @@ async fn ingest_logs_accepts_gzip_encoded_body() {
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        ingest_auth: None,
         raw_days: Some(90),
     });
 
@@ -1641,6 +1670,7 @@ async fn ingest_endpoints_reject_missing_or_unknown_x_source_header() {
         }),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        ingest_auth: None,
         raw_days: None,
     });
 

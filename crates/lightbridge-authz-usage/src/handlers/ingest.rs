@@ -25,6 +25,7 @@ use tracing::{debug, instrument, warn};
 
 use crate::{
     UsageState,
+    handlers::payload_identity::check_identity_mismatch,
     models::IngestResponse,
     normalizer::{extract_f64, extract_i64, extract_string},
     repo::UsageEvent,
@@ -324,7 +325,7 @@ pub async fn ingest_logs(
     ))
 }
 
-async fn decode_otlp_request_async<T>(
+pub(crate) async fn decode_otlp_request_async<T>(
     headers: HeaderMap,
     body: Bytes,
     signal: &'static str,
@@ -395,7 +396,7 @@ fn decode_maybe_gzip<'a>(
     Ok(std::borrow::Cow::Owned(out))
 }
 
-async fn persist_events(
+pub(crate) async fn persist_events(
     state: &UsageState,
     signal_type: &str,
     events: &[UsageEvent],
@@ -462,16 +463,35 @@ fn validate_events(events: &[UsageEvent]) -> Result<()> {
     Ok(())
 }
 
-struct MergedNorm {
+pub struct MergedNorm {
     model: Option<String>,
     prompt_tokens: Option<i64>,
     completion_tokens: Option<i64>,
     total_tokens: Option<i64>,
-    total_cost: Option<f64>,
+    pub total_cost: Option<f64>,
     latency_ms: Option<f64>,
 }
 
-fn apply_normalizer(
+/// # `total_cost` is MICRO-USD, from every branch, always (#745)
+///
+/// This function is the ONLY writer of `usage_events.total_cost`, and both of its branches must
+/// agree on the unit. They did not, twice, and each time it was an incident:
+///
+/// * `norm.cost_micros` is micro-USD by its own name. It used to be divided by `1_000_000.0`
+///   here, silently making the column dollars for normalizer-backed sources only.
+/// * `extract_f64(attrs, &COST_KEYS)` is the gateway's `llm_custom_total_cost` CEL value, which
+///   is micro-USD and is stored verbatim.
+///
+/// With one branch scaling and the other not, the column held two units distinguished only by
+/// which writer produced the row, and `validate_total_cost_micros` on the budget side cannot tell
+/// them apart — it sees one `f64`. #488 read the column as micro-USD, #737 read it as dollars,
+/// and both were half right. Neither is recoverable by choosing a different constant on the
+/// reading side: the fix is that there is only ever ONE unit written.
+///
+/// If a future normalizer reports cost in anything but micro-USD, convert it INSIDE that
+/// normalizer, not here. `usage_events_total_cost_is_micro_usd_from_every_branch`
+/// (`tests/normalizer_tests.rs`) fails if this branch starts scaling again.
+pub fn apply_normalizer(
     normalizer: Option<crate::normalizer::NormalizerFn>,
     attrs: &HashMap<String, Value>,
     span_meta: &crate::normalizer::SpanMeta,
@@ -491,7 +511,7 @@ fn apply_normalizer(
 
     let total_cost = norm
         .cost_micros
-        .map(|c| c as f64 / 1_000_000.0)
+        .map(|c| c as f64)
         .or_else(|| extract_f64(attrs, &COST_KEYS));
 
     let model = norm.model.or_else(|| extract_string(attrs, &MODEL_KEYS));
@@ -506,7 +526,10 @@ fn apply_normalizer(
     }
 }
 
-fn extract_log_events(payload: ExportLogsServiceRequest, source: &str) -> Vec<UsageEvent> {
+pub(crate) fn extract_log_events(
+    payload: ExportLogsServiceRequest,
+    source: &str,
+) -> Vec<UsageEvent> {
     let mut events = Vec::new();
     let normalizer = crate::normalizer::REGISTRY.get(source);
 
@@ -520,6 +543,7 @@ fn extract_log_events(payload: ExportLogsServiceRequest, source: &str) -> Vec<Us
             for log_record in scope_logs.log_records {
                 let attrs =
                     merge_attr_maps(&resource_attrs, &key_values_to_map(&log_record.attributes));
+                check_identity_mismatch(&attrs, source);
 
                 let observed_nanos = if log_record.time_unix_nano > 0 {
                     log_record.time_unix_nano
@@ -582,7 +606,10 @@ fn is_json_content(headers: &HeaderMap) -> bool {
         .is_some_and(|value| value.contains("json"))
 }
 
-fn extract_trace_events(payload: ExportTraceServiceRequest, source: &str) -> Vec<UsageEvent> {
+pub(crate) fn extract_trace_events(
+    payload: ExportTraceServiceRequest,
+    source: &str,
+) -> Vec<UsageEvent> {
     let mut events = Vec::new();
     let normalizer = crate::normalizer::REGISTRY.get(source);
 
@@ -595,6 +622,7 @@ fn extract_trace_events(payload: ExportTraceServiceRequest, source: &str) -> Vec
         for scope_spans in resource_spans.scope_spans {
             for span in scope_spans.spans {
                 let attrs = merge_attr_maps(&resource_attrs, &key_values_to_map(&span.attributes));
+                check_identity_mismatch(&attrs, source);
 
                 let span_meta = crate::normalizer::SpanMeta {
                     trace_id: (!span.trace_id.is_empty()).then(|| hex::encode(&span.trace_id)),
@@ -649,7 +677,10 @@ fn extract_trace_events(payload: ExportTraceServiceRequest, source: &str) -> Vec
     events
 }
 
-fn extract_metric_events(payload: ExportMetricsServiceRequest, source: &str) -> Vec<UsageEvent> {
+pub(crate) fn extract_metric_events(
+    payload: ExportMetricsServiceRequest,
+    source: &str,
+) -> Vec<UsageEvent> {
     let mut events = Vec::new();
     let normalizer = crate::normalizer::REGISTRY.get(source);
 
@@ -739,6 +770,7 @@ fn number_data_point_to_event(
     normalizer: Option<crate::normalizer::NormalizerFn>,
 ) -> UsageEvent {
     let attrs = merge_attr_maps(metric_attrs, &key_values_to_map(&point.attributes));
+    check_identity_mismatch(&attrs, source);
 
     let value = match point.value {
         Some(number_data_point::Value::AsDouble(v)) => v,
@@ -790,6 +822,7 @@ fn histogram_data_point_to_event(
     normalizer: Option<crate::normalizer::NormalizerFn>,
 ) -> UsageEvent {
     let attrs = merge_attr_maps(metric_attrs, &key_values_to_map(&point.attributes));
+    check_identity_mismatch(&attrs, source);
 
     let count = u64_to_i64(point.count);
     let usage_value = point.sum.unwrap_or(count as f64);
@@ -835,6 +868,7 @@ fn exponential_histogram_data_point_to_event(
     normalizer: Option<crate::normalizer::NormalizerFn>,
 ) -> UsageEvent {
     let attrs = merge_attr_maps(metric_attrs, &key_values_to_map(&point.attributes));
+    check_identity_mismatch(&attrs, source);
 
     let count = u64_to_i64(point.count);
     let usage_value = point.sum.unwrap_or(count as f64);
@@ -880,6 +914,7 @@ fn summary_data_point_to_event(
     normalizer: Option<crate::normalizer::NormalizerFn>,
 ) -> UsageEvent {
     let attrs = merge_attr_maps(metric_attrs, &key_values_to_map(&point.attributes));
+    check_identity_mismatch(&attrs, source);
 
     let count = u64_to_i64(point.count);
 
@@ -1468,9 +1503,7 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
-        // F1 test recipe (research doc §4): `gen_ai.usage.custom_total_cost = 1875` is micro-USD,
-        // so it must produce a spend of 1875 micro-USD = $0.001875, never 1,875,000,000 (F1).
-        assert_eq!(event.total_cost, Some(0.001875));
+        assert_eq!(event.total_cost, Some(1875.0));
         assert_eq!(event.prompt_tokens, Some(100));
         assert_eq!(event.completion_tokens, Some(50));
         assert_eq!(event.total_tokens, Some(150));
@@ -1538,8 +1571,9 @@ mod tests {
         let event = &events[0];
         assert_eq!(
             event.total_cost,
-            Some(0.001875),
-            "a double-valued 1875 micro-USD must read as $0.001875, not $1875 (F1)"
+            Some(1875.0),
+            "a double-valued 1875 micro-USD is STORED as 1875 micro-USD (#745): this column is \
+             micro-USD from every writer, so the value passes through unscaled in both directions"
         );
     }
 
@@ -2652,6 +2686,7 @@ mod tests {
             repo: Arc::new(PartialInsertRepo { persisted: 1 }),
             bearer: Arc::new(RefuseEverythingBearer),
             scope_authority: Arc::new(RefuseEverythingScopeAuthority),
+            ingest_auth: None,
             raw_days: Some(90),
         };
         let events = vec![base_usage_event(), base_usage_event()];

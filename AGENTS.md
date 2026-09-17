@@ -47,8 +47,12 @@ This repository provides API key management plus usage analytics:
   `sub = "svc:<client_id>"`, carries no `roles` claim, and therefore holds zero permissions against
   every RPC op-id.
 - `lightbridge-mcp`: OAuth2/JWT-protected MCP server exposing the authz surface as MCP tools over streamable HTTP (`/mcp`).
-- `lightbridge-authz-usage`: split across two listeners (#347) — an unprotected OTLP/HTTP ingest
-  API (`/v1/otel/traces`, `/v1/otel/metrics`, `/v1/otel/logs`) and an mTLS-required query listener
+- `lightbridge-authz-usage`: split across two listeners (#347) — an ingest listener carrying an
+  unprotected OTLP/HTTP API (`/v1/otel/traces`, `/v1/otel/metrics`, `/v1/otel/logs`, the one
+  deliberate gateway exception) **plus** an authenticated mirror of it,
+  `/auth/v1/otel/*` (#585), mounted only when `ingest_auth` is configured and binding the stored
+  `source` to a `client_credentials` credential rather than to a caller-set header — and an
+  mTLS-required query listener
   serving the usage query API (`/usage/v1/usage/query`, which since #570 also requires an end-user
   bearer token plus an ownership check — see "Security Notes" below) and the budget domain's
   service-to-service spend read (`/usage/v1/spend/query`, mTLS-only) — backed by Timescale/Postgres.
@@ -454,8 +458,10 @@ Tables (see `migrations/`):
   them into the roles claim alongside `ClaimSource::ProjectRole`; `lightbridge-authz rbac grant` is
   the bootstrap writer (there is no admin to grant the first admin). Before this, prod mapped
   `owner -> lightbridge-admin`, which under ADR-0026 minted admin for every signed-in person.
-- `federated_identities` (ADR-0024, corrected 2026-08-25; deliberately absent from `authz.cstack`
-  — see "Persistence" below): keyed by `(issuer, subject)`, the login federation key. Carries the
+- `federated_identities` (ADR-0024, corrected 2026-08-25; ADR-0024 Q4 reversed 2026-09-16 by
+  explicit owner directive, #740 — now modelled in `authz.cstack` with zero `@@allow` clauses,
+  same as `User`; see "Persistence" below): keyed by `(issuer, subject)`, the login federation
+  key. Carries the
   sealed Keycloak token set (`token_envelope`, AES-256-GCM, `lightbridge_authz_core::crypto`) —
   refresh token plus a non-access-token ID-token claims snapshot, never the access token.
   `account_id` is `NOT NULL` (no `user_id` column — the user is always derived) and adopted by AT
@@ -687,6 +693,15 @@ Key config fields:
   `client_cert_path`/`client_key_path`/`timeout_ms` defaulted) for calling `authz-opa`'s
   `POST /idp/v1/authorize-usage-scope` — the ownership authority `/usage/v1/usage/query` calls for
   `account`/`project` scopes (#570).
+- `ingest_auth` (`lightbridge-authz-usage` only, **optional**, `Option<IngestAuthConfig>`): the
+  credential-binding rules for the authenticated ingest surface (#585). Absent, `/auth/v1/otel/*`
+  is not mounted at all and the unauthenticated `/v1/otel/*` stays the only ingest path. Carries
+  `audience` (required, non-empty — the `aud` every token on that surface must name, AC4) and
+  `principals` (required, non-empty — a `sub` → `X-Source` map whose keys must be `svc:`-prefixed
+  and whose values must be `KNOWN_SOURCES` entries). All four of those constraints are enforced in
+  `load_from_path`, so a typo fails config load (and therefore the `migrate` Job) rather than
+  producing per-request 400/403s. See "Security Notes" below for the gate order and ADR-0028 D8 for
+  which sources belong in `principals` (leg-3 out-of-cluster only).
 - `database.url`: Postgres connection string
 - `oauth2.jwks_url`: JWKS endpoint (Keycloak in local compose)
 - `redis.url`: mandatory for `authz-api`, `authz-idp`, `authz-budget` — see below.
@@ -996,6 +1011,22 @@ Traces capture the full lifecycle of a validation request, including database lo
   `crates/lightbridge-authz-budget/src/spend.rs`'s `UsageServiceSpendReader` doc comments for the
   full posture and the fail-closed contract (a rejected/missing/expired client cert resolves to
   `Spend::Unavailable`, never a silent bypass).
+  - **The ingest listener gained an AUTHENTICATED route block in #585:**
+    `/auth/v1/otel/{traces,metrics,logs}`, the credential-bound mirror of `/v1/otel/*` (which
+    stays the one documented exception, AC5). It is mounted only when `ingest_auth` is configured;
+    a request must present a `client_credentials` bearer token that validates against JWKS,
+    carries `caller_kind: service`, and carries an `aud` naming `ingest_auth.audience` — then
+    `X-Source` must equal the source that token's `sub` is mapped to in `ingest_auth.principals`.
+    Every failure mode resolves to `401`/`403`, never to permit, including an unreachable JWKS
+    (AGENTS.md's "Failure modes" rule). Keys must be `svc:`-prefixed and values must be
+    `KNOWN_SOURCES` entries; both are refused at config load, so a typo fails the `migrate` Job
+    rather than surfacing per-request. **Scope is ADR-0028 D8 leg 3 only** — collector-mediated
+    sources (claude-code, codex, opencode) must NOT be listed, because D8 leg 2 says the
+    collector→usage hop carries no second credential; only out-of-cluster sources with no
+    collector in their path belong there. A payload asserting a different `governance.source`/
+    `service.namespace` is warned about and stored with the trusted source, never obeyed
+    (`handlers::payload_identity`, AC4's "alert, never overwrite"). See `docs/usage-api.md`'s
+    "Authenticated ingest" section for the full gate order.
   - **`/usage/v1/usage/query` now ALSO requires an end-user bearer token plus an ownership check
     (#570/#603/#605), closing the cross-tenant gap mTLS alone left open.** On top of mTLS, the
     handler (`crates/lightbridge-authz-usage/src/handlers/query.rs`) requires
@@ -1062,6 +1093,21 @@ Two rules once a collision has happened:
   the record of what actually ran there. The file that moves is the one that has *not* been applied
   anywhere durable. If both have, renumbering is not available and the fix is a new forward
   migration.
+
+  **This rule existed and was still broken (#741, 2026-09-16), so it needs a procedure, not just a
+  statement.** Before renumbering ANY migration, ask the database which file actually holds that
+  version — do not infer it from the repo:
+
+  ```bash
+  kubectl --context hetzner-prod exec -n converse lightbridge-main-db-1 -c postgres --     psql -U postgres -d usage -c     "SELECT version, description, installed_on FROM _sqlx_migrations ORDER BY version DESC LIMIT 10;"
+  ```
+
+  (`-d app` for the authz database.) #733 renumbered `usage_retention_state` off `20260911000001`
+  without checking; production had applied it under that exact version two days earlier, so the
+  version then resolved to a different file with a different checksum, and every subsequent
+  `lightbridge-usage-migrate` run aborted — leaving the usage store with nothing applied since
+  2026-09-11 and the crashloop unnoticed until an operator looked. Match the numbering to what the
+  database already ran, and move the file that has run nowhere.
 - **An applied migration's bytes are frozen.** SQLx stores a checksum per migration and validates
   it on every run, so editing one — *even to add a comment* — aborts the next migrate with a
   version mismatch. Corrections go in the owning ADR, not in the file.
@@ -1115,12 +1161,19 @@ hand-written SQL and direct `sqlx` dependencies.
     `create_hypertable`, `add_retention_policy`, `add_compression_policy`, or `ON CONFLICT
     (composite, including partition column) DO UPDATE`. Justified in the migration headers as an
     ADR-0038 exception per the grain-partitioned time-series + CAS/upsert exception class.
-  - `federated_identities`: deliberately ABSENT from `authz.cstack` entirely, not merely
-    `@@allow`-less -- it carries the sealed Keycloak token envelope, so a credential-bearing table
-    must be unreachable from any generated read path, not just gated behind the coarse-RBAC check
-    a present-but-unallowed model would still have (ADR-0024 Q4; created by
-    `migrations/20260825000001_users_and_federated_identities.sql`; justified in the `User` model
-    comment in `crates/lightbridge-authz-api/schema/authz.cstack`).
+  - `federated_identities`: modelled in `authz.cstack` as `FederatedIdentity` since the ADR-0024
+    Q4 reversal (#740, explicit owner directive) — schema-of-record now, but carrying ZERO
+    `@@allow` clauses, the same two independent deny layers as `User` (cratestack's own
+    no-`@@allow`-means-no-access, plus `rpc_authorize.rs`'s `required_permission` denying any
+    unmapped op-id unconditionally). The sealed Keycloak token envelope
+    (`tokenEnvelope`/`tokenSealedAt`) is still never declared at all — stronger than
+    `@@allow`-less, since a column this model never names cannot be exposed by a future accidental
+    `@@allow`. Every actual read and write still goes through hand-written SQL
+    (`crates/lightbridge-authz-api-key/src/federated_provisioning.rs`, `repo.rs`, and
+    `identity_resolution.rs`'s free-text search over its three display columns), never the
+    generated client — the model exists for policy/documentation, not data access. Justified in
+    the `FederatedIdentity` model comment in
+    `crates/lightbridge-authz-api/schema/authz.cstack`.
   - `accounts`/`projects`, READ-ONLY, for admin identity resolution only (#647): the estate-wide
     label lookups in `crates/lightbridge-authz-api-key/src/identity_resolution.rs`
     (`resolve_account_labels`/`resolve_project_labels`, and the `accounts` hop
@@ -1130,8 +1183,25 @@ hand-written SQL and direct `sqlx` dependencies.
     with no bypass -- an estate-wide admin label lookup is exactly the query that policy cannot
     express, and widening the shared clause would widen `model.Account.list`/`model.Project.list`
     for every other caller too. Gated instead by the dedicated `user:read` permission at the RPC
-    layer; see `docs/admin-identity-resolution.md`. Reads only -- every write to these tables still
-    goes through the generated client or the pre-existing exceptions.
+    layer; see `docs/admin-identity-resolution.md`. Reads only for #647 -- the one WRITE exception
+    is the first-login provisioning entry immediately below.
+  - `accounts`/`projects`, WRITE, at first federated login only (#739):
+    `StoreRepo::upsert_federated_identity_and_provision`
+    (`crates/lightbridge-authz-api-key/src/federated_provisioning.rs`) mints the anchor account and
+    its default project for a grandfather-issuer subject signing in for the first time. Three
+    independent reasons, none of them "not got round to it": (1) it must commit atomically with the
+    `federated_identities` INSERT -- that model is `@@allow`-less and denied unconditionally too
+    (per the entry above) -- and `cratestack-pg` exposes no API for joining a caller-owned `sqlx`
+    transaction; (2) `Account` deliberately carries
+    NO `@@allow("create", ...)`, and `model.Account.create` is denied unconditionally at the RBAC
+    layer besides, because account creation is procedure-only by design (ADR-0006) -- which is why
+    `create_account` and `provision_account` are hand-written too; routing this through the
+    generated client would mean WIDENING `@@allow("create")` on `Account`, exposing account creation
+    as a generic CRUD verb to every caller, which is strictly worse; (3) `Project` DOES carry
+    `@@allow("create", (account.userId == auth().id) && auth().rpcScope == "crud" &&
+    auth().permProjectCreate == true)`, but every conjunct is unsatisfiable on this path: at
+    `/idp/callback` there is no `auth()` context at all -- the caller holds no lightbridge token
+    yet, and obtaining one is precisely what this unblocks.
   - `platform_role_grants` (ADR-0033): who holds a platform role, read at token mint by
     `ClaimSource::PlatformRoles`. Two independent reasons: the hot read runs on the mint path
     inside `authz-idp`, which builds no cratestack client at all; and the grant's idempotency is an
@@ -1163,7 +1233,7 @@ hand-written SQL and direct `sqlx` dependencies.
     (`ON CONFLICT`) semantics that generated CRUD cannot express, in the usage DB which is
     already hand-written SQL (see `usage_events`). Same exception class as `secret_claims`;
     justified in each migration header under `migrations-usage/2026090700000{1,2,3,4}_*.sql`.
-- This repo runs cratestack (`cratestack-pg`) `=0.10.0` (pinned exactly in the root `Cargo.toml`,
+- This repo runs cratestack (`cratestack-pg`) `=0.11.0` (pinned exactly in the root `Cargo.toml`,
   which also documents why the pin cannot float past it -- see that file's `cratestack-core =
   "=0.10.0"` block); ADR-0038's capability findings were verified against 0.7.8. Re-verify any
   capability claim against `0.10.0` here before relying on it -- this line has gone stale at every

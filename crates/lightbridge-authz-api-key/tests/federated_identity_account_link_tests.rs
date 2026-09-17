@@ -392,3 +392,219 @@ async fn the_correction_migration_removes_accountless_rows_and_keeps_adopted_one
         "the adopted account itself must be untouched by the correction migration"
     );
 }
+
+// --- StoreRepo::upsert_federated_identity_and_provision (self-service provisioning restore) ---
+//
+// The incident: ADR-0024's 2026-08-25 correction (above) removed the mint-on-login branch and
+// nothing replaced it for production -- a grandfather-issuer subject with no `accounts` row was
+// permanently refused. `upsert_federated_identity_and_provision` restores self-service
+// provisioning ONLY for that one grandfather issuer; every refusal/conflict rule the tests above
+// pin for `upsert_federated_identity` must survive unchanged in the new method too.
+
+/// Mirror image of `upsert_federated_identity_refuses_a_subject_with_no_account` above, but for
+/// the provisioning-capable method: the ADR-0025 issuer pin must NOT be weakened by the new
+/// provisioning capability. A non-grandfather issuer presenting a subject with no account is still
+/// refused outright -- it must never reach the provisioning branch at all.
+#[sqlx::test(migrations = "../../migrations")]
+async fn provisioning_still_refuses_a_non_grandfather_issuer_with_no_account(pool: PgPool) {
+    let repo = build_repo(pool.clone());
+    let subject = "rogue-issuer-accountless-subject";
+
+    let err = repo
+        .upsert_federated_identity_and_provision(
+            bare_upsert("https://rogue-issuer.example", subject),
+            "https://issuer.example",
+        )
+        .await
+        .expect_err(
+            "a non-grandfather issuer must never trigger self-service provisioning, even for a \
+             subject with no account",
+        );
+    assert!(
+        matches!(err, Error::Forbidden(_)),
+        "expected Error::Forbidden, got {err:?}"
+    );
+
+    let account_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM accounts WHERE id = $1)")
+            .bind(subject)
+            .fetch_one(&pool)
+            .await
+            .expect("checking accounts must succeed");
+    assert!(
+        !account_exists,
+        "a refused non-grandfather login must never provision an account"
+    );
+
+    let fi_count: i64 = sqlx::query_scalar("SELECT count(*) FROM federated_identities")
+        .fetch_one(&pool)
+        .await
+        .expect("counting federated_identities must succeed");
+    assert_eq!(
+        fi_count, 0,
+        "a refused login must leave no federated_identities row behind"
+    );
+}
+
+/// The grandfather issuer provisions a brand new account+project for a never-seen subject
+/// (`provisioned: true`), and reports `provisioned: false` when the account already existed --
+/// the flag `KeycloakRelyingParty::persist_federated_identity` relies on to decide whether the
+/// #697 starting grant needs booking (never for a login that merely adopted an existing account).
+#[sqlx::test(migrations = "../../migrations")]
+async fn provisioning_reports_provisioned_true_only_for_a_brand_new_account(pool: PgPool) {
+    let repo = build_repo(pool.clone());
+
+    let provisioned_subject = "freshly-provisioned-subject";
+    let outcome = repo
+        .upsert_federated_identity_and_provision(
+            bare_upsert("https://issuer.example", provisioned_subject),
+            "https://issuer.example",
+        )
+        .await
+        .expect("a grandfather-issuer subject with no account must be provisioned");
+    assert!(
+        outcome.provisioned,
+        "a never-before-seen subject must be reported as provisioned"
+    );
+    assert_eq!(outcome.row.account_id, provisioned_subject);
+    let project_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM projects WHERE account_id = $1)")
+            .bind(provisioned_subject)
+            .fetch_one(&pool)
+            .await
+            .expect("checking the default project must succeed");
+    assert!(
+        project_exists,
+        "provisioning the account without its default project would still dead-end browser SSO \
+         one step later at find_default_project_id"
+    );
+
+    let existing_subject = "pre-existing-account-subject";
+    repo.create_account(
+        &AccountId::assert_already_resolved(existing_subject),
+        CreateAccount {
+            default_quota: None,
+            name: None,
+        },
+    )
+    .await
+    .expect("account creation must succeed");
+    let outcome = repo
+        .upsert_federated_identity_and_provision(
+            bare_upsert("https://issuer.example", existing_subject),
+            "https://issuer.example",
+        )
+        .await
+        .expect("adopting a pre-existing account must succeed");
+    assert!(
+        !outcome.provisioned,
+        "adopting an account that already existed must report provisioned = false, so the \
+         caller never re-books a starting grant for an already-funded account"
+    );
+}
+
+/// The second-issuer collision guard survives unchanged when the FIRST adoption was itself a
+/// self-service provisioning (a scenario that could not exist before this fix): issuer_a
+/// provisions the account, then issuer_b presenting the SAME subject must be refused with
+/// `Error::Conflict`, never silently merged onto issuer_a's brand new account. Both calls use
+/// their OWN issuer as their OWN grandfather_issuer, mirroring two independently-configured
+/// `KeycloakRelyingParty` instances (`persist_federated_identity` always passes `self.issuer`).
+#[sqlx::test(migrations = "../../migrations")]
+async fn provisioning_second_issuer_collision_is_still_a_conflict(pool: PgPool) {
+    let repo = build_repo(pool.clone());
+    let subject = "provisioned-then-colliding-subject";
+
+    let first = repo
+        .upsert_federated_identity_and_provision(
+            bare_upsert("https://issuer-a.example", subject),
+            "https://issuer-a.example",
+        )
+        .await
+        .expect("issuer_a must provision a brand new account for a never-seen subject");
+    assert!(first.provisioned);
+    assert_eq!(first.row.account_id, subject);
+
+    let err = repo
+        .upsert_federated_identity_and_provision(
+            bare_upsert("https://issuer-b.example", subject),
+            "https://issuer-b.example",
+        )
+        .await
+        .expect_err("issuer_b presenting the same subject must be refused, not merged");
+    assert!(
+        matches!(err, Error::Conflict(_)),
+        "expected Error::Conflict, got {err:?}"
+    );
+
+    let fi_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM federated_identities WHERE subject = $1")
+            .bind(subject)
+            .fetch_one(&pool)
+            .await
+            .expect("counting federated_identities must succeed");
+    assert_eq!(
+        fi_count, 1,
+        "issuer_b's refused attempt must leave exactly issuer_a's row behind, never a second \
+         merged row"
+    );
+}
+
+/// The decided `billing_identity` rule (do not change without a new ADR): the ID token's `email`
+/// is used ONLY when `email_verified == Some(true)`; every other shape -- no email at all, or an
+/// email present but not verified -- falls back to `subject` verbatim. `projects.billing_identity`
+/// is globally UNIQUE, so trusting an unverified email would let one user squat another's billing
+/// identity before ever proving they own it; `subject` is always safe because it is unique and
+/// non-squattable, which is what keeps a user with no verified email from being locked out a
+/// second way.
+#[sqlx::test(migrations = "../../migrations")]
+async fn provisioning_billing_identity_is_the_subject_unless_email_is_verified(pool: PgPool) {
+    let repo = build_repo(pool.clone());
+
+    async fn billing_identity_for(pool: &PgPool, subject: &str) -> String {
+        sqlx::query_scalar("SELECT billing_identity FROM projects WHERE account_id = $1")
+            .bind(subject)
+            .fetch_one(pool)
+            .await
+            .expect("the provisioned default project must exist")
+    }
+
+    let no_email_subject = "no-email-claim-subject";
+    repo.upsert_federated_identity_and_provision(
+        bare_upsert("https://issuer.example", no_email_subject),
+        "https://issuer.example",
+    )
+    .await
+    .expect("provisioning with no email claim at all must still succeed");
+    assert_eq!(
+        billing_identity_for(&pool, no_email_subject).await,
+        no_email_subject,
+        "no email claim at all must fall back to the subject"
+    );
+
+    let unverified_subject = "unverified-email-claim-subject";
+    let mut unverified_input = bare_upsert("https://issuer.example", unverified_subject);
+    unverified_input.email = Some("unverified@example.test".to_string());
+    unverified_input.email_verified = Some(false);
+    repo.upsert_federated_identity_and_provision(unverified_input, "https://issuer.example")
+        .await
+        .expect("provisioning with an unverified email must still succeed");
+    assert_eq!(
+        billing_identity_for(&pool, unverified_subject).await,
+        unverified_subject,
+        "an email present but NOT verified must fall back to the subject, never the email -- \
+         trusting it would let one user squat another's billing identity before proving they own it"
+    );
+
+    let verified_subject = "verified-email-claim-subject";
+    let mut verified_input = bare_upsert("https://issuer.example", verified_subject);
+    verified_input.email = Some("verified@example.test".to_string());
+    verified_input.email_verified = Some(true);
+    repo.upsert_federated_identity_and_provision(verified_input, "https://issuer.example")
+        .await
+        .expect("provisioning with a verified email must succeed");
+    assert_eq!(
+        billing_identity_for(&pool, verified_subject).await,
+        "verified@example.test",
+        "a verified email must become the billing identity"
+    );
+}

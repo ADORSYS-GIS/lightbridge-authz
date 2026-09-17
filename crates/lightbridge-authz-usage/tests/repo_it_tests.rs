@@ -391,6 +391,7 @@ async fn healthz_ready_reports_ok_against_a_live_database(pool: PgPool) {
         repo,
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        ingest_auth: None,
         raw_days: Some(90),
     });
     let app = build_ingest_router(state, readiness_pool, false);
@@ -1412,6 +1413,7 @@ async fn ingest_must_not_log_the_request_body_and_must_not_log_at_info(pool: PgP
         repo: Arc::new(build_repo(pool)),
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        ingest_auth: None,
         raw_days: Some(90),
     });
     let app = build_ingest_router(state, readiness_pool, false);

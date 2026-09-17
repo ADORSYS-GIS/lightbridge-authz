@@ -102,6 +102,33 @@ config:
     rawDays: 90
     rollupDays: 365
     intervalSeconds: 3600
+  # #585: the authenticated ingest surface, POST /auth/v1/otel/{traces,metrics,logs}.
+  #
+  # DISABLED by default, and that default is load-bearing: with `enabled: false` no `ingest_auth`
+  # block is rendered at all, the config still loads (`UsageConfig::ingest_auth` is optional), and
+  # `/auth/v1/otel/*` is simply not mounted. A chart upgrade to a version carrying this support
+  # therefore cannot change any existing deployment's surface.
+  #
+  # Enabling it requires a real machine credential to exist first: a `type: service`
+  # (`client_credentials`, #534/ADR-0030) client registered on `authz-idp`, whose
+  # `allowed_audiences` lists `audience` below, and whose minted `sub` is `svc:<that client_id>`.
+  # Until one does, turning this on mounts routes that refuse every request (401/403) --
+  # fail-closed, never open.
+  #
+  # `principals` maps that `svc:`-prefixed `sub` to the ONE `X-Source` it may assert. Per ADR-0028
+  # D8 this block belongs to LEG-3 sources only -- out-of-cluster callers with no edge collector in
+  # their path. Collector-mediated sources (claude-code, codex, opencode) must NOT be listed here:
+  # D8 leg 2 says the collector->usage hop carries no second credential. See `config/usage.yaml`
+  # for the full rationale.
+  ingestAuth:
+    enabled: false
+    # The audience every token on this surface must name (AC4). This is the value authz-idp is
+    # asked for via the RFC 8707 `audience` parameter at the token endpoint.
+    audience: "lightbridge-usage-ingest"
+    principals: {}
+    # principals:
+    #   "svc:collector-github-copilot": "github-copilot"
+    #   "svc:collector-microsoft-foundry": "microsoft-foundry"
 
 controllers:
   main:
@@ -329,6 +356,22 @@ configMaps:
           {{- with .Values.config.scopeAuthority.caBundlePath }}
           ca_bundle_path: {{ . | quote }}
           {{- end }}
+        # #585: the authenticated ingest surface. Rendered ONLY when explicitly enabled -- see
+        # `.Values.config.ingestAuth` above for why the default is off, and for the prerequisite a
+        # real `type: service` authz-idp client that this config only makes sense alongside.
+        #
+        # Both keys are validated at config load: a principal not `svc:`-prefixed, a value outside
+        # `normalizer::KNOWN_SOURCES`, or an empty `audience`/`principals` fails the `migrate` Job
+        # (sync-wave 1, before `main`'s wave 2) and therefore the whole ArgoCD app sync -- not a
+        # per-request 400/403 discovered later.
+        {{- if .Values.config.ingestAuth.enabled }}
+        ingest_auth:
+          audience: {{ .Values.config.ingestAuth.audience | quote }}
+          principals:
+          {{- range $sub, $source := .Values.config.ingestAuth.principals }}
+            {{ $sub | quote }}: {{ $source | quote }}
+          {{- end }}
+        {{- end }}
         # #549 AC2: retention/rollup for usage_events. Shipped uncommented so the knob is visible
         # in the rendered config. The job is OFF by default (rollback safety -- it moves rows out
         # of usage_events into usage_events_daily, which the previous image's spend_for_account

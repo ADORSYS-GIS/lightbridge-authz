@@ -119,7 +119,8 @@ async fn authorize(
     // authentication at the token endpoint does not address (that proves who redeemed the code,
     // not that the code belongs to the session redeeming it). `client.require_pkce` is validated
     // to always be `true` for authorization_code clients at startup
-    // (`validate_authorization_code_clients` in `lib.rs`), but this check does not read that flag
+    // (`validate_authorization_code_clients` in `oauth2_client_validation.rs`), but this check
+    // does not read that flag
     // at all: it is unconditional defense-in-depth, so a config that somehow reached this endpoint
     // with `require_pkce: false` still can never start a codeless-challenge authorization_code
     // flow.

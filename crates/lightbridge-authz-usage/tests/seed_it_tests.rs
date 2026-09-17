@@ -31,6 +31,7 @@ fn build_state(pool: PgPool) -> Arc<UsageState> {
         repo,
         bearer: support::trust_no_one_bearer(),
         scope_authority: support::refuse_everything_scope_authority(),
+        ingest_auth: None,
         raw_days: None,
     })
 }
@@ -175,10 +176,9 @@ async fn seed_then_query_returns_totals_equal_to_what_was_seeded(pool: PgPool) {
                     index,
                 ));
                 index += 1;
-                // `cost` above is micro-USD, the wire unit; merge_norm_tokens_and_cost (ingest.rs)
-                // divides by 1e6 before storing/returning total_cost in dollars -- match that here,
-                // or this reproduces the exact "F1" 10^6 unit bug the comment above warns about.
-                expected_total_cost += cost / 1_000_000.0;
+                // `cost` above is micro-USD, and since #745 that is also the STORED unit --
+                // apply_normalizer (ingest.rs) no longer divides, so no conversion belongs here.
+                expected_total_cost += cost;
                 expected_total_tokens += prompt + completion;
                 expected_requests += 1;
             }

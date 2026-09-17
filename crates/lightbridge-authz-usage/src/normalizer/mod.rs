@@ -80,13 +80,24 @@ impl NormalizerRegistry {
 
 pub static REGISTRY: LazyLock<NormalizerRegistry> = LazyLock::new(NormalizerRegistry::build);
 
-/// Extracts and validates the trusted source from the authenticated channel.
+/// Extracts and validates the source named by the `X-Source` HTTP header, never from payload
+/// resource attributes a caller could forge.
 ///
-/// AC4 status (#584): the source is read from the `X-Source` HTTP header, never from payload
-/// resource attributes a caller could forge. Because the ingest listener is itself still
-/// unauthenticated (#585), the header is provisional -- any client can currently set any known
-/// value. This is the acknowledged interim until #585 lands; the payload-identity-mismatch
-/// "alert, never overwrite" half of AC4 is deferred to that story too.
+/// What that header is *worth* depends entirely on which door the request came through, and the
+/// two doors differ deliberately (#585 AC5):
+///
+/// - **`/auth/v1/otel/*` (authenticated, #585).** The header is only a claimed value here too,
+///   but the caller must present a machine credential whose `aud` names the endpoint and who is
+///   mapped to exactly this source -- see `handlers::auth_ingest::credential`. A client cannot
+///   assert a source it is not entitled to.
+/// - **`/v1/otel/*` (unauthenticated).** Still provisional: any client that can reach the
+///   listener can set any known value. That is the acknowledged gateway exception, sound only
+///   under the `ClusterIP`-only/no-ingress casing documented in `AGENTS.md`'s Security Notes and
+///   `docs/usage-api.md`, and its sole intended emitter is the AI gateway's Envoy access-log sink
+///   (always `eaig`).
+///
+/// Either way the payload's own idea of who it is gets checked but never trusted -- the
+/// "alert, never overwrite" half of AC4 lives in `handlers::payload_identity`.
 pub fn resolve_source(headers: &HeaderMap) -> Result<&'static str> {
     let source_header = headers
         .get("x-source")

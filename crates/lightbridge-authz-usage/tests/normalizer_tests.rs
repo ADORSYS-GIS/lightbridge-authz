@@ -2,8 +2,10 @@ use std::collections::HashMap;
 
 use axum::http::{HeaderMap, HeaderValue};
 use lightbridge_authz_core::Error;
+use lightbridge_authz_usage_rest::handlers::ingest::apply_normalizer;
 use lightbridge_authz_usage_rest::normalizer::{
-    KNOWN_SOURCES, REGISTRY, SpanMeta, combine_token_total, resolve_source, usd_to_micros,
+    KNOWN_SOURCES, NormalizedRecord, REGISTRY, SpanMeta, combine_token_total, resolve_source,
+    usd_to_micros,
 };
 use serde_json::{Value, json};
 
@@ -450,4 +452,60 @@ fn test_combine_token_total_covers_every_combination() {
     assert_eq!(combine_token_total(None, Some(4)), Some(4));
     assert_eq!(combine_token_total(None, None), None);
     assert_eq!(combine_token_total(Some(i64::MAX), Some(1)), None);
+}
+
+/// #745, the regression guard for a unit that has now drifted twice.
+///
+/// `apply_normalizer` is the only writer of `usage_events.total_cost`, and BOTH of its branches
+/// must emit micro-USD. It used to divide the normalizer branch by `1_000_000.0`, which made the
+/// column's unit depend on which writer produced the row -- unrecoverable on the reading side,
+/// where `validate_total_cost_micros` sees only a bare `f64`. That is why #488 (read as
+/// micro-USD) and #737 (read as dollars) were each half right, and why #737 drove 40 of 49
+/// production accounts to `budget_exhausted` on 2026-09-16.
+///
+/// Both branches are asserted here against the SAME input value, so the test fails if either one
+/// starts scaling independently of the other.
+#[test]
+fn usage_events_total_cost_is_micro_usd_from_every_branch() {
+    let span_meta = SpanMeta {
+        trace_id: None,
+        span_id: None,
+        start_time_unix_nano: 0,
+        end_time_unix_nano: 0,
+        name: "test".to_string(),
+    };
+
+    let normalizer_branch = apply_normalizer(
+        Some(
+            |_attrs: &HashMap<String, Value>, _meta: &SpanMeta| NormalizedRecord {
+                cost_micros: Some(1_875),
+                ..NormalizedRecord::default()
+            },
+        ),
+        &HashMap::new(),
+        &span_meta,
+    );
+    assert_eq!(
+        normalizer_branch.total_cost,
+        Some(1_875.0),
+        "the normalizer branch must store `cost_micros` verbatim -- dividing it by 1_000_000.0 \
+         makes this column dollars for normalizer-backed sources only, which is the #745 incident"
+    );
+
+    let cel_branch = apply_normalizer(
+        None,
+        &HashMap::from([("gen_ai.usage.custom_total_cost".to_string(), json!(1_875.0))]),
+        &span_meta,
+    );
+    assert_eq!(
+        cel_branch.total_cost,
+        Some(1_875.0),
+        "the gateway CEL branch is micro-USD and is stored verbatim"
+    );
+
+    assert_eq!(
+        normalizer_branch.total_cost, cel_branch.total_cost,
+        "both writers must agree on the unit for the same value -- a column whose unit depends on \
+         its writer cannot be read correctly by any single constant on the budget side"
+    );
 }

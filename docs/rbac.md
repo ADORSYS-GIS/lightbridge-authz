@@ -504,7 +504,8 @@ listed here is denied unconditionally (fail closed).**
 `authz.cstack` carries no `@@allow` clause at all (same precedent as `Session`), so every generic
 `model.User.*` verb is denied unconditionally by the rule above; no new entry was needed here or
 in `rpc_authorize.rs`. `federated_identities` has no RPC surface either, and never will through the
-generated CRUD path — it is deliberately absent from `authz.cstack` entirely (see
+generated CRUD path — since #739 it IS modelled (as `FederatedIdentity`) but likewise carries no
+`@@allow` clause at all, and its two credential columns are not declared on the model (see
 [`docs/architecture/data-model.md`](./architecture/data-model.md#users-and-federated-identities-adr-0024-corrected-2026-08-25)).
 
 **Every `budget:*` row below is served at `POST /budget/rpc/{op_id}` on the separate
@@ -811,14 +812,77 @@ not list is refused before dispatch. The `@@allow("read", ...)` clause above exi
 `account:create` (`procedure.createAccount`) is self-service only — it mints an account for
 `auth().id`, the caller's own identity; there is no subject field on its input at all, so it is
 structurally incapable of targeting anyone but the caller (same shape as `revokeOwnSessions`
-above). This leaves no way for anyone to give a *different*, brand-new Keycloak subject their first
-account: `authz-idp`'s `/idp/callback` refuses to complete sign-in for a subject with no `accounts`
-row (ADR-0024's 2026-08-25 correction removed the old mint-on-login branch), and ADR-0025's
-`NoAccount` self-service bootstrap fallback — a brand-new subject's own raw Keycloak bearer token
-calling `createAccount` directly — turns out to be unreachable in production, since `authz-api`'s
-bearer middleware there validates against `authz-idp`'s own JWKS, not Keycloak's. Before
-`provisionAccount` existed, the only remedy was a manual SQL `INSERT` against production
+above). This leaves no way for `createAccount` itself to give a *different*, brand-new Keycloak
+subject their first account.
+
+`authz-idp`'s `/idp/callback` used to refuse sign-in outright for a subject with no `accounts` row
+(ADR-0024's 2026-08-25 correction removed the old mint-on-login branch, and nothing replaced it for
+production — measured against hetzner-prod, 42 of 96 enabled `camer-digital` Keycloak users were
+permanently blocked this way). The callback now self-service-provisions the ONE grandfather issuer's
+first-time subjects: `StoreRepo::upsert_federated_identity_and_provision`
+(`crates/lightbridge-authz-api-key/src/federated_provisioning.rs`) provisions the anchor account and
+its default project inline, in the same transaction, gated on the identical ADR-0025 issuer pin
+`upsert_federated_identity` already enforced for adoption — a subject presented by any OTHER issuer
+is still refused exactly as before, never provisioned. `billing_identity` is the ID token's `email`
+only when `email_verified == Some(true)`; every other shape falls back to the subject, which is
+unique and non-squattable, rather than ever trusting an unverified email. ADR-0025's `NoAccount`
+self-service bootstrap fallback — a brand-new subject's own raw Keycloak bearer token calling
+`createAccount` directly — remains unreachable in production, since `authz-api`'s bearer middleware
+there validates against `authz-idp`'s own JWKS, not Keycloak's; `provisionAccount` (below) remains
+the admin remedy for every subject the callback itself cannot self-service provision — a
+non-grandfather issuer, or a service account — the same gap that, before `provisionAccount` existed,
+had no remedy but a manual SQL `INSERT` against production
 ([#720](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/720)).
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant B as Browser / device
+    participant IDP as authz-idp
+    participant KC as Keycloak
+    participant DB as Postgres
+
+    B->>KC: authenticate
+    KC-->>IDP: 303 /idp/callback?code
+    IDP->>IDP: validate_id_token (iss, aud, nonce)<br/>relying_party.rs:760
+    IDP->>DB: upsert_federated_identity_and_provision<br/>federated_provisioning.rs:41
+    alt issuer is NOT the grandfather issuer
+        DB-->>IDP: Forbidden (ADR-0025 pin, unchanged)
+        IDP-->>B: 303 /ui/error
+    else no accounts row, grandfather issuer
+        DB->>DB: INSERT accounts + default project<br/>(same transaction)
+        DB-->>IDP: outcome.provisioned = true
+        IDP->>DB: book_starting_grant (#697, fail-soft)
+        IDP-->>B: signed in
+    else accounts row exists
+        DB-->>IDP: outcome.provisioned = false
+        IDP-->>B: signed in (budget untouched)
+    end
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> Authenticated: Keycloak login ok
+    Authenticated --> Refused: issuer is not the grandfather issuer
+    Authenticated --> Refused: subject already adopted by another issuer
+    Authenticated --> Adopted: accounts row exists
+    Authenticated --> Provisioned: no accounts row, grandfather issuer
+
+    Provisioned --> Funded: starting grant booked
+    Provisioned --> Unfunded: grant failed (logged, login still succeeds)
+    Funded --> [*]
+    Unfunded --> [*]
+    Adopted --> [*]
+    Refused --> [*]: 303 /ui/error
+
+    note right of Provisioned
+        Before this change this transition did not exist:
+        every first-time subject fell to Refused.
+        Unfunded is deliberately reachable - an unbookable
+        grant must not turn one accountless subject into
+        one account that cannot sign in at all.
+    end note
+```
 
 **`procedure.provisionAccount`** (gated `account:provision`, admin-only via `lightbridge-admin`'s
 `*` — never granted to `lightbridge-editor`/`lightbridge-viewer`, unlike `account:create`) is the

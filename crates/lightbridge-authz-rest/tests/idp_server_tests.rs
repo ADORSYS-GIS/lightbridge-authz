@@ -653,6 +653,14 @@ fn working_relying_party() -> lightbridge_authz_core::config::OidcRelyingParty {
 fn offline_relying_party(
     repo: Arc<StoreRepo>,
 ) -> Arc<lightbridge_authz_rest::relying_party::KeycloakRelyingParty> {
+    // Reuses `repo`'s own already-wrapped `Arc<dyn DbPoolTrait>` (a cheap Arc clone) rather than
+    // asking every caller of this helper to thread a second, separate `pool: PgPool` through just
+    // for this constructor argument.
+    let starting_grant = Arc::new(lightbridge_authz_budget::StartingGrantService::new(
+        repo.pool.clone(),
+        lightbridge_authz_rest::budget_services::BUDGET_POLICY_SET_ID,
+        lightbridge_authz_rest::budget_services::BUDGET_POLICY_EVALUATION_BUDGET,
+    ));
     Arc::new(
         lightbridge_authz_rest::relying_party::KeycloakRelyingParty::new(
             working_relying_party(),
@@ -660,6 +668,7 @@ fn offline_relying_party(
             WORKING_ISSUER.to_string(),
             repo,
             Arc::new(cratestack_axum::ratelimit::InMemoryRateLimitStore::new()),
+            starting_grant,
             None,
         )
         .expect("working_relying_party() is a valid offline config"),
@@ -2553,7 +2562,8 @@ mod db {
         }
     }
 
-    /// Follow-up to PR #466's review finding: `validate_authorization_code_clients` (`lib.rs`)
+    /// Follow-up to PR #466's review finding: `validate_authorization_code_clients`
+    /// (`oauth2_client_validation.rs`)
     /// used to gate the PKCE+redirect_uri requirement on `client_type == OauthClientType::Public`
     /// alone, so a Confidential client configured with the `authorization_code` grant and
     /// `require_pkce: false` started up cleanly -- and could then complete a full non-PKCE
