@@ -90,7 +90,7 @@ fn extract_day_grain(
                         return Err(Error::BadRequest(
                             "day-grain record missing report attribute".into(),
                         ));
-None => { /* per-record: skip and note in response */ facts.push(f); ... } — either resolve by dropping the `None => return Err` branch and count skipped records, or rewrite the normalizer doc to say a non-report record aborts the request.
+                    }
                 }
             }
         }
