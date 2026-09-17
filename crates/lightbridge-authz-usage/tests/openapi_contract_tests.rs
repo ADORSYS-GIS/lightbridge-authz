@@ -320,6 +320,94 @@ fn usage_openapi_should_publish_execution_schema_with_nullable_total_cost() {
     );
 }
 
+/// #728: pins the seat-grain query endpoint in the published OpenAPI doc, the same seam
+/// `usage_openapi_should_publish_execution_query_path` guards for the execution endpoint -- a
+/// client generated from `openapi/usage.backend.yaml` needs this path to exist to ever call it.
+#[test]
+fn usage_openapi_should_publish_seat_query_path() {
+    let doc = usage_openapi();
+    let paths = doc["paths"]
+        .as_object()
+        .expect("openapi paths should be an object");
+    assert!(
+        paths.contains_key("/usage/v1/usage/seats/query"),
+        "expected the seat query endpoint in openapi paths"
+    );
+}
+
+/// #728: pins the 401/403 responses the seat query endpoint documents, mirroring
+/// `usage_openapi_should_publish_execution_query_auth_responses` -- a silent regression back to
+/// "no auth check documented" fails here first.
+#[test]
+fn usage_openapi_should_publish_seat_query_auth_responses() {
+    let doc = usage_openapi();
+    let responses = &doc["paths"]["/usage/v1/usage/seats/query"]["post"]["responses"];
+
+    assert!(
+        responses.get("401").is_some(),
+        "expected /usage/v1/usage/seats/query to document a 401 response"
+    );
+    assert!(
+        responses.get("403").is_some(),
+        "expected /usage/v1/usage/seats/query to document a 403 response"
+    );
+}
+
+/// #728: pins the `SeatSnapshotSeriesPoint` schema -- every field the console renders, including
+/// the `seat_state` echo that makes a grouped response distinguishable. A client generated from
+/// `openapi/usage.backend.yaml` needs these fields to exist to render a seat chart.
+#[test]
+fn usage_openapi_should_publish_seat_schema() {
+    let doc = usage_openapi();
+    let point = &doc["components"]["schemas"]["SeatSnapshotSeriesPoint"]["properties"];
+
+    for field in [
+        "bucket_start",
+        "source",
+        "subject_kind",
+        "subject_id",
+        "seat_state",
+        "seat_count",
+        "active_count",
+        "pending_cancellation_count",
+    ] {
+        assert!(
+            point.get(field).is_some(),
+            "expected SeatSnapshotSeriesPoint.{field} in the published schema"
+        );
+    }
+
+    // `seat_state` is an optional echo (present only when grouped), so it must not be required.
+    let required: Vec<&str> = doc["components"]["schemas"]["SeatSnapshotSeriesPoint"]["required"]
+        .as_array()
+        .expect("SeatSnapshotSeriesPoint should declare required fields")
+        .iter()
+        .filter_map(|value| value.as_str())
+        .collect();
+    assert!(
+        !required.contains(&"seat_state"),
+        "seat_state must stay optional (nullable) in the published schema, got {required:?}"
+    );
+}
+
+/// #728: pins the `SeatGroupBy` enum values -- the console's client contract for what a seat
+/// query can be grouped by.
+#[test]
+fn usage_openapi_should_publish_seat_group_by_contract() {
+    let doc = usage_openapi();
+    let group_by: Vec<&str> = doc["components"]["schemas"]["SeatGroupBy"]["enum"]
+        .as_array()
+        .expect("SeatGroupBy should publish an enum")
+        .iter()
+        .filter_map(|value| value.as_str())
+        .collect();
+    assert_eq!(
+        group_by,
+        vec!["source", "subject_kind", "subject_id", "seat_state"],
+        "SeatGroupBy's published values are the console's client contract"
+    );
+}
+
 /// #727: pins the day-facts grain query endpoint in the published OpenAPI doc, the same seam
 /// `usage_openapi_should_publish_execution_query_path` guards for the execution endpoint -- a
 /// client generated from `openapi/usage.backend.yaml` needs this path to exist to ever call it.
