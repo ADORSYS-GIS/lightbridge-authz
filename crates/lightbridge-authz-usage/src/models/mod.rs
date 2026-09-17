@@ -2,9 +2,10 @@ use chrono::{DateTime, Utc};
 use lightbridge_authz_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
-
+pub mod day_fact;
 pub mod day_seat;
 pub mod execution;
+pub mod seat;
 #[derive(Debug, Serialize, ToSchema)]
 pub struct IngestResponse {
     pub accepted_events: usize,
@@ -318,7 +319,6 @@ fn default_bucket() -> String {
 fn default_limit() -> u32 {
     1_000
 }
-
 /// Request body for the internal, mTLS-protected `/usage/v1/spend/query` endpoint (the query
 /// listener requires and verifies a client certificate -- see `UsageServerGroup::query`'s doc
 /// comment; this route carries no Basic-auth or bearer check of its own). Answers

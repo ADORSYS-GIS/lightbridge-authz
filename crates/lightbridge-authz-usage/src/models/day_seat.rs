@@ -14,7 +14,9 @@
 /// `SubjectKind::as_str()` — are kept in lockstep with the migrations' CHECK tokens by
 /// `subject_kind_vocabulary_stays_in_lockstep_with_the_live_check` in
 /// `tests/day_seat_grain_it_tests.rs`, which reads the CHECK definition back from the database.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum SubjectKind {
     Org,

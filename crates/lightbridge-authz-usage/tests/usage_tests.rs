@@ -78,6 +78,26 @@ impl UsageRepoTrait for MockUsageRepo {
         Ok((self.execution_points.clone(), self.execution_truncated))
     }
 
+    async fn query_seat_snapshots(
+        &self,
+        _input: &lightbridge_authz_usage_rest::models::seat::SeatSnapshotQueryRequest,
+    ) -> Result<(
+        Vec<lightbridge_authz_usage_rest::models::seat::SeatSnapshotSeriesPoint>,
+        bool,
+    )> {
+        Ok((vec![], false))
+    }
+
+    async fn query_day_facts(
+        &self,
+        _input: &lightbridge_authz_usage_rest::models::day_fact::DayFactQueryRequest,
+    ) -> Result<(
+        Vec<lightbridge_authz_usage_rest::models::day_fact::DayFactSeriesPoint>,
+        bool,
+    )> {
+        Ok((vec![], false))
+    }
+
     async fn spend_for_account(
         &self,
         _account_id: &str,
