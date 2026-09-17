@@ -219,6 +219,7 @@ thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "serde", "serde_json"] }
+tracing-test = "0.2"
 opentelemetry = { version = "0.32" }
 opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic", "tokio"] }
 opentelemetry-proto = "0.32"

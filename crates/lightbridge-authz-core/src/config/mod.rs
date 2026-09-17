@@ -1165,6 +1165,7 @@ pub struct JwtSigning {
 pub mod budget_internal;
 pub mod budget_server;
 pub mod claim_mapper;
+mod unknown_keys;
 
 /// Re-exported from [`crate::config::claim_mapper`], which holds both types. Split out only to
 /// keep this file inside its LoC-gate baseline; see that module's own doc comment.
@@ -1322,7 +1323,11 @@ fn default_exchange_allowed_scopes() -> Vec<String> {
 }
 
 pub fn load_from_path<P: AsRef<std::path::Path>>(path: P) -> Result<Config> {
-    load_yaml_from_path(path)
+    let content = read_to_string(path.as_ref())?;
+    let interpolated = interpolate_env_vars(&content);
+    let cfg: Config = from_str(&interpolated)?;
+    unknown_keys::warn_unknown_keys_in_config(&interpolated);
+    Ok(cfg)
 }
 
 pub fn load_yaml_from_path<T, P>(path: P) -> Result<T>

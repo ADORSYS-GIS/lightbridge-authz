@@ -426,3 +426,51 @@ fn claim_mappers_default_to_empty_when_absent() {
     .expect("a signing block without claim_mappers must still parse");
     assert!(signing.claim_mappers.is_empty());
 }
+
+#[test]
+#[tracing_test::traced_test]
+fn load_from_path_warns_on_unknown_and_deprecated_keys() {
+    let default_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/default.yaml");
+    let content = fs::read_to_string(&default_path).expect("default.yaml should exist");
+
+    let yaml = content
+        .replace("server:", "unknown_top_level_key: foo\nserver:")
+        .replace("  signing:", "  signing:\n    unknown_signing_key: bar")
+        .replace(
+            "  relying_party:",
+            "  relying_party:\n    issuer: \"https://example.com\"",
+        );
+
+    let path = unique_temp_path("unknown-keys");
+    fs::write(&path, yaml).expect("temp file should write");
+
+    let config = load_from_path(&path);
+    assert!(
+        config.is_ok(),
+        "config with unknown/deprecated keys must still load successfully"
+    );
+
+    assert!(logs_contain(
+        "Unknown configuration key 'unknown_top_level_key' ignored"
+    ));
+    assert!(logs_contain(
+        "Unknown configuration key 'oauth2.signing.unknown_signing_key' ignored"
+    ));
+    assert!(logs_contain(
+        "Configuration key 'oauth2.relying_party.issuer' is deprecated: use oauth2.federation.issuer instead"
+    ));
+
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+#[tracing_test::traced_test]
+fn load_from_path_clean_config_produces_no_unknown_key_warnings() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/default.yaml");
+    let config = load_from_path(&path);
+    assert!(config.is_ok(), "default.yaml must load successfully");
+
+    assert!(!logs_contain("Unknown configuration key"));
+    assert!(!logs_contain("is deprecated"));
+}
