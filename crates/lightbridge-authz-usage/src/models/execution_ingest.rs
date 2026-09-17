@@ -12,7 +12,7 @@ use chrono::{DateTime, Utc};
 /// One normalized `usage_executions` row — either a real execution span or a stub minted on
 /// first sight of a child (see the `20260907000002_usage_executions.sql` header for the
 /// stub-before-parent contract).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ExecutionRecord {
     pub source: String,
     pub trace_id: String,
@@ -34,7 +34,7 @@ pub struct ExecutionRecord {
 
 /// One normalized `usage_model_calls` row. `span_id` is the model call's OWN span, not the
 /// parent execution's; `execution_id` is the derived parent id.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ModelCallRecord {
     pub source: String,
     pub trace_id: String,
@@ -49,7 +49,7 @@ pub struct ModelCallRecord {
 
 /// One normalized `usage_tool_calls` row. `span_id` is the tool call's OWN span;
 /// `execution_id` is the derived parent id. `duration_ms` is `NOT NULL` in the schema.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ToolCallRecord {
     pub source: String,
     pub trace_id: String,
@@ -62,7 +62,7 @@ pub struct ToolCallRecord {
 
 /// The full set of rows one OTLP trace export normalizes to. `executions` already includes any
 /// stubs the normalizer minted for children whose parent execution is not in the same batch.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ExecutionGrainBatch {
     pub executions: Vec<ExecutionRecord>,
     pub model_calls: Vec<ModelCallRecord>,

@@ -3,17 +3,16 @@
 //! dedup.
 //!
 //! ADR-0038 persistence exception, same class as `usage_events` and the day-grain upserts: a
-//! natural-key upsert with `ON CONFLICT` that generated CRUD cannot express. The usage DB is
-//! already hand-written SQL.
+//! natural-key upsert with `ON CONFLICT` that generated CRUD cannot express.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::{Error, Result};
-use sqlx::{PgPool, Postgres, QueryBuilder, Transaction};
+use sqlx::{PgPool, Postgres, QueryBuilder, Row, Transaction};
 
 use crate::models::execution_ingest::{
-    ExecutionGrainBatch, execution_id, model_call_id, tool_call_id,
+    ExecutionGrainBatch, ExecutionRecord, execution_id, model_call_id, tool_call_id,
 };
 
 /// Upsert an execution-grain batch in ONE transaction.
@@ -38,34 +37,50 @@ pub async fn upsert_execution_grain(pool: &PgPool, batch: &ExecutionGrainBatch) 
 
 /// Mint (or reuse) a `usage_identities` row per distinct `(source, provider_user_id)` and return
 /// the `(source, subject_id) -> id` map. Provider user ids are preserved verbatim (AC3 — no
-/// shape validation). Dedup is `ON CONFLICT (source, subject_kind, subject_id) DO UPDATE ...
-/// RETURNING id`, which returns the existing id on re-assertion.
+/// shape validation). Minted in ONE batched statement (not one round-trip per identity), with
+/// `ON CONFLICT (source, subject_kind, subject_id) DO UPDATE ... RETURNING id` reusing existing ids.
 async fn mint_identities(
     tx: &mut Transaction<'_, Postgres>,
     batch: &ExecutionGrainBatch,
 ) -> Result<HashMap<(String, String), String>> {
-    let mut map = HashMap::new();
+    let mut distinct: Vec<(String, String, String)> = Vec::new();
+    let mut seen = HashSet::new();
     for exec in &batch.executions {
         let Some(subject_id) = &exec.provider_user_id else {
             continue;
         };
         let key = (exec.source.clone(), subject_id.clone());
-        if map.contains_key(&key) {
-            continue;
+        if seen.insert(key) {
+            distinct.push((exec.source.clone(), subject_id.clone(), cuid2()));
         }
-        let id = sqlx::query_scalar::<_, String>(
-            "INSERT INTO usage_identities (id, source, subject_kind, subject_id) \
-             VALUES ($1, $2, 'user', $3) \
-             ON CONFLICT (source, subject_kind, subject_id) \
-             DO UPDATE SET subject_id = EXCLUDED.subject_id \
-             RETURNING id",
-        )
-        .bind(cuid2())
-        .bind(&exec.source)
-        .bind(subject_id)
-        .fetch_one(&mut **tx)
-        .await?;
-        map.insert(key, id);
+    }
+    if distinct.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut builder = QueryBuilder::<Postgres>::new(
+        "INSERT INTO usage_identities (id, source, subject_kind, subject_id) ",
+    );
+    builder.push_values(&distinct, |mut row, (source, subject_id, id)| {
+        row.push_bind(id)
+            .push_bind(source)
+            .push_bind("user")
+            .push_bind(subject_id);
+    });
+    builder.push(
+        " ON CONFLICT (source, subject_kind, subject_id) \
+         DO UPDATE SET subject_id = EXCLUDED.subject_id \
+         RETURNING source, subject_id, id",
+    );
+
+    let rows = builder.build().fetch_all(&mut **tx).await?;
+
+    let mut map = HashMap::new();
+    for row in rows {
+        let source: String = row.try_get("source")?;
+        let subject_id: String = row.try_get("subject_id")?;
+        let id: String = row.try_get("id")?;
+        map.insert((source, subject_id), id);
     }
     Ok(map)
 }
@@ -78,12 +93,22 @@ async fn upsert_executions(
     if batch.executions.is_empty() {
         return Ok(0);
     }
+    // Dedup by derived id before the multi-row statement: a single export can carry the same
+    // (source, trace_id, span_id) twice, and a multi-row `ON CONFLICT DO UPDATE` refuses a row
+    // that appears twice in the SAME statement (Postgres 21000). Keeping the first is safe.
+    let mut seen = HashSet::new();
+    let mut deduped: Vec<ExecutionRecord> = Vec::with_capacity(batch.executions.len());
+    for e in &batch.executions {
+        if seen.insert(execution_id(&e.source, &e.trace_id, &e.span_id)) {
+            deduped.push(e.clone());
+        }
+    }
     let mut builder = QueryBuilder::<Postgres>::new(
         "INSERT INTO usage_executions \
          (id, observed_at, source, provider, trace_id, span_id, identity_id, duration_ms, \
           estimated_cost_micro_usd, raw_backend, raw_schema_version) ",
     );
-    builder.push_values(&batch.executions, |mut row, e| {
+    builder.push_values(&deduped, |mut row, e| {
         let identity_id = e.provider_user_id.as_ref().and_then(|uid| {
             identity_ids
                 .get(&(e.source.clone(), uid.clone()))

@@ -111,6 +111,42 @@ async fn upsert_seat_snapshots_is_idempotent_on_natural_key(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations-usage")]
+async fn duplicate_day_fact_in_one_batch_does_not_21000(pool: PgPool) {
+    let r = repo(&pool);
+    let fact = DayFact {
+        source: "github-copilot".into(),
+        day: chrono::NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(),
+        subject_kind: SubjectKind::Org,
+        subject_id: "g1".into(),
+        provider_user_id: None,
+        active_users: Some(10),
+        engaged_users: Some(4),
+        total_interactions: Some(150),
+        total_completions: Some(120),
+        ai_credits: Some(0),
+        coding_agent_activity: None,
+        code_review_activity: None,
+        pull_request_activity: None,
+        team_id: None,
+        team_slug: None,
+        cost_micro_usd: Some(0),
+        is_aggregate_only: false,
+    };
+    // A re-emitted record during the cutover replay can carry the same natural key twice in one
+    // payload; the multi-row `ON CONFLICT DO UPDATE` must not refuse the whole batch (21000).
+    r.upsert_day_facts(&[fact.clone(), fact])
+        .await
+        .expect("a duplicate day fact in one batch must not 21000");
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM usage_day_facts WHERE source='github-copilot' AND day='2026-09-01'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(count, 1, "the duplicate collapses to one row");
+}
+
+#[sqlx::test(migrations = "../../migrations-usage")]
 async fn ingest_day_grain_logs_end_to_end(pool: PgPool) {
     let router = app(pool.clone());
     let body = json!({

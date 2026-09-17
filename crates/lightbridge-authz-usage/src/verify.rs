@@ -135,6 +135,16 @@ pub async fn verify_counts(pool: &PgPool, manifest: &VerifyManifest) -> Result<V
     )
     .await?;
 
+    // Fail-loud on an empty gate: every manifest field is optional, so a manifest that parses to
+    // `{}` (an empty or mis-generated `ingest_manifests` export) would otherwise produce zero
+    // checks and `passed` would be vacuously true — the cutover's "block loudly" gate silently
+    // passing because nothing was asserted. Refuse instead.
+    if checks.is_empty() {
+        return Err(Error::BadRequest(
+            "verify manifest asserted nothing; refusing to pass an empty gate".into(),
+        ));
+    }
+
     let passed = checks.iter().all(|c| c.matched);
     Ok(VerifyReport { passed, checks })
 }

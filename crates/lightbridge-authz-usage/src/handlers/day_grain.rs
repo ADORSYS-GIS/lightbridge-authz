@@ -24,20 +24,26 @@ use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use crate::{
     UsageState,
     handlers::ingest::{decode_otlp_request_async, key_values_to_map, merge_attr_maps},
+    handlers::payload_identity::check_identity_mismatch,
     models::IngestResponse,
     models::day_seat::{DayFact, SeatSnapshot},
     normalizer::day_grain::{DayGrainRecord, parse_day_grain},
 };
 
 /// Decode an OTLP logs request, parse every day-grain record, and upsert into the day/seat tables.
+///
+/// `source` is the caller-resolved, credential-bound trusted source (ADR-0027 decision 4 / #585).
+/// It is used for the stored rows and cross-checked against the payload's own assertion via AC4's
+/// "alert, never overwrite" — never taken from the payload.
 pub async fn ingest_day_grain_logs(
     State(state): State<Arc<UsageState>>,
     headers: HeaderMap,
     body: Bytes,
+    source: &'static str,
 ) -> Result<(StatusCode, Json<IngestResponse>)> {
     let payload =
         decode_otlp_request_async::<ExportLogsServiceRequest>(headers, body, "logs").await?;
-    let (facts, seats) = extract_day_grain(payload)?;
+    let (facts, seats) = extract_day_grain(payload, source)?;
 
     let accepted = state.repo.upsert_day_facts(&facts).await?
         + state.repo.upsert_seat_snapshots(&seats).await?;
@@ -55,8 +61,12 @@ pub async fn ingest_day_grain_logs(
 /// Records without a `report` attribute are not day-grain and are skipped (a `github-copilot`
 /// source emits only day-grain records per RFC-0001). A record that IS day-grain but malformed
 /// returns `Err` — the whole request is refused rather than partially applied.
+///
+/// `source` is the trusted source; the payload's own `source` assertion is cross-checked per
+/// record (AC4) and never trusted for the stored row.
 fn extract_day_grain(
     payload: ExportLogsServiceRequest,
+    source: &'static str,
 ) -> Result<(Vec<DayFact>, Vec<SeatSnapshot>)> {
     let mut facts = Vec::new();
     let mut seats = Vec::new();
@@ -70,7 +80,8 @@ fn extract_day_grain(
             for log_record in scope_logs.log_records {
                 let attrs =
                     merge_attr_maps(&resource_attrs, &key_values_to_map(&log_record.attributes));
-                match parse_day_grain(&attrs)? {
+                check_identity_mismatch(&attrs, source);
+                match parse_day_grain(&attrs, source)? {
                     Some(DayGrainRecord::DayFact(f)) => facts.push(f),
                     Some(DayGrainRecord::SeatSnapshot(s)) => seats.push(s),
                     None => {}

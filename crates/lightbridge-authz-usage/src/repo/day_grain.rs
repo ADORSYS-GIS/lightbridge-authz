@@ -9,6 +9,8 @@
 //! ADR-0038 persistence exception, same class as `usage_events`: a natural-key upsert that
 //! generated CRUD cannot express. The usage DB is already hand-written SQL.
 
+use std::collections::HashSet;
+
 use lightbridge_authz_core::{Error, Result};
 use sqlx::{PgPool, Postgres, QueryBuilder};
 
@@ -19,6 +21,23 @@ pub async fn upsert_day_facts(pool: &PgPool, facts: &[DayFact]) -> Result<usize>
     if facts.is_empty() {
         return Ok(0);
     }
+    // Dedup on the natural key before building the multi-row statement: a single payload can
+    // carry the same (source, day, subject_kind, subject_id) twice (a re-emitted record during
+    // the cutover replay), and a multi-row `ON CONFLICT DO UPDATE` refuses a row that appears
+    // twice in the SAME statement (Postgres 21000) — the whole batch would be refused.
+    let mut seen = HashSet::new();
+    let mut deduped: Vec<DayFact> = Vec::with_capacity(facts.len());
+    for f in facts {
+        let key = (
+            f.source.clone(),
+            f.day,
+            f.subject_kind.clone(),
+            f.subject_id.clone(),
+        );
+        if seen.insert(key) {
+            deduped.push(f.clone());
+        }
+    }
     let mut builder = QueryBuilder::<Postgres>::new(
         "INSERT INTO usage_day_facts \
          (source, day, subject_kind, subject_id, provider_user_id, active_users, engaged_users, \
@@ -26,7 +45,7 @@ pub async fn upsert_day_facts(pool: &PgPool, facts: &[DayFact]) -> Result<usize>
           code_review_activity, pull_request_activity, team_id, team_slug, cost_micro_usd, \
           is_aggregate_only) ",
     );
-    builder.push_values(facts, |mut row, f| {
+    builder.push_values(&deduped, |mut row, f| {
         row.push_bind(&f.source)
             .push_bind(f.day)
             .push_bind(f.subject_kind.as_str())
@@ -72,12 +91,29 @@ pub async fn upsert_seat_snapshots(pool: &PgPool, snapshots: &[SeatSnapshot]) ->
     if snapshots.is_empty() {
         return Ok(0);
     }
+    // Dedup on the natural key before building the multi-row statement (same 21000 rationale as
+    // `upsert_day_facts`): a re-emitted seat record during the cutover replay must not refuse the
+    // whole batch.
+    let mut seen = HashSet::new();
+    let mut deduped: Vec<SeatSnapshot> = Vec::with_capacity(snapshots.len());
+    for s in snapshots {
+        let key = (
+            s.source.clone(),
+            s.snapshot_day,
+            s.subject_kind.clone(),
+            s.subject_id.clone(),
+            s.provider_user_id.clone(),
+        );
+        if seen.insert(key) {
+            deduped.push(s.clone());
+        }
+    }
     let mut builder = QueryBuilder::<Postgres>::new(
         "INSERT INTO usage_seat_snapshots \
          (source, snapshot_day, subject_kind, subject_id, provider_user_id, seat_state, \
           assignee_login, seat_created_at, last_activity_at, last_activity_editor, plan_type) ",
     );
-    builder.push_values(snapshots, |mut row, s| {
+    builder.push_values(&deduped, |mut row, s| {
         row.push_bind(&s.source)
             .push_bind(s.snapshot_day)
             .push_bind(s.subject_kind.as_str())

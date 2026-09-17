@@ -18,11 +18,11 @@ use chrono::{DateTime, Utc};
 use lightbridge_authz_core::{Error, Result};
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 
+use crate::handlers::payload_identity::check_identity_mismatch;
 use crate::models::execution_ingest::{
     ExecutionGrainBatch, ExecutionRecord, ModelCallRecord, ToolCallRecord, execution_id,
 };
 use crate::normalizer::{REGISTRY, SpanMeta, extract_string};
-
 /// The sources whose OTLP traces are execution-grain (ADR-0027): the agent tools. The gateway
 /// (`eaig`) stays request-grain; `github-copilot` is day-grain (RFC-0001).
 pub const EXECUTION_GRAIN_SOURCES: [&str; 4] =
@@ -71,6 +71,7 @@ pub fn parse_execution_grain(
                     &resource_attrs,
                     &crate::handlers::ingest::key_values_to_map(&span.attributes),
                 );
+                check_identity_mismatch(&attrs, source);
                 let trace_id = hex::encode(&span.trace_id);
                 let span_id = hex::encode(&span.span_id);
                 let parent_span_id = hex::encode(&span.parent_span_id);
@@ -88,7 +89,7 @@ pub fn parse_execution_grain(
                     span.end_time_unix_nano
                 } else {
                     span.start_time_unix_nano
-                });
+                })?;
                 let duration_ms =
                     span_duration_ms(span.start_time_unix_nano, span.end_time_unix_nano)
                         .or(norm.latency_ms.map(|v| v as i64));
@@ -181,13 +182,14 @@ fn stub_execution(
     }
 }
 
-fn nanos_to_datetime(nanos: u64) -> DateTime<Utc> {
+fn nanos_to_datetime(nanos: u64) -> Result<DateTime<Utc>> {
     if nanos == 0 {
-        return Utc::now();
+        return Err(Error::BadRequest("span has no timestamp".into()));
     }
     let secs = (nanos / 1_000_000_000) as i64;
     let sub_nanos = (nanos % 1_000_000_000) as u32;
-    DateTime::from_timestamp(secs, sub_nanos).unwrap_or_else(Utc::now)
+    DateTime::from_timestamp(secs, sub_nanos)
+        .ok_or_else(|| Error::BadRequest("span timestamp out of range".into()))
 }
 
 fn span_duration_ms(start_time_unix_nano: u64, end_time_unix_nano: u64) -> Option<i64> {

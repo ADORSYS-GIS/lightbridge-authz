@@ -151,14 +151,33 @@ fn no_stub_when_parent_execution_is_in_the_same_batch() {
 
 #[test]
 fn refuses_a_tool_call_with_no_duration() {
+    // A valid timestamp pair that is non-monotonic (end < start) yields no duration, so the
+    // tool-call branch must refuse rather than fabricate a zero.
     let p = payload(json!([span(
         TC_SPAN,
         EXEC_SPAN,
         "tool.use",
-        "0",
-        "0",
+        "1735689605000000000",
+        "1735689600000000000",
         json!([{"key":"tool_name","value":{"stringValue":"bash"}}])
     )]));
     let err = parse_execution_grain(p, "claude-code").expect_err("no duration must be refused");
     assert!(err.to_string().contains("no duration"));
+}
+
+#[test]
+fn refuses_a_span_with_no_timestamp() {
+    // Fail-loud on a missing timestamp (P2): `usage_executions.observed_at` is NOT NULL and built
+    // from new code, so a zero timestamp must be refused, never silently replaced with wall-clock
+    // ingest time.
+    let p = payload(json!([span(
+        EXEC_SPAN,
+        "",
+        "agent.run",
+        "0",
+        "0",
+        json!([{"key":"user_id","value":{"stringValue":"user-1"}}])
+    )]));
+    let err = parse_execution_grain(p, "claude-code").expect_err("no timestamp must be refused");
+    assert!(err.to_string().contains("no timestamp"));
 }

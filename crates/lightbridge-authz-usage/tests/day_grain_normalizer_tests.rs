@@ -40,7 +40,9 @@ fn parses_organization_1_day() {
         ("ai_credits", json!(0)),
         ("net_cost_micro_usd", json!(0)),
     ]);
-    let rec = parse_day_grain(&attrs(&a)).expect("ok").expect("day-grain");
+    let rec = parse_day_grain(&attrs(&a), "github-copilot")
+        .expect("ok")
+        .expect("day-grain");
     match rec {
         DayGrainRecord::DayFact(f) => {
             assert_eq!(f.source, "github-copilot");
@@ -69,7 +71,9 @@ fn parses_users_1_day_with_provider_user_id() {
         ("ai_credits", json!(2)),
         ("net_cost_micro_usd", json!(25000)),
     ]);
-    let rec = parse_day_grain(&attrs(&a)).expect("ok").expect("day-grain");
+    let rec = parse_day_grain(&attrs(&a), "github-copilot")
+        .expect("ok")
+        .expect("day-grain");
     match rec {
         DayGrainRecord::DayFact(f) => {
             assert_eq!(f.subject_kind, SubjectKind::User);
@@ -90,7 +94,9 @@ fn parses_repos_1_day() {
         ("code_review_activity", json!(1)),
         ("pull_request_activity", json!(2)),
     ]);
-    let rec = parse_day_grain(&attrs(&a)).expect("ok").expect("day-grain");
+    let rec = parse_day_grain(&attrs(&a), "github-copilot")
+        .expect("ok")
+        .expect("day-grain");
     match rec {
         DayGrainRecord::DayFact(f) => {
             assert_eq!(f.subject_kind, SubjectKind::Repo);
@@ -113,7 +119,9 @@ fn parses_billing_seats() {
         ("last_activity_editor", json!("vscode/1.90.0")),
         ("seat_state", json!("active")),
     ]);
-    let rec = parse_day_grain(&attrs(&a)).expect("ok").expect("day-grain");
+    let rec = parse_day_grain(&attrs(&a), "github-copilot")
+        .expect("ok")
+        .expect("day-grain");
     match rec {
         DayGrainRecord::SeatSnapshot(s) => {
             assert_eq!(s.subject_kind, SubjectKind::Org);
@@ -133,7 +141,23 @@ fn parses_billing_seats() {
 #[test]
 fn returns_none_for_non_day_grain_record() {
     let a = attrs(&[("source", json!("eaig")), ("model", json!("gpt-4.1"))]);
-    assert!(parse_day_grain(&a).expect("ok").is_none());
+    assert!(parse_day_grain(&a, "github-copilot").expect("ok").is_none());
+}
+
+#[test]
+fn stored_source_comes_from_the_trusted_source_not_the_payload() {
+    // AC4 / ADR-0027 decision 4: the stored `source` dimension is the credential-bound trusted
+    // source, never the payload's own assertion. A payload that asserts a foreign source must
+    // still land under the trusted source (the mismatch is alerted, never applied).
+    let mut a = common("organization-1-day", "2026-08-01", "org", "g1");
+    a.push(("source", json!("eaig")));
+    let rec = parse_day_grain(&attrs(&a), "github-copilot")
+        .expect("ok")
+        .expect("day-grain");
+    match rec {
+        DayGrainRecord::DayFact(f) => assert_eq!(f.source, "github-copilot"),
+        DayGrainRecord::SeatSnapshot(_) => panic!("expected day fact"),
+    }
 }
 
 #[test]
@@ -144,18 +168,18 @@ fn refuses_user_teams_until_known_issue_resolved() {
         "user_team",
         "1001",
     ));
-    let err = parse_day_grain(&a).expect_err("user-teams must be refused");
+    let err = parse_day_grain(&a, "github-copilot").expect_err("user-teams must be refused");
     assert!(err.to_string().contains("user-teams-1-day"));
 }
 
 #[test]
 fn refuses_unknown_report() {
     let a = attrs(&common("mystery-report", "2026-08-01", "org", "g1"));
-    assert!(parse_day_grain(&a).is_err());
+    assert!(parse_day_grain(&a, "github-copilot").is_err());
 }
 
 #[test]
 fn refuses_invalid_day() {
     let a = attrs(&common("organization-1-day", "not-a-date", "org", "g1"));
-    assert!(parse_day_grain(&a).is_err());
+    assert!(parse_day_grain(&a, "github-copilot").is_err());
 }

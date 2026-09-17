@@ -22,7 +22,9 @@ use serde_json::Value;
 use crate::models::day_seat::{DayFact, SeatSnapshot, SubjectKind};
 use crate::normalizer::{extract_i64, extract_string};
 
-/// The trusted-source stamp every RFC-0001 record carries (ADR-0013 invariant 2).
+/// The trusted source for the day-grain receiver (ADR-0027 decision 4 / #585): the only source
+/// whose OTLP logs are routed to the day-grain path, and the value stamped on every stored
+/// `DayFact`/`SeatSnapshot` row. Never taken from the payload.
 pub const DAY_GRAIN_SOURCE: &str = "github-copilot";
 
 /// A parsed day-grain record: either a day fact or a seat snapshot.
@@ -34,16 +36,22 @@ pub enum DayGrainRecord {
 
 /// Parse one OTLP log record's attributes into a day-grain record.
 ///
+/// `source` is the caller-resolved, credential-bound trusted source (ADR-0027 decision 4 / #585:
+/// the stored `source` dimension is NEVER taken from the payload). The caller cross-checks the
+/// payload's own `source` assertion via [`crate::handlers::payload_identity::check_identity_mismatch`]
+/// and alerts on disagreement; this function only ever stamps the trusted source.
+///
 /// Returns `Ok(None)` when the record is not day-grain (no `report` attribute) — the caller
 /// routes it to the request-grain path. Returns `Err` when it IS day-grain but malformed.
-pub fn parse_day_grain(attrs: &HashMap<String, Value>) -> Result<Option<DayGrainRecord>> {
+pub fn parse_day_grain(
+    attrs: &HashMap<String, Value>,
+    source: &str,
+) -> Result<Option<DayGrainRecord>> {
     let report = match extract_string(attrs, &["report"]) {
         Some(r) => r,
         None => return Ok(None),
     };
 
-    let source = extract_string(attrs, &["source"])
-        .ok_or_else(|| Error::BadRequest("day-grain record missing source".into()))?;
     let day = extract_string(attrs, &["day"])
         .ok_or_else(|| Error::BadRequest("day-grain record missing day".into()))?;
     let day = NaiveDate::parse_from_str(&day, "%Y-%m-%d")
@@ -81,7 +89,7 @@ pub fn parse_day_grain(attrs: &HashMap<String, Value>) -> Result<Option<DayGrain
 }
 
 fn parse_day_fact(
-    source: String,
+    source: &str,
     day: NaiveDate,
     subject_kind: SubjectKind,
     subject_id: String,
@@ -93,7 +101,7 @@ fn parse_day_fact(
         _ => None,
     };
     Ok(DayFact {
-        source,
+        source: source.to_string(),
         day,
         subject_kind,
         subject_id,
@@ -114,7 +122,7 @@ fn parse_day_fact(
 }
 
 fn parse_seat(
-    source: String,
+    source: &str,
     snapshot_day: NaiveDate,
     subject_kind: SubjectKind,
     subject_id: String,
@@ -138,7 +146,7 @@ fn parse_seat(
         })?;
 
     Ok(SeatSnapshot {
-        source,
+        source: source.to_string(),
         snapshot_day,
         subject_kind,
         subject_id,

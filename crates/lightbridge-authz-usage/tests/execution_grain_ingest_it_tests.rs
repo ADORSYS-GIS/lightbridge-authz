@@ -184,6 +184,31 @@ async fn stub_before_parent_then_real_execution_fills_it(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations-usage")]
+async fn duplicate_execution_in_one_batch_does_not_21000(pool: PgPool) {
+    let r = repo(&pool);
+    // A single OTLP export can carry the same (source, trace_id, span_id) twice (e.g. a
+    // BatchSpanProcessor flush that duplicates a span into two resource_spans). A multi-row
+    // `ON CONFLICT DO UPDATE` refuses a row that appears twice in the SAME statement (Postgres
+    // 21000), so the repo must dedup before building the statement.
+    let batch = ExecutionGrainBatch {
+        executions: vec![
+            exec("claude-code", "t1", "e1", Some("user-1")),
+            exec("claude-code", "t1", "e1", Some("user-1")),
+        ],
+        model_calls: vec![],
+        tool_calls: vec![],
+    };
+    r.upsert_execution_grain(&batch)
+        .await
+        .expect("a duplicate span in one batch must not 21000");
+    let execs: i64 = sqlx::query_scalar("SELECT count(*) FROM usage_executions")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(execs, 1, "the duplicate collapses to one row");
+}
+
+#[sqlx::test(migrations = "../../migrations-usage")]
 async fn identity_is_minted_once_and_reused(pool: PgPool) {
     let r = repo(&pool);
     let batch = ExecutionGrainBatch {

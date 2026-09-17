@@ -144,7 +144,8 @@ runs:
 
     # lightbridge-authz-usage-rest's own ephemeral sqlx::test suite (repo_it_tests.rs,
     # spend_query_it_tests.rs, scope_ownership_it_tests.rs, retention_it_tests.rs, seed_it_tests.rs,
-    # execution_grain_it_tests.rs, day_seat_grain_it_tests.rs -- #570/#578/#549/#528/#582/#583)
+    # execution_grain_it_tests.rs, day_seat_grain_it_tests.rs, cutover_verify_it_tests.rs,
+    # day_grain_ingest_it_tests.rs, execution_grain_ingest_it_tests.rs -- #570/#578/#549/#528/#582/#583/#588)
     # against the SAME plain
     # Postgres container as the step above -- not a dedicated TimescaleDB.
     # `migrations-usage/20260829000001_usage_event_latency.sql` is
@@ -357,6 +358,66 @@ runs:
         echo "replay_tests passed: ${passed:-0}"
         if [ -z "${passed}" ] || [ "${passed}" -eq 0 ]; then
           echo "::error::replay_tests reported 0 passed tests -- a skip is not a pass."
+          exit 1
+        fi
+      env:
+        DATABASE_URL: ${{ inputs.database-url }}
+        CARGO_BUILD_JOBS: "2"
+        CARGO_INCREMENTAL: "0"
+
+    # The three #588 cutover binaries (cutover_verify_it_tests, day_grain_ingest_it_tests,
+    # execution_grain_ingest_it_tests). Each was registered in Cargo.toml but never wired into any
+    # CI job -- none of their assertions ran anywhere until these steps. That includes the
+    # count-assertion harness's own pass/mismatch logic (cutover_verify_it_tests), which is this
+    # PR's stated purpose, so a broken `verify_counts` would otherwise stay green indefinitely.
+    # Same per-binary `0 passed` guard as the steps above -- a skipped binary is not a pass.
+    - name: Run it-tests (usage) - cutover_verify_it_tests
+      shell: bash
+      run: |
+        set -euo pipefail
+        log_file="$(mktemp)"
+        cargo test -p lightbridge-authz-usage-rest --features it-tests \
+          --test cutover_verify_it_tests 2>&1 | tee "${log_file}"
+        passed=$(grep -oE '[0-9]+ passed' "${log_file}" | grep -oE '^[0-9]+' | tail -1 || true)
+        echo "cutover_verify_it_tests passed: ${passed:-0}"
+        if [ -z "${passed}" ] || [ "${passed}" -eq 0 ]; then
+          echo "::error::cutover_verify_it_tests reported 0 passed tests -- a skip is not a pass."
+          exit 1
+        fi
+      env:
+        DATABASE_URL: ${{ inputs.database-url }}
+        CARGO_BUILD_JOBS: "2"
+        CARGO_INCREMENTAL: "0"
+
+    - name: Run it-tests (usage) - day_grain_ingest_it_tests
+      shell: bash
+      run: |
+        set -euo pipefail
+        log_file="$(mktemp)"
+        cargo test -p lightbridge-authz-usage-rest --features it-tests \
+          --test day_grain_ingest_it_tests 2>&1 | tee "${log_file}"
+        passed=$(grep -oE '[0-9]+ passed' "${log_file}" | grep -oE '^[0-9]+' | tail -1 || true)
+        echo "day_grain_ingest_it_tests passed: ${passed:-0}"
+        if [ -z "${passed}" ] || [ "${passed}" -eq 0 ]; then
+          echo "::error::day_grain_ingest_it_tests reported 0 passed tests -- a skip is not a pass."
+          exit 1
+        fi
+      env:
+        DATABASE_URL: ${{ inputs.database-url }}
+        CARGO_BUILD_JOBS: "2"
+        CARGO_INCREMENTAL: "0"
+
+    - name: Run it-tests (usage) - execution_grain_ingest_it_tests
+      shell: bash
+      run: |
+        set -euo pipefail
+        log_file="$(mktemp)"
+        cargo test -p lightbridge-authz-usage-rest --features it-tests \
+          --test execution_grain_ingest_it_tests 2>&1 | tee "${log_file}"
+        passed=$(grep -oE '[0-9]+ passed' "${log_file}" | grep -oE '^[0-9]+' | tail -1 || true)
+        echo "execution_grain_ingest_it_tests passed: ${passed:-0}"
+        if [ -z "${passed}" ] || [ "${passed}" -eq 0 ]; then
+          echo "::error::execution_grain_ingest_it_tests reported 0 passed tests -- a skip is not a pass."
           exit 1
         fi
       env:

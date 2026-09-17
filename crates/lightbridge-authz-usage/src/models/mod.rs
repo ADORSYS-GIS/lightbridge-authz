@@ -23,8 +23,7 @@ pub struct IngestResponse {
 ///
 /// `"other"` is a real, storable value: the request had a path and it was not one of the four
 /// known surfaces. It is NOT the same as `NULL`, which means the signal carried no path key at
-/// all -- "we do not know" is not "something else". `NULL` is therefore deliberately absent from
-/// this list: it is not a filterable value, it is the absence of one.
+/// all -- "we do not know" is not "something else". `NULL` is deliberately absent from this list.
 ///
 /// #581's `usage_request_events` rewrite (PR-1b) reuses this vocabulary verbatim -- see
 /// `docs/plans/0581-multi-source-usage-plan-of-work.md`.

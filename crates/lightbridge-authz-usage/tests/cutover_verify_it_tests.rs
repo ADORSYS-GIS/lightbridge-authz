@@ -99,3 +99,19 @@ async fn verify_blocks_on_a_corrupted_row(pool: PgPool) {
     assert_eq!(seat_check.actual, 1);
     assert!(!seat_check.matched, "the seat mismatch must be reported");
 }
+
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn empty_manifest_is_refused_not_vacuously_passed(pool: PgPool) {
+    // Every manifest field is optional, so a manifest that parses to `{}` (an empty or
+    // mis-generated `ingest_manifests` export) must be refused, not silently pass because nothing
+    // was asserted.
+    let manifest: VerifyManifest =
+        serde_json::from_value(json!({})).expect("empty manifest parses");
+    let err = verify_counts(&pool, &manifest)
+        .await
+        .expect_err("an empty gate must fail, not pass vacuously");
+    assert!(
+        err.to_string().contains("empty"),
+        "error should name the empty gate: {err}"
+    );
+}

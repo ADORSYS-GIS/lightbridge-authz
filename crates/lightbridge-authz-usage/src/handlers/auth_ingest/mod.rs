@@ -74,8 +74,13 @@ where
     // Copilot data arrives via the day-grain pull path (RFC-0001), never the request-grain push
     // path. On the logs signal, route a `github-copilot` source to the day-grain receiver (#588).
     if persist_signal == "log" && source == crate::normalizer::day_grain::DAY_GRAIN_SOURCE {
-        return match crate::handlers::day_grain::ingest_day_grain_logs(State(state), headers, body)
-            .await
+        return match crate::handlers::day_grain::ingest_day_grain_logs(
+            State(state),
+            headers,
+            body,
+            source,
+        )
+        .await
         {
             Ok((status, json)) => (status, json).into_response(),
             Err(e) => e.into_response(),
