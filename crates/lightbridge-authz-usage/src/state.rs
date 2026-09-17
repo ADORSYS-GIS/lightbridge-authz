@@ -11,6 +11,7 @@ use lightbridge_authz_bearer::BearerTokenServiceTrait;
 use lightbridge_authz_core::{Result, async_trait};
 use std::sync::Arc;
 
+use crate::models::day_fact::{DayFactQueryRequest, DayFactSeriesPoint};
 use crate::models::execution::{ExecutionQueryRequest, ExecutionSeriesPoint};
 use crate::models::{UsageQueryRequest, UsageSeriesPoint};
 use crate::repo::{StoreRepo, UsageEvent};
@@ -69,6 +70,13 @@ pub trait UsageRepoTrait: Send + Sync {
         &self,
         input: &ExecutionQueryRequest,
     ) -> Result<(Vec<ExecutionSeriesPoint>, bool)>;
+    /// Returns `(points, truncated)` for the day-facts grain (#727) -- see
+    /// `StoreRepo::query_day_facts`'s doc comment for the #578 truncation contract `truncated`
+    /// documents.
+    async fn query_day_facts(
+        &self,
+        input: &DayFactQueryRequest,
+    ) -> Result<(Vec<DayFactSeriesPoint>, bool)>;
     async fn spend_for_account(
         &self,
         account_id: &str,
@@ -98,6 +106,13 @@ impl UsageRepoTrait for StoreRepo {
         input: &ExecutionQueryRequest,
     ) -> Result<(Vec<ExecutionSeriesPoint>, bool)> {
         StoreRepo::query_executions(self, input).await
+    }
+
+    async fn query_day_facts(
+        &self,
+        input: &DayFactQueryRequest,
+    ) -> Result<(Vec<DayFactSeriesPoint>, bool)> {
+        StoreRepo::query_day_facts(self, input).await
     }
 
     async fn spend_for_account(
