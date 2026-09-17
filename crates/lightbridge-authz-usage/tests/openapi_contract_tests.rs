@@ -408,6 +408,94 @@ fn usage_openapi_should_publish_seat_group_by_contract() {
     );
 }
 
+/// #727: pins the day-facts grain query endpoint in the published OpenAPI doc, the same seam
+/// `usage_openapi_should_publish_execution_query_path` guards for the execution endpoint -- a
+/// client generated from `openapi/usage.backend.yaml` needs this path to exist to ever call it.
+#[test]
+fn usage_openapi_should_publish_day_fact_query_path() {
+    let doc = usage_openapi();
+    let paths = doc["paths"]
+        .as_object()
+        .expect("openapi paths should be an object");
+    assert!(
+        paths.contains_key("/usage/v1/usage/facts/query"),
+        "expected the day-facts query endpoint in openapi paths"
+    );
+}
+
+/// #727: pins the 401/403 responses the day-facts query endpoint documents, mirroring
+/// `usage_openapi_should_publish_execution_query_auth_responses` -- a silent regression back to
+/// "no auth check documented" fails here first.
+#[test]
+fn usage_openapi_should_publish_day_fact_query_auth_responses() {
+    let doc = usage_openapi();
+    let responses = &doc["paths"]["/usage/v1/usage/facts/query"]["post"]["responses"];
+
+    assert!(
+        responses.get("401").is_some(),
+        "expected /usage/v1/usage/facts/query to document a 401 response"
+    );
+    assert!(
+        responses.get("403").is_some(),
+        "expected /usage/v1/usage/facts/query to document a 403 response"
+    );
+}
+
+/// #727: pins the `DayFactSeriesPoint` schema, and specifically that `cost_micro_usd` is
+/// nullable -- `None` (unknown) must survive serialization as `null`, never `0`
+/// (governance#188). A client generated from `openapi/usage.backend.yaml` needs to know the
+/// field can be absent to render "unknown" rather than "free".
+#[test]
+fn usage_openapi_should_publish_day_fact_schema_with_nullable_cost() {
+    let doc = usage_openapi();
+    let point = &doc["components"]["schemas"]["DayFactSeriesPoint"]["properties"];
+
+    for field in [
+        "bucket_start",
+        "source",
+        "subject_kind",
+        "subject_id",
+        "is_aggregate_only",
+        "total_suggestions",
+        "total_acceptances",
+        "total_lines_suggested",
+        "total_lines_accepted",
+        "total_active_users",
+        "cost_micro_usd",
+    ] {
+        assert!(
+            point.get(field).is_some(),
+            "expected DayFactSeriesPoint.{field} in the published schema"
+        );
+    }
+
+    let required: Vec<&str> = doc["components"]["schemas"]["DayFactSeriesPoint"]["required"]
+        .as_array()
+        .expect("DayFactSeriesPoint should declare required fields")
+        .iter()
+        .filter_map(|value| value.as_str())
+        .collect();
+    assert!(
+        !required.contains(&"cost_micro_usd"),
+        "cost_micro_usd must stay optional (nullable) in the published schema, got {required:?}"
+    );
+
+    let cost_type: Vec<String> = match point["cost_micro_usd"]["type"].as_array() {
+        Some(values) => values
+            .iter()
+            .filter_map(|value| value.as_str().map(str::to_string))
+            .collect(),
+        None => point["cost_micro_usd"]["type"]
+            .as_str()
+            .map(|value| vec![value.to_string()])
+            .unwrap_or_default(),
+    };
+    assert!(
+        cost_type.contains(&"null".to_string()),
+        "cost_micro_usd must publish as nullable (type contains \"null\"), got {cost_type:?}"
+    );
+}
+
 #[test]
 fn usage_openapi_should_be_openapi_3() {
     let doc = usage_openapi();

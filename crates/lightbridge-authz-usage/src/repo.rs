@@ -1,4 +1,6 @@
 mod bucket;
+mod day_fact_filters;
+pub mod day_fact_query;
 pub mod execution;
 mod execution_filters;
 mod seat_filters;

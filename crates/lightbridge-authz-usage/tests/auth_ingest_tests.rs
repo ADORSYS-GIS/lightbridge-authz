@@ -108,6 +108,16 @@ impl UsageRepoTrait for MockUsageRepo {
         Ok((vec![], false))
     }
 
+    async fn query_day_facts(
+        &self,
+        _input: &lightbridge_authz_usage_rest::models::day_fact::DayFactQueryRequest,
+    ) -> lightbridge_authz_core::Result<(
+        Vec<lightbridge_authz_usage_rest::models::day_fact::DayFactSeriesPoint>,
+        bool,
+    )> {
+        Ok((vec![], false))
+    }
+
     async fn spend_for_account(
         &self,
         _account_id: &str,
