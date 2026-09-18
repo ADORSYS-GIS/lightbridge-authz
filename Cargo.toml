@@ -219,6 +219,13 @@ thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "serde", "serde_json"] }
+# no-env-filter: the macro's default env filter (`<test-crate>=trace`) only passes events whose
+# target is the test crate itself, so every `warn!` emitted from `lightbridge-authz-core` during
+# `load_from_path` (the unknown/deprecated-key warnings these tests assert on) is silently
+# dropped by the filter and `logs_contain` stays trivially false. `no-env-filter` makes the
+# injected subscriber filter nothing; the sync tests then see lib events. The only workspace
+# consumer is lightbridge-authz-core's dev-dependencies.
+tracing-test = { version = "0.2", features = ["no-env-filter"] }
 opentelemetry = { version = "0.32" }
 opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic", "tokio"] }
 opentelemetry-proto = "0.32"
