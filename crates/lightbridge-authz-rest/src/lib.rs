@@ -69,8 +69,8 @@ pub use server_budget::{build_budget_router, start_budget_server};
 pub use server_idp::{build_idp_router, start_idp_server};
 pub use server_opa::{build_opa_router, start_opa_server};
 
-pub(crate) use convert::{has_permission, subject_from_ctx};
 pub(crate) use crate::error_convert::to_cratestack_error;
+pub(crate) use convert::{has_permission, subject_from_ctx};
 
 /// Idempotency replay window for the CRUD RPC surface (ADR-0003, "Idempotency").
 const IDEMPOTENCY_TTL: Duration = Duration::from_secs(24 * 3600);
@@ -106,7 +106,10 @@ pub const SERVICE_BUDGET_INTERNAL: &str = "authz-budget-internal";
 /// — can never drift between them. Generic over `S` the same way
 /// `well_known_router`/`token_exchange_router` are, so it merges into any router regardless of that
 /// router's own state type.
-pub(crate) fn probe_router<S>(readiness_pool: Arc<dyn DbPoolTrait>, service: &'static str) -> Router<S>
+pub(crate) fn probe_router<S>(
+    readiness_pool: Arc<dyn DbPoolTrait>,
+    service: &'static str,
+) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
@@ -127,14 +130,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::StatusCode;
     use crate::convert::{
-        clamp_expiring_soon_window_days, DEFAULT_EXPIRING_SOON_WINDOW_DAYS,
-        MAX_EXPIRING_SOON_WINDOW_DAYS,
+        DEFAULT_EXPIRING_SOON_WINDOW_DAYS, MAX_EXPIRING_SOON_WINDOW_DAYS,
+        clamp_expiring_soon_window_days,
     };
     use crate::opa_doc::OpaDoc;
     use crate::server_api::normalize_rpc_base_path;
     use crate::server_idp::build_token_exchange_state;
+    use axum::http::StatusCode;
     use lightbridge_authz_api_key::repo::StoreRepo;
     use lightbridge_authz_bearer::{BearerTokenServiceTrait, TokenInfo};
     use lightbridge_authz_core::async_trait;
