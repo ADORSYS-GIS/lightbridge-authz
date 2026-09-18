@@ -1,8 +1,5 @@
 use axum::{Router, routing::get};
-use lightbridge_authz_core::{
-    db::DbPoolTrait,
-    server::dev_cors_enabled,
-};
+use lightbridge_authz_core::db::DbPoolTrait;
 
 pub mod actor_api_key_labels;
 pub mod auth_provider;
@@ -24,6 +21,7 @@ pub mod handlers;
 mod health_handlers;
 pub mod html_page;
 pub mod identity_directory;
+pub mod introspect_budget;
 pub mod loopback;
 pub mod middleware;
 pub mod models;
@@ -74,8 +72,8 @@ pub use server_idp::{
 };
 pub use server_opa::{build_opa_router, start_opa_server};
 
+pub(crate) use crate::error_convert::to_cratestack_error;
 pub(crate) use convert::{has_permission, subject_from_ctx};
-pub(crate) use crate::error_convert::{budget_error_to_cratestack_error, to_cratestack_error};
 
 /// Idempotency replay window for the CRUD RPC surface (ADR-0003, "Idempotency").
 const IDEMPOTENCY_TTL: Duration = Duration::from_secs(24 * 3600);
@@ -111,7 +109,10 @@ pub const SERVICE_BUDGET_INTERNAL: &str = "authz-budget-internal";
 /// — can never drift between them. Generic over `S` the same way
 /// `well_known_router`/`token_exchange_router` are, so it merges into any router regardless of that
 /// router's own state type.
-pub(crate) fn probe_router<S>(readiness_pool: Arc<dyn DbPoolTrait>, service: &'static str) -> Router<S>
+pub(crate) fn probe_router<S>(
+    readiness_pool: Arc<dyn DbPoolTrait>,
+    service: &'static str,
+) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
@@ -133,12 +134,20 @@ where
 mod tests {
     use super::*;
     use axum::http::StatusCode;
+    use lightbridge_authz_api_key::repo::StoreRepo;
     use lightbridge_authz_bearer::{BearerTokenServiceTrait, TokenInfo};
-    use lightbridge_authz_core::config::{
-        Oauth2TokenExchange, Oauth2Type, OauthClient, OauthClientType,
+    use lightbridge_authz_core::{
+        async_trait,
+        config::{Oauth2, Oauth2TokenExchange, Oauth2Type, OauthClient, OauthClientType},
     };
     use serde_json::Value;
     use sqlx::postgres::PgPoolOptions;
+    use utoipa::OpenApi;
+    use crate::convert::{
+        DEFAULT_EXPIRING_SOON_WINDOW_DAYS, MAX_EXPIRING_SOON_WINDOW_DAYS,
+        clamp_expiring_soon_window_days,
+    };
+    use crate::opa_doc::OpaDoc;
 
     struct NoopBearer;
 

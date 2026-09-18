@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_core::{
-    Account, AccountId, ApiKey, ApiKeyValidation, Project, ResolvedContext, async_trait,
+    Account, AccountId, Project, async_trait,
     config::{BasicAuth, Billing},
     error::{Error, Result},
 };

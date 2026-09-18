@@ -151,7 +151,7 @@ pub fn build_api_router(
 /// Normalize a configured RPC base path into an axum-`nest`-safe prefix, or `None` for the historical
 /// root mount. Ensures a single leading slash and strips a trailing slash; treats `None`, empty, or
 /// `/` as unset. axum's `nest` panics on an empty path or a trailing slash, so this guards both.
-pub(crate) fn normalize_rpc_base_path(raw: Option<&str>) -> Option<String> {
+pub fn normalize_rpc_base_path(raw: Option<&str>) -> Option<String> {
     let trimmed = raw?.trim().trim_end_matches('/');
     if trimmed.is_empty() {
         return None;
