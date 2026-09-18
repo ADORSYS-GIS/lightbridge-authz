@@ -2,6 +2,8 @@
 
 # A grandfathered-ceiling raise (an entry going up, or a new key appearing in the
 # baseline file) must carry the `loc-baseline-raise` PR label enforced by the
-# loc-gate; this rule makes the same change require a maintainer's review before
-# merge. Lowering or removing entries stays always-free.
+# loc-gate. This rule REQUESTS a maintainer's review on any change to the
+# baseline file; blocking the merge on that review is branch protection's
+# "Require review from Code Owners" setting, which lives outside this file.
+# Lowering or removing entries stays always-free.
 /.github/loc-baseline.json @stephane-segning
