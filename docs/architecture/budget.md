@@ -402,14 +402,18 @@ two services querying one service's tables. `lightbridge-authz-usage` owns `usag
 owns the query too, and `UsageServiceSpendReader` calls it like any other client would.
 
 **Unit note:** whichever reader is asking, the raw `total_cost`/`SUM(total_cost)` figure is
-dollar-scale, not micro-USD — `usage_events.total_cost` is written in dollars by
-`apply_normalizer` (`crates/lightbridge-authz-usage/src/handlers/ingest.rs:492-495`).
-`UsageServiceSpendReader`'s caller converts it into the `i64` micro-USD
-`Facts.spend_this_period`/`spend_last_period` actually carry via
-`validate_total_cost_micros` (`crates/lightbridge-authz-budget/src/spend_units.rs`) — see
-[ADR-0034 §3](../adr/0034-dynamic-budget-limiter.md)'s "`spent_micros` is dollars-on-the-wire"
-note for the full history (PR #488 vs. commit `6413db1` vs. PR
-[#737](https://github.com/ADORSYS-GIS/lightbridge-authz/pull/737)).
+**micro-USD from every writer**, settled by PR
+[#745](https://github.com/ADORSYS-GIS/lightbridge-authz/pull/745)/
+[#746](https://github.com/ADORSYS-GIS/lightbridge-authz/pull/746) (`f061d1e`, 2026-09-16) —
+`apply_normalizer` (`crates/lightbridge-authz-usage/src/handlers/ingest.rs`) is the only writer
+of this column, and both of its branches now agree on the unit. `validate_total_cost_micros`
+(`crates/lightbridge-authz-budget/src/spend_units.rs`), which produces the `i64` micro-USD
+`Facts.spend_this_period`/`spend_last_period` actually carry, validates that figure (finite,
+non-negative, fits in `i64`) but does not scale it — see
+[ADR-0034 §3](../adr/0034-dynamic-budget-limiter.md)'s "`spent_micros` is micro-USD on the wire,
+validated but not scaled" note for the full history, including the production incident this
+column's two-branch unit split caused (PR #488 → commit `6413db1` → PR
+[#737](https://github.com/ADORSYS-GIS/lightbridge-authz/pull/737) → PR #745/#746).
 
 **⚠️ This inversion is a breaking config-key rename, and it needs a companion change in
 `ai-helm-values` to keep working in production.** As of the PR that introduced this section, prod's

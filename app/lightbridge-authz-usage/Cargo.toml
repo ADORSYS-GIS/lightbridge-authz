@@ -20,3 +20,5 @@ mimalloc.workspace = true
 # `version` prints the build stamp as JSON (#573).
 serde_json.workspace = true
 sqlx.workspace = true
+reqwest.workspace = true
+serde.workspace = true

@@ -19,6 +19,8 @@ pub mod handlers;
 pub mod instrumentation;
 pub mod models;
 pub mod normalizer;
+pub mod replay;
+pub mod replay_types;
 pub mod repo;
 pub mod retention;
 pub mod retention_config;
@@ -89,13 +91,39 @@ pub fn build_ingest_router(
     readiness_pool: Arc<dyn DbPoolTrait>,
     dev_cors: bool,
 ) -> Router {
-    let router = health_routes(readiness_pool, SERVICE_USAGE_INGEST)
+    let mut app = health_routes(readiness_pool, SERVICE_USAGE_INGEST)
         .merge(
             SwaggerUi::new("/usage/v1/usage/docs")
                 .url("/usage/v1/usage/openapi.json", UsageDoc::openapi()),
         )
-        .merge(routers::ingest_router())
-        .with_state(state);
+        .merge(routers::ingest_router());
+
+    // #585: the authenticated surface is mounted only when `ingest_auth` is configured. This is a
+    // MOUNT-CONDITIONAL gate, which this repo has been bitten by before -- #473 (`468084a`) left
+    // discovery advertising `device_code` while `/device/verify` 404'd, because a route was
+    // conditionally mounted and nothing said so (ADR-0023). Three things keep that from
+    // recurring here, and all three are deliberate:
+    //
+    //   1. Nothing advertises /auth/v1/otel/*: it is absent from the OpenAPI document and from
+    //      discovery, so there is no document to contradict the router.
+    //   2. The decision is DERIVED from `state.ingest_auth`, not passed alongside it, so the mount
+    //      and the state the handlers read cannot disagree.
+    //   3. Absent means absent. There is no "mounted but permissive" branch -- the alternative
+    //      failure mode is a route that exists and admits, which is strictly worse.
+    //
+    // Why conditional at all, and where it is heading: #585 frames authenticated ingest as a
+    // PRErequisite for any non-gateway source going live, and ADR-0028 D8 makes the credential
+    // the source of truth for `source`. That argues for eventually making this surface mandatory
+    // the way `redis.url` is for authz-api/authz-idp/authz-budget (presence enforced loudly at
+    // startup, no silent degradation) rather than optional. It is optional today because the only
+    // callers are the out-of-cluster leg-3 sources, and forcing every deployment to configure a
+    // machine credential it has no client for would be a worse default than leaving the legacy
+    // gateway path as the sole door.
+    if state.ingest_auth.is_some() {
+        app = app.merge(routers::auth_ingest_router());
+    }
+
+    let router = app.with_state(state);
 
     if dev_cors {
         router.layer(CorsLayer::permissive())
@@ -136,6 +164,7 @@ pub async fn start_usage_server(
     database: &Database,
     oauth2: &Oauth2,
     scope_authority: &ScopeAuthorityConfig,
+    ingest_auth: Option<&config::IngestAuthConfig>,
     retention: &RetentionConfig,
 ) -> Result<()> {
     let pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::new(database).await?);
@@ -166,6 +195,7 @@ pub async fn start_usage_server(
         repo,
         bearer,
         scope_authority,
+        ingest_auth: ingest_auth.cloned(),
         raw_days: retention.enabled.then_some(retention.raw_days),
     });
 
@@ -248,6 +278,8 @@ async fn readiness_handler(pool: Arc<dyn DbPoolTrait>) -> StatusCode {
         crate::handlers::ingest::ingest_logs,
         crate::handlers::query::query_usage,
         crate::handlers::execution::query_executions,
+        crate::handlers::seat::query_seat_snapshots,
+        crate::handlers::day_fact::query_day_facts,
         crate::handlers::spend::query_spend
     ),
     components(
@@ -266,6 +298,16 @@ async fn readiness_handler(pool: Arc<dyn DbPoolTrait>) -> StatusCode {
             crate::models::execution::ExecutionQueryFilters,
             crate::models::execution::ExecutionSeriesPoint,
             crate::models::execution::ExecutionGroupBy,
+            crate::models::seat::SeatSnapshotQueryRequest,
+            crate::models::seat::SeatSnapshotQueryResponse,
+            crate::models::seat::SeatSnapshotQueryFilters,
+            crate::models::seat::SeatSnapshotSeriesPoint,
+            crate::models::seat::SeatGroupBy,
+            crate::models::day_fact::DayFactQueryRequest,
+            crate::models::day_fact::DayFactQueryResponse,
+            crate::models::day_fact::DayFactQueryFilters,
+            crate::models::day_fact::DayFactSeriesPoint,
+            crate::models::day_fact::DayFactGroupBy,
             crate::models::SpendQueryRequest,
             crate::models::SpendQueryResponse
         )

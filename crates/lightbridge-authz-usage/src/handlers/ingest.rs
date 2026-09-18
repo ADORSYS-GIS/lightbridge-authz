@@ -25,6 +25,7 @@ use tracing::{debug, instrument, warn};
 
 use crate::{
     UsageState,
+    handlers::payload_identity::check_identity_mismatch,
     models::IngestResponse,
     normalizer::{extract_f64, extract_i64, extract_string},
     repo::UsageEvent,
@@ -324,7 +325,7 @@ pub async fn ingest_logs(
     ))
 }
 
-async fn decode_otlp_request_async<T>(
+pub(crate) async fn decode_otlp_request_async<T>(
     headers: HeaderMap,
     body: Bytes,
     signal: &'static str,
@@ -395,7 +396,7 @@ fn decode_maybe_gzip<'a>(
     Ok(std::borrow::Cow::Owned(out))
 }
 
-async fn persist_events(
+pub(crate) async fn persist_events(
     state: &UsageState,
     signal_type: &str,
     events: &[UsageEvent],
@@ -525,7 +526,10 @@ pub fn apply_normalizer(
     }
 }
 
-fn extract_log_events(payload: ExportLogsServiceRequest, source: &str) -> Vec<UsageEvent> {
+pub(crate) fn extract_log_events(
+    payload: ExportLogsServiceRequest,
+    source: &str,
+) -> Vec<UsageEvent> {
     let mut events = Vec::new();
     let normalizer = crate::normalizer::REGISTRY.get(source);
 
@@ -539,6 +543,7 @@ fn extract_log_events(payload: ExportLogsServiceRequest, source: &str) -> Vec<Us
             for log_record in scope_logs.log_records {
                 let attrs =
                     merge_attr_maps(&resource_attrs, &key_values_to_map(&log_record.attributes));
+                check_identity_mismatch(&attrs, source);
 
                 let observed_nanos = if log_record.time_unix_nano > 0 {
                     log_record.time_unix_nano
@@ -601,7 +606,10 @@ fn is_json_content(headers: &HeaderMap) -> bool {
         .is_some_and(|value| value.contains("json"))
 }
 
-fn extract_trace_events(payload: ExportTraceServiceRequest, source: &str) -> Vec<UsageEvent> {
+pub(crate) fn extract_trace_events(
+    payload: ExportTraceServiceRequest,
+    source: &str,
+) -> Vec<UsageEvent> {
     let mut events = Vec::new();
     let normalizer = crate::normalizer::REGISTRY.get(source);
 
@@ -614,6 +622,7 @@ fn extract_trace_events(payload: ExportTraceServiceRequest, source: &str) -> Vec
         for scope_spans in resource_spans.scope_spans {
             for span in scope_spans.spans {
                 let attrs = merge_attr_maps(&resource_attrs, &key_values_to_map(&span.attributes));
+                check_identity_mismatch(&attrs, source);
 
                 let span_meta = crate::normalizer::SpanMeta {
                     trace_id: (!span.trace_id.is_empty()).then(|| hex::encode(&span.trace_id)),
@@ -668,7 +677,10 @@ fn extract_trace_events(payload: ExportTraceServiceRequest, source: &str) -> Vec
     events
 }
 
-fn extract_metric_events(payload: ExportMetricsServiceRequest, source: &str) -> Vec<UsageEvent> {
+pub(crate) fn extract_metric_events(
+    payload: ExportMetricsServiceRequest,
+    source: &str,
+) -> Vec<UsageEvent> {
     let mut events = Vec::new();
     let normalizer = crate::normalizer::REGISTRY.get(source);
 
@@ -758,6 +770,7 @@ fn number_data_point_to_event(
     normalizer: Option<crate::normalizer::NormalizerFn>,
 ) -> UsageEvent {
     let attrs = merge_attr_maps(metric_attrs, &key_values_to_map(&point.attributes));
+    check_identity_mismatch(&attrs, source);
 
     let value = match point.value {
         Some(number_data_point::Value::AsDouble(v)) => v,
@@ -809,6 +822,7 @@ fn histogram_data_point_to_event(
     normalizer: Option<crate::normalizer::NormalizerFn>,
 ) -> UsageEvent {
     let attrs = merge_attr_maps(metric_attrs, &key_values_to_map(&point.attributes));
+    check_identity_mismatch(&attrs, source);
 
     let count = u64_to_i64(point.count);
     let usage_value = point.sum.unwrap_or(count as f64);
@@ -854,6 +868,7 @@ fn exponential_histogram_data_point_to_event(
     normalizer: Option<crate::normalizer::NormalizerFn>,
 ) -> UsageEvent {
     let attrs = merge_attr_maps(metric_attrs, &key_values_to_map(&point.attributes));
+    check_identity_mismatch(&attrs, source);
 
     let count = u64_to_i64(point.count);
     let usage_value = point.sum.unwrap_or(count as f64);
@@ -899,6 +914,7 @@ fn summary_data_point_to_event(
     normalizer: Option<crate::normalizer::NormalizerFn>,
 ) -> UsageEvent {
     let attrs = merge_attr_maps(metric_attrs, &key_values_to_map(&point.attributes));
+    check_identity_mismatch(&attrs, source);
 
     let count = u64_to_i64(point.count);
 
@@ -2620,6 +2636,20 @@ mod tests {
                 Ok((vec![], false))
             }
 
+            async fn query_seat_snapshots(
+                &self,
+                _input: &crate::models::seat::SeatSnapshotQueryRequest,
+            ) -> Result<(Vec<crate::models::seat::SeatSnapshotSeriesPoint>, bool)> {
+                Ok((vec![], false))
+            }
+
+            async fn query_day_facts(
+                &self,
+                _input: &crate::models::day_fact::DayFactQueryRequest,
+            ) -> Result<(Vec<crate::models::day_fact::DayFactSeriesPoint>, bool)> {
+                Ok((vec![], false))
+            }
+
             async fn spend_for_account(
                 &self,
                 _account_id: &str,
@@ -2663,6 +2693,7 @@ mod tests {
             repo: Arc::new(PartialInsertRepo { persisted: 1 }),
             bearer: Arc::new(RefuseEverythingBearer),
             scope_authority: Arc::new(RefuseEverythingScopeAuthority),
+            ingest_auth: None,
             raw_days: Some(90),
         };
         let events = vec![base_usage_event(), base_usage_event()];

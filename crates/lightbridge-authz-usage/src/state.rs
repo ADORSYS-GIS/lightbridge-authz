@@ -11,7 +11,9 @@ use lightbridge_authz_bearer::BearerTokenServiceTrait;
 use lightbridge_authz_core::{Result, async_trait};
 use std::sync::Arc;
 
+use crate::models::day_fact::{DayFactQueryRequest, DayFactSeriesPoint};
 use crate::models::execution::{ExecutionQueryRequest, ExecutionSeriesPoint};
+use crate::models::seat::{SeatSnapshotQueryRequest, SeatSnapshotSeriesPoint};
 use crate::models::{UsageQueryRequest, UsageSeriesPoint};
 use crate::repo::{StoreRepo, UsageEvent};
 use crate::scope_authority::ScopeAuthority;
@@ -42,6 +44,17 @@ pub struct UsageState {
     /// purged, so `usage_events` holds everything ingested and no range is truncated by retention
     /// -- the handler must not stamp `truncated: true` on a complete answer (P2).
     pub raw_days: Option<i64>,
+    /// The credential-binding rules for the authenticated ingest surface (#585): the strict
+    /// `sub` -> `X-Source` map and the required audience.
+    ///
+    /// `None` means `ingest_auth` was absent from config, and is the single source of truth for
+    /// whether the `/auth/v1/otel/*` routes are mounted at all -- `build_ingest_router` derives
+    /// that decision from this field rather than taking a parallel flag, so the two can never
+    /// disagree. See that call site for why the surface is config-conditional today.
+    ///
+    /// Deny-by-default regardless: an empty `principals` map authorizes nobody, so a route that
+    /// somehow stayed mounted would refuse rather than admit.
+    pub ingest_auth: Option<crate::config::IngestAuthConfig>,
 }
 
 #[async_trait]
@@ -58,6 +71,20 @@ pub trait UsageRepoTrait: Send + Sync {
         &self,
         input: &ExecutionQueryRequest,
     ) -> Result<(Vec<ExecutionSeriesPoint>, bool)>;
+    /// Returns `(points, truncated)` for the seat grain (#728) -- see
+    /// `StoreRepo::query_seat_snapshots`'s doc comment for the #578 truncation contract `truncated`
+    /// documents.
+    async fn query_seat_snapshots(
+        &self,
+        input: &SeatSnapshotQueryRequest,
+    ) -> Result<(Vec<SeatSnapshotSeriesPoint>, bool)>;
+    /// Returns `(points, truncated)` for the day-facts grain (#727) -- see
+    /// `StoreRepo::query_day_facts`'s doc comment for the #578 truncation contract `truncated`
+    /// documents.
+    async fn query_day_facts(
+        &self,
+        input: &DayFactQueryRequest,
+    ) -> Result<(Vec<DayFactSeriesPoint>, bool)>;
     async fn spend_for_account(
         &self,
         account_id: &str,
@@ -87,6 +114,20 @@ impl UsageRepoTrait for StoreRepo {
         input: &ExecutionQueryRequest,
     ) -> Result<(Vec<ExecutionSeriesPoint>, bool)> {
         StoreRepo::query_executions(self, input).await
+    }
+
+    async fn query_seat_snapshots(
+        &self,
+        input: &SeatSnapshotQueryRequest,
+    ) -> Result<(Vec<SeatSnapshotSeriesPoint>, bool)> {
+        StoreRepo::query_seat_snapshots(self, input).await
+    }
+
+    async fn query_day_facts(
+        &self,
+        input: &DayFactQueryRequest,
+    ) -> Result<(Vec<DayFactSeriesPoint>, bool)> {
+        StoreRepo::query_day_facts(self, input).await
     }
 
     async fn spend_for_account(
