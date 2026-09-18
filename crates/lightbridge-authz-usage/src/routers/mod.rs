@@ -1,7 +1,9 @@
 use crate::UsageState;
+use crate::handlers::day_fact::query_day_facts;
 use crate::handlers::execution::query_executions;
 use crate::handlers::ingest::{ingest_logs, ingest_metrics, ingest_traces};
 use crate::handlers::query::query_usage;
+use crate::handlers::seat::query_seat_snapshots;
 use crate::handlers::spend::query_spend;
 use axum::{Router, routing::post};
 use std::sync::Arc;
@@ -31,12 +33,13 @@ pub fn auth_ingest_router() -> Router<Arc<UsageState>> {
         .route("/auth/v1/otel/logs", post(auth_ingest_logs))
 }
 
-/// The internal query routes (#347): `/usage/v1/usage/query` and `/usage/v1/spend/query`, mounted
-/// on `UsageServerGroup::query` -- the listener that requires and verifies a client certificate
-/// via `Tls::client_ca_bundle_path` (see `lightbridge_authz_core::server::serve_tls`'s
-/// `build_mtls_config`). Both routes moved off the shared `usage` listener above rather than
-/// growing a second, in-app authorization mechanism, because `axum-server`'s rustls integration
-/// enforces client-cert verification per-listener, not per-route.
+/// The internal query routes (#347): `/usage/v1/usage/query`, `/usage/v1/usage/executions/query`,
+/// `/usage/v1/usage/facts/query` and `/usage/v1/spend/query`, mounted on `UsageServerGroup::query`
+/// -- the listener that requires and verifies a client certificate via `Tls::client_ca_bundle_path`
+/// (see `lightbridge_authz_core::server::serve_tls`'s `build_mtls_config`). All routes moved off the
+/// shared `usage` listener above rather than growing a second, in-app authorization mechanism,
+/// because `axum-server`'s rustls integration enforces client-cert verification per-listener, not
+/// per-route.
 ///
 /// The two routes diverge above the TLS layer, though (#570): `/usage/v1/spend/query`
 /// (`handlers::spend::query_spend`) applies no further app-level check -- it is `authz-budget`'s
@@ -51,5 +54,7 @@ pub fn query_router() -> Router<Arc<UsageState>> {
     Router::new()
         .route("/usage/v1/usage/query", post(query_usage))
         .route("/usage/v1/usage/executions/query", post(query_executions))
+        .route("/usage/v1/usage/facts/query", post(query_day_facts))
+        .route("/usage/v1/usage/seats/query", post(query_seat_snapshots))
         .route("/usage/v1/spend/query", post(query_spend))
 }

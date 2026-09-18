@@ -1,4 +1,5 @@
 pub mod auth_ingest;
+pub mod day_fact;
 pub mod day_grain;
 pub mod execution;
 pub mod execution_ingest;
@@ -6,4 +7,5 @@ pub mod ingest;
 pub mod ownership;
 pub mod payload_identity;
 pub mod query;
+pub mod seat;
 pub mod spend;

@@ -1,8 +1,12 @@
 mod bucket;
+mod day_fact_filters;
+pub mod day_fact_query;
 pub mod day_grain;
 pub mod execution;
 mod execution_filters;
 pub mod execution_ingest;
+mod seat_filters;
+pub mod seat_query;
 
 use crate::models::{UsageGroupBy, UsageQueryRequest, UsageScope, UsageSeriesPoint};
 use chrono::{DateTime, Utc};
