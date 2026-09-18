@@ -8,10 +8,11 @@
 //! `emit.rs` (gov#196). The two must change together; the attribute names/types below are the
 //! contract, not an implementation detail.
 //!
-//! A record is a day-grain record iff it carries a `report` attribute. Records without one are
-//! request-grain and are handled by the existing OTLP path. A record that IS day-grain but is
-//! malformed is refused (`Err`), never silently dropped — the cutover's count assertions depend
-//! on every emitted record landing or the run failing loudly.
+//! A record is a day-grain record iff it carries a `report` attribute. This handler is only
+//! dispatched for the day-grain source, so a record without a `report` attribute — or one that IS
+//! day-grain but malformed — is refused (`Err`), never silently dropped and never re-routed to the
+//! request-grain path; the cutover's count assertions depend on every emitted record landing or
+//! the run failing loudly.
 
 use std::collections::HashMap;
 
@@ -42,7 +43,8 @@ pub enum DayGrainRecord {
 /// and alerts on disagreement; this function only ever stamps the trusted source.
 ///
 /// Returns `Ok(None)` when the record is not day-grain (no `report` attribute) — the caller
-/// routes it to the request-grain path. Returns `Err` when it IS day-grain but malformed.
+/// (`extract_day_grain`) treats that as a malformed record and refuses the whole request, never
+/// re-routing it to the request-grain path. Returns `Err` when it IS day-grain but malformed.
 pub fn parse_day_grain(
     attrs: &HashMap<String, Value>,
     source: &str,
