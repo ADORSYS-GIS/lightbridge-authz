@@ -279,6 +279,8 @@ async fn readiness_handler(pool: Arc<dyn DbPoolTrait>) -> StatusCode {
         crate::handlers::ingest::ingest_logs,
         crate::handlers::query::query_usage,
         crate::handlers::execution::query_executions,
+        crate::handlers::seat::query_seat_snapshots,
+        crate::handlers::day_fact::query_day_facts,
         crate::handlers::spend::query_spend
     ),
     components(
@@ -297,6 +299,16 @@ async fn readiness_handler(pool: Arc<dyn DbPoolTrait>) -> StatusCode {
             crate::models::execution::ExecutionQueryFilters,
             crate::models::execution::ExecutionSeriesPoint,
             crate::models::execution::ExecutionGroupBy,
+            crate::models::seat::SeatSnapshotQueryRequest,
+            crate::models::seat::SeatSnapshotQueryResponse,
+            crate::models::seat::SeatSnapshotQueryFilters,
+            crate::models::seat::SeatSnapshotSeriesPoint,
+            crate::models::seat::SeatGroupBy,
+            crate::models::day_fact::DayFactQueryRequest,
+            crate::models::day_fact::DayFactQueryResponse,
+            crate::models::day_fact::DayFactQueryFilters,
+            crate::models::day_fact::DayFactSeriesPoint,
+            crate::models::day_fact::DayFactGroupBy,
             crate::models::SpendQueryRequest,
             crate::models::SpendQueryResponse
         )
