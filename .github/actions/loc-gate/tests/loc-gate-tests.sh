@@ -97,7 +97,7 @@ output_contains() {
 # numbers + the override (AC1, AC2). The .rs itself is untouched in the head
 # commit, so any failure can only come from the baseline ratchet — the
 # per-file ceiling scan cannot fire.
-REPO="$(mktemp -d /tmp/opencode/loc-gate-XXXXXX)"
+REPO="$(mktemp -d "${TMPDIR:-/tmp}/loc-gate-XXXXXX")"
 new_repo "${REPO}"
 echo '{"crates/demo/lib.rs": 50}' >"${REPO}/.github/loc-baseline.json"
 commit_base
