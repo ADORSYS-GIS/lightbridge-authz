@@ -38,6 +38,15 @@ pub enum Commands {
         #[arg(long, short, env = "CONFIG_PATH")]
         config_path: String,
     },
+    /// Assert the usage store's row counts match a governance `ingest_manifests` export (#588).
+    /// Exits non-zero on any mismatch — the cutover's "block loudly" gate.
+    VerifyCounts {
+        #[arg(long, short, env = "CONFIG_PATH")]
+        config_path: String,
+        /// Path to the expected-counts manifest (JSON) exported from the governance store.
+        #[arg(long)]
+        manifest_path: String,
+    },
     /// Print this binary's build stamp as JSON (#573) -- the same struct both usage listeners
     /// serve at `GET /version`. Reads no config and touches no database.
     Version,

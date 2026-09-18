@@ -12,7 +12,9 @@ use lightbridge_authz_core::{Result, async_trait};
 use std::sync::Arc;
 
 use crate::models::day_fact::{DayFactQueryRequest, DayFactSeriesPoint};
+use crate::models::day_seat::{DayFact, SeatSnapshot};
 use crate::models::execution::{ExecutionQueryRequest, ExecutionSeriesPoint};
+use crate::models::execution_ingest::ExecutionGrainBatch;
 use crate::models::seat::{SeatSnapshotQueryRequest, SeatSnapshotSeriesPoint};
 use crate::models::{UsageQueryRequest, UsageSeriesPoint};
 use crate::repo::{StoreRepo, UsageEvent};
@@ -60,6 +62,13 @@ pub struct UsageState {
 #[async_trait]
 pub trait UsageRepoTrait: Send + Sync {
     async fn insert_usage_events(&self, events: &[UsageEvent]) -> Result<usize>;
+    /// Upserts day-grain facts into `usage_day_facts` on the natural key (#588).
+    async fn upsert_day_facts(&self, facts: &[DayFact]) -> Result<usize>;
+    /// Upserts seat snapshots into `usage_seat_snapshots` on the natural key (#588).
+    async fn upsert_seat_snapshots(&self, snapshots: &[SeatSnapshot]) -> Result<usize>;
+    /// Upserts an execution-grain batch (executions + model calls + tool calls + identities) in
+    /// one transaction (#588, AC2).
+    async fn upsert_execution_grain(&self, batch: &ExecutionGrainBatch) -> Result<usize>;
     /// Returns `(points, truncated)` -- see `StoreRepo::query_usage`'s doc comment for the #578
     /// truncation contract `truncated` documents.
     async fn query_usage(&self, input: &UsageQueryRequest)
@@ -100,6 +109,18 @@ pub trait UsageRepoTrait: Send + Sync {
 impl UsageRepoTrait for StoreRepo {
     async fn insert_usage_events(&self, events: &[UsageEvent]) -> Result<usize> {
         StoreRepo::insert_usage_events(self, events).await
+    }
+
+    async fn upsert_day_facts(&self, facts: &[DayFact]) -> Result<usize> {
+        crate::repo::day_grain::upsert_day_facts(self.pool(), facts).await
+    }
+
+    async fn upsert_seat_snapshots(&self, snapshots: &[SeatSnapshot]) -> Result<usize> {
+        crate::repo::day_grain::upsert_seat_snapshots(self.pool(), snapshots).await
+    }
+
+    async fn upsert_execution_grain(&self, batch: &ExecutionGrainBatch) -> Result<usize> {
+        crate::repo::execution_ingest::upsert_execution_grain(self.pool(), batch).await
     }
 
     async fn query_usage(
