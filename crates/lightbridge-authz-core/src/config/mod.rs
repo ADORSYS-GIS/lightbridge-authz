@@ -1166,6 +1166,7 @@ pub mod budget_internal;
 pub mod budget_server;
 pub mod claim_mapper;
 mod unknown_keys;
+mod unknown_keys_data;
 
 /// Re-exported from [`crate::config::claim_mapper`], which holds both types. Split out only to
 /// keep this file inside its LoC-gate baseline; see that module's own doc comment.

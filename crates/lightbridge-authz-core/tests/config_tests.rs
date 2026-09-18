@@ -435,11 +435,11 @@ fn load_from_path_warns_on_unknown_and_deprecated_keys() {
     let content = fs::read_to_string(&default_path).expect("default.yaml should exist");
 
     let yaml = content
-        .replace("server:", "unknown_top_level_key: foo\nserver:")
-        .replace("  signing:", "  signing:\n    unknown_signing_key: bar")
+        .replacen("server:\n", "unknown_top_level_key: foo\nserver:\n", 1)
+        .replace("  signing:\n", "  signing:\n    unknown_signing_key: bar\n")
         .replace(
-            "  relying_party:",
-            "  relying_party:\n    issuer: \"https://example.com\"",
+            "  relying_party:\n",
+            "  relying_party:\n    issuer: \"https://example.com\"\n",
         );
 
     let path = unique_temp_path("unknown-keys");
@@ -467,10 +467,317 @@ fn load_from_path_warns_on_unknown_and_deprecated_keys() {
 #[test]
 #[tracing_test::traced_test]
 fn load_from_path_clean_config_produces_no_unknown_key_warnings() {
+    tracing::warn!("__capture_probe__");
+    assert!(
+        logs_contain("__capture_probe__"),
+        "the injected tracing subscriber did not capture a warn emitted from this test \
+         -- the negative assertions below would pass vacuously on an empty buffer"
+    );
+
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/default.yaml");
-    let config = load_from_path(&path);
-    assert!(config.is_ok(), "default.yaml must load successfully");
+    let container =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.docker/authz/container.yaml");
+    for config_path in [path, container] {
+        let config = load_from_path(&config_path);
+        assert!(
+            config.is_ok(),
+            "checked-in config {} must load successfully",
+            config_path.display()
+        );
+    }
 
     assert!(!logs_contain("Unknown configuration key"));
     assert!(!logs_contain("is deprecated"));
+}
+
+/// Every section of the `Config` schema that deserializes into a YAML mapping (as opposed to a
+/// sequence such as `oauth2.clients` or a scalar such as `otel.enabled`), enumerated from the
+/// serde struct definitions in `crates/lightbridge-authz-core/src/config/` -- NOT from
+/// `KNOWN_KEYS`. The unknown-key walker (`unknown_keys.rs`) must descend into each of these, so
+/// the sync tests below assert both directions of drift against this list.
+fn config_section_paths() -> &'static [&'static str] {
+    &[
+        "",
+        "server",
+        "server.api",
+        "server.api.tls",
+        "server.opa",
+        "server.opa.tls",
+        "server.opa.basic_auth",
+        "server.idp",
+        "server.idp.tls",
+        "server.budget",
+        "server.budget.tls",
+        "server.budget_internal",
+        "server.budget_internal.tls",
+        "logging",
+        "database",
+        "redis",
+        "usage_service",
+        "oauth2",
+        "oauth2.issuance",
+        "oauth2.signing",
+        "oauth2.token_exchange",
+        "oauth2.relying_party",
+        "oauth2.rbac",
+        "oauth2.federation",
+        "otel",
+        "billing",
+        "quota_tiers",
+        "models",
+        "api_key_expiry",
+        "secret_claim",
+    ]
+}
+
+/// A `Config`-shaped YAML document that populates every field of every serde struct in
+/// `crates/lightbridge-authz-core/src/config/` (including `server.budget`,
+/// `server.budget_internal`, `secret_claim`, `quota_tiers`, `models`, `api_key_expiry` and every
+/// `oauth2.*` subsection) and deserializes cleanly. Any field a caller can actually set that is
+/// missing from `KNOWN_KEYS` would log a spurious "Unknown configuration key" warning here, so
+/// this is the config the no-warnings sync test drives.
+fn fully_populated_config_yaml() -> String {
+    r#"
+server:
+  api:
+    address: "0.0.0.0"
+    port: 3000
+    tls:
+      cert_path: "./api.crt"
+      key_path: "./api.key"
+      client_ca_bundle_path: "./ca.crt"
+    allowed_hosts: ["localhost", "127.0.0.1"]
+    rpc_base_path: "/api"
+  opa:
+    address: "0.0.0.0"
+    port: 3001
+    tls:
+      cert_path: "./opa.crt"
+      key_path: "./opa.key"
+      client_ca_bundle_path: "./ca.crt"
+    basic_auth:
+      username: "authorino"
+      password: "change-me"
+  idp:
+    address: "0.0.0.0"
+    port: 3004
+    tls:
+      cert_path: "./idp.crt"
+      key_path: "./idp.key"
+      client_ca_bundle_path: "./ca.crt"
+    static_dir: "./dist/static"
+  budget:
+    address: "0.0.0.0"
+    port: 3005
+    tls:
+      cert_path: "./budget.crt"
+      key_path: "./budget.key"
+      client_ca_bundle_path: "./ca.crt"
+    snapshot_refresh_seconds: 60
+    snapshot_active_window_minutes: 1440
+    snapshot_slow_lane_minutes: 2880
+    snapshot_seed_lookback_days: 7
+    snapshot_batch: 100
+    snapshot_concurrency: 4
+  budget_internal:
+    address: "0.0.0.0"
+    port: 3007
+    tls:
+      cert_path: "./budget.crt"
+      key_path: "./budget.key"
+      client_ca_bundle_path: "./ca.crt"
+    shared_secret: "s3cr3t"
+    shared_secret_header: "X-Budget-Shared-Secret"
+    remaining_grace_seconds: 30
+logging:
+  level: "info"
+database:
+  url: "postgres://postgres:postgres@localhost:5432/lightbridge_authz"
+  pool_size: 10
+redis:
+  url: "redis://localhost:6379"
+  ca_bundle_path: "./ca.crt"
+usage_service:
+  base_url: "https://authz-usage:3002"
+  insecure_skip_verify: false
+  ca_bundle_path: "./ca.crt"
+  client_cert_path: "./usage.crt"
+  client_key_path: "./usage.key"
+  timeout_ms: 5000
+oauth2:
+  type: self
+  jwks_url: "http://localhost:9100/realms/dev/protocol/openid-connect/certs"
+  jwks_ca_bundle_path: "./ca.crt"
+  oauth2_url: "http://localhost:9100"
+  issuer_url: "http://localhost:9100"
+  authorization_endpoint: "http://localhost:9100/authorize"
+  token_endpoint: "http://localhost:9100/token"
+  registration_endpoint: "http://localhost:9100/register"
+  issuance:
+    grant_type: "urn:ietf:params:oauth:grant-type:token-exchange"
+    client_id: "authz"
+    client_secret: "secret"
+    subject_token_type: "urn:ietf:params:oauth:token-type:access_token"
+    requested_token_type: "urn:ietf:params:oauth:token-type:jwt"
+    audience: "authz"
+    scope: "openid"
+  audience: ["authz"]
+  signing:
+    issuer: "https://issuer.example"
+    audience: "authz"
+    ttl_seconds: 3600
+    max_key_age_days: 30
+    claim_mappers:
+      - claim: lightbridge_api_roles
+        source: project_role
+        map:
+          owner: ["lightbridge-admin"]
+        default: []
+  token_exchange:
+    enabled: true
+    access_ttl_seconds: 900
+    authorization_code_ttl_seconds: 600
+    refresh_ttl_seconds: 2592000
+    allowed_scopes: ["openid", "profile", "email", "offline_access"]
+    refresh_absolute_ttl_seconds: 604800
+    refresh_reuse_grace_seconds: 30
+    device_code_ttl_seconds: 600
+    device_poll_interval_seconds: 5
+    device_verification_uri: "http://localhost:3004/ui/device"
+    client_credentials_ttl_seconds: 900
+  relying_party:
+    client_id: "lightbridge-ui"
+    callback_url: "http://localhost:3004/idp/callback"
+    client_secret: "secret"
+    state_encryption_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+    token_encryption_key: "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="
+    timeout_ms: 5000
+    browser_session_ttl_seconds: 28800
+  rbac:
+    roles_claim: "lightbridge_api_roles"
+    role_permissions:
+      lightbridge-admin: ["*"]
+    default_grants: ["lightbridge-viewer"]
+  clients: []
+  federation:
+    issuer: "http://localhost:9100/realms/dev"
+    discovery_url: "http://keycloak:9100/realms/dev"
+otel:
+  enabled: false
+  otlp_endpoint: "http://localhost:4317"
+  service_name: "lightbridge-authz"
+billing:
+  plans:
+    - id: "basic"
+      name: "Basic"
+      limits:
+        requests_per_second: 10
+        requests_per_day: 100
+        requests_per_month: 1000
+        concurrent_requests: 5
+quota_tiers:
+  tiers:
+    - id: "free"
+      name: "Free"
+    - id: "pro"
+      name: "Pro"
+models:
+  models:
+    - id: "gpt-4"
+      name: "GPT-4"
+api_key_expiry:
+  max_lifetime_days: 90
+secret_claim:
+  encryption_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+  ttl_seconds: 300
+  redeem_base_url: "https://authz-idp:3004"
+"#
+    .to_string()
+}
+
+fn insert_probe_at_section(value: &mut serde_yaml::Value, path: &str) {
+    let segments: Vec<&str> = path.split('.').filter(|s| !s.is_empty()).collect();
+    let mut current = value;
+    for segment in &segments {
+        current = current
+            .as_mapping_mut()
+            .expect("section must deserialize into a mapping")
+            .get_mut(serde_yaml::Value::String((*segment).to_string()))
+            .expect("section must be present in the fully-populated config");
+    }
+    current
+        .as_mapping_mut()
+        .expect("section must deserialize into a mapping")
+        .insert(
+            serde_yaml::Value::String("__unknown_probe__".to_string()),
+            serde_yaml::Value::from(1),
+        );
+}
+
+/// Direction 1 of KNOWN_KEYS drift: a field a caller can actually set, but that is missing from
+/// `KNOWN_KEYS`, logs a spurious "Unknown configuration key" warning. The clean-config test only
+/// exercises `config/default.yaml`'s paths (no budget snapshot / `secret_claim` / `quota_tiers` /
+/// `oauth2.*` subsections), so this drives every field of every struct and asserts none warns.
+#[test]
+#[tracing_test::traced_test]
+fn known_keys_flag_no_spurious_warnings_on_fully_populated_config() {
+    let yaml = fully_populated_config_yaml();
+    let path = unique_temp_path("full-config");
+    fs::write(&path, yaml).expect("temp file should write");
+
+    let config = load_from_path(&path);
+    assert!(
+        config.is_ok(),
+        "the fully-populated config must still load successfully"
+    );
+
+    assert!(
+        !logs_contain("Unknown configuration key"),
+        "a valid field is missing from KNOWN_KEYS and logged a spurious warning; add it to \
+         crates/lightbridge-authz-core/src/config/unknown_keys_data.rs"
+    );
+    assert!(!logs_contain("is deprecated"));
+
+    let _ = fs::remove_file(&path);
+}
+
+/// Direction 2 of KNOWN_KEYS drift: a section dropped/renamed in `KNOWN_KEYS` makes the walker's
+/// `get_known_fields` early-return, silently skipping that whole subtree. Each of these
+/// `__unknown_probe__` keys is guaranteed unknown, so a missing section (or a walk that fails to
+/// descend) shows up as the probe's warning never being emitted.
+#[test]
+#[tracing_test::traced_test]
+fn known_keys_descend_into_every_config_section() {
+    let mut value: serde_yaml::Value =
+        serde_yaml::from_str(&fully_populated_config_yaml()).expect("base config should parse");
+
+    for path in config_section_paths() {
+        insert_probe_at_section(&mut value, path);
+    }
+
+    let probed = serde_yaml::to_string(&value).expect("probed config should re-serialize");
+    let path = unique_temp_path("section-probes");
+    fs::write(&path, &probed).expect("temp file should write");
+
+    let config = load_from_path(&path);
+    assert!(
+        config.is_ok(),
+        "a config with probes planted in every section must still load successfully"
+    );
+
+    for section in config_section_paths() {
+        let probe_key = if section.is_empty() {
+            "__unknown_probe__".to_string()
+        } else {
+            format!("{section}.__unknown_probe__")
+        };
+        assert!(
+            logs_contain(&format!("Unknown configuration key '{probe_key}' ignored")),
+            "the walker did not emit a warning for the probe under '{section}' -- either that \
+             section is missing from KNOWN_KEYS (silently skipping the subtree) or the walk does \
+             not descend into it"
+        );
+    }
+
+    let _ = fs::remove_file(&path);
 }
