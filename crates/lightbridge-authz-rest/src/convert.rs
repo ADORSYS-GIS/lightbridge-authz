@@ -354,6 +354,9 @@ pub(crate) fn to_schema_model_catalog(models: &ModelCatalog) -> Vec<schema::Mode
 pub(crate) fn to_schema_session_revocation_result(
     revoked_count: u64,
 ) -> schema::SessionRevocationResult {
+    // `revokedCount` is a schema `Int` (Rust `i64`, see `authz.cstack`'s `Int` mapping note on
+    // `SimulateBudgetPolicyInput`) -- `rows_affected()` is `u64`, so this is a lossy cast only in
+    // the astronomically unreachable case of revoking over i64::MAX rows in one call.
     schema::SessionRevocationResult {
         revokedCount: revoked_count as i64,
     }

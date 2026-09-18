@@ -1,8 +1,5 @@
 use axum::{Router, routing::get};
-use lightbridge_authz_core::{
-    db::DbPoolTrait,
-    server::dev_cors_enabled,
-};
+use lightbridge_authz_core::db::DbPoolTrait;
 
 pub mod actor_api_key_labels;
 pub mod auth_provider;
@@ -24,6 +21,7 @@ pub mod handlers;
 mod health_handlers;
 pub mod html_page;
 pub mod identity_directory;
+pub mod introspect_budget;
 pub mod loopback;
 pub mod middleware;
 pub mod models;
@@ -66,16 +64,13 @@ use cratestack::ratelimit::StoreErrorPolicy;
 
 pub use opa_repo::{OpaRepoTrait, OpaState, SessionStatusRow};
 pub use procedures::Procedures;
-pub use server_api::{build_api_router, normalize_rpc_base_path, start_api_server};
+pub use server_api::{build_api_router, start_api_server};
 pub use server_budget::{build_budget_router, start_budget_server};
-pub use server_idp::{
-    build_bearer_service, build_idp_router, build_token_exchange_state, require_federation,
-    start_idp_server,
-};
+pub use server_idp::{build_idp_router, start_idp_server};
 pub use server_opa::{build_opa_router, start_opa_server};
 
 pub(crate) use convert::{has_permission, subject_from_ctx};
-pub(crate) use crate::error_convert::{budget_error_to_cratestack_error, to_cratestack_error};
+pub(crate) use crate::error_convert::to_cratestack_error;
 
 /// Idempotency replay window for the CRUD RPC surface (ADR-0003, "Idempotency").
 const IDEMPOTENCY_TTL: Duration = Duration::from_secs(24 * 3600);
@@ -133,12 +128,22 @@ where
 mod tests {
     use super::*;
     use axum::http::StatusCode;
+    use crate::convert::{
+        clamp_expiring_soon_window_days, DEFAULT_EXPIRING_SOON_WINDOW_DAYS,
+        MAX_EXPIRING_SOON_WINDOW_DAYS,
+    };
+    use crate::opa_doc::OpaDoc;
+    use crate::server_api::normalize_rpc_base_path;
+    use crate::server_idp::build_token_exchange_state;
+    use lightbridge_authz_api_key::repo::StoreRepo;
     use lightbridge_authz_bearer::{BearerTokenServiceTrait, TokenInfo};
+    use lightbridge_authz_core::async_trait;
     use lightbridge_authz_core::config::{
-        Oauth2TokenExchange, Oauth2Type, OauthClient, OauthClientType,
+        Oauth2, Oauth2TokenExchange, Oauth2Type, OauthClient, OauthClientType,
     };
     use serde_json::Value;
     use sqlx::postgres::PgPoolOptions;
+    use utoipa::OpenApi;
 
     struct NoopBearer;
 
