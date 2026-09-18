@@ -1,4 +1,6 @@
-use std::{collections::HashMap, sync::Arc};
+#[cfg(test)]
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use axum::{
     Json as AxumJson, Router,
@@ -6,24 +8,19 @@ use axum::{
     routing::{get, post},
 };
 use chrono::{DateTime, Utc};
-use cratestack::{CratestackContext, CratestackError, Value as CratestackValue};
+use cratestack::{CratestackContext, CratestackError};
 use lightbridge_authz_api::schema;
 use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_bearer::{BearerTokenService, BearerTokenServiceTrait, TokenInfo};
 use lightbridge_authz_core::{
-    Config, CreateAccount, CreateApiKey, DefaultLimits, Error, Result, RotateApiKey,
+    Config, DefaultLimits, Error, Result,
     config::{ApiKeyExpiry, ApiServer, BasicAuth, Billing, ModelCatalog, Oauth2, QuotaTiers},
-    cuid::cuid2,
     db::{DbPoolTrait, is_database_ready},
     server::serve_tls,
 };
 use lightbridge_authz_rest::{
-    OpaRepoTrait, OpaState, Procedures,
-    handlers::{AuthzStoreImpl, opa::validate_api_key_context},
-    middleware::bearer_auth,
-    models::authorino::AuthorinoMetadata,
-    rpc_authorize::RpcScope,
-    secret_claim::SecretClaimStore,
+    OpaRepoTrait, OpaState, Procedures, handlers::AuthzStoreImpl, middleware::bearer_auth,
+    rpc_authorize::RpcScope, secret_claim::SecretClaimStore,
 };
 
 use crate::mcp_rbac::ToolGate;
@@ -38,14 +35,26 @@ use crate::mcp_oauth_proxy::{
     oauth_authorization_server_metadata_handler, oauth_register_handler,
     openid_configuration_handler,
 };
+// lightbridge-authz#520 split the `validate-*` tool METHODS into `mcp_tools_validation.rs`, but
+// their `Params` structs and RBAC-gate-independent `run_validate_*` cores stay reachable here for
+// the SAME reason as the oauth re-exports above: this module's own `#[cfg(test)] mod tests`
+// constructs the `Params` structs and calls `run_validate_*` directly, through `use super::*`.
+// `#[cfg(test)]`-gated (unlike the oauth re-exports above) because, unlike those, nothing in
+// mcp.rs's own PRODUCTION code calls these -- only the test module does -- so an unconditional
+// `use` would warn (and fail `-D warnings`) on the plain, non-test build.
+#[cfg(test)]
+use crate::mcp_tools_validation::{
+    ValidateApiKeyParams, ValidateAuthorinoApiKeyParams, run_validate_api_key,
+    run_validate_authorino,
+};
 use reqwest::Client;
 use rmcp::{
     ErrorData, Json, RoleServer, ServerHandler,
-    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    handler::server::router::tool::ToolRouter,
     model::{ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo},
     schemars,
     service::RequestContext,
-    tool, tool_handler, tool_router,
+    tool_handler,
     transport::{
         StreamableHttpServerConfig,
         streamable_http_server::{
@@ -54,7 +63,9 @@ use rmcp::{
     },
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
 
 /// Service name reported by `GET /version` and the `service.build` startup log line (#573).
 pub const SERVICE_MCP: &str = "lightbridge-mcp";
@@ -66,7 +77,7 @@ struct RootResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-struct EndpointResponse {
+pub(crate) struct EndpointResponse {
     #[schemars(schema_with = "json_value_without_boolean_schema")]
     result: Value,
 }
@@ -114,14 +125,21 @@ impl From<DefaultLimitsInput> for DefaultLimits {
 #[derive(Clone)]
 pub struct LightbridgeMcpHandler {
     tool_router: ToolRouter<Self>,
-    cratestack_db: schema::Cratestack,
-    issuer: Arc<AuthzStoreImpl>,
-    opa_state: Arc<OpaState>,
+    // `pub(crate)` from here down: lightbridge-authz#520 split the `#[tool]` methods that read
+    // these fields out into `mcp_tools_*.rs` sibling modules, each with its own
+    // `#[tool_router(router = <domain>_tool_router)]` impl block on this same struct (summed in
+    // `new` below). Those impls live in different modules, so the fields they read need at least
+    // `pub(crate)` -- the same reasoning that already gave `cratestack_db`/`procedures` their own
+    // accessor methods below, just applied directly to the fields instead, so every moved tool
+    // body could travel verbatim (`self.issuer.foo(...)`, not a rewritten `self.issuer().foo(...)`).
+    pub(crate) cratestack_db: schema::Cratestack,
+    pub(crate) issuer: Arc<AuthzStoreImpl>,
+    pub(crate) opa_state: Arc<OpaState>,
     billing: Arc<Billing>,
     /// ADR-0025 Stage 2: translates a validated bearer token's `(iss, sub)` into the acting
     /// account id -- see `lightbridge_authz_rest::auth_provider::SubjectResolver`'s own doc
     /// comment for the self-signed-vs-external issuer cases this handles.
-    resolver: Arc<dyn lightbridge_authz_rest::auth_provider::SubjectResolver>,
+    pub(crate) resolver: Arc<dyn lightbridge_authz_rest::auth_provider::SubjectResolver>,
     /// Stashes a freshly minted API key secret so it is handed to the human out of band instead
     /// of returned in a tool result (GHSA-9pc6-965v-2c44).
     ///
@@ -130,11 +148,11 @@ pub struct LightbridgeMcpHandler {
     /// startup, would take this service down on any deployment that upgrades the image before
     /// provisioning the key, so the refusal was moved from process start to the affected operation.
     /// Every other tool keeps working.
-    claim_store: Option<Arc<SecretClaimStore>>,
+    pub(crate) claim_store: Option<Arc<SecretClaimStore>>,
     /// Origin of the `authz-idp` that redeems claims, from `secret_claim.redeem_base_url`.
     /// Configured, never derived from a request header, which would be attacker-influenced.
     /// `Some` exactly when `claim_store` is.
-    redeem_base_url: Option<Arc<String>>,
+    pub(crate) redeem_base_url: Option<Arc<String>>,
     /// The SAME `ProcedureRegistry` implementation `authz-api` and `authz-budget` mount on their
     /// RPC routers (lightbridge-authz#645), constructed here with `SERVICE_MCP` so `getBuildInfo`
     /// reports the process a caller actually reached. Every procedure-backed tool in
@@ -187,7 +205,22 @@ impl LightbridgeMcpHandler {
             budget: Default::default(),
         });
 
-        let mut tool_router = Self::tool_router();
+        // lightbridge-authz#520: the single `#[tool_router(router = tool_router)]` impl block this
+        // used to call now lives as eight `#[tool_router(router = <domain>_tool_router)]` impl
+        // blocks across `mcp_tools_*.rs` sibling modules (grouped accounts / project roster+limits
+        // / project crud+lifecycle / api-key crud+lifecycle / validation), summed here with
+        // `ToolRouter`'s `Add` impl -- see rmcp 3.2.0's own
+        // `tests/test_tool_routers.rs::test_router_1`/`test_router_2` for this exact pattern.
+        let mut tool_router = Self::accounts_tool_router()
+            + Self::accounts_lifecycle_tool_router()
+            + Self::project_roster_tool_router()
+            + Self::project_limits_tool_router()
+            + Self::project_crud_write_tool_router()
+            + Self::project_crud_read_tool_router()
+            + Self::project_lifecycle_tool_router()
+            + Self::api_keys_crud_tool_router()
+            + Self::api_keys_lifecycle_tool_router()
+            + Self::validation_tool_router();
         for route in crate::mcp_procedure_tools::procedure_tool_routes() {
             tool_router.add_route(route);
         }
@@ -326,7 +359,7 @@ impl ServerHandler for LightbridgeMcpHandler {
     }
 }
 
-fn parse_optional_datetime(
+pub(crate) fn parse_optional_datetime(
     value: Option<String>,
     field_name: &str,
 ) -> std::result::Result<Option<DateTime<Utc>>, ErrorData> {
@@ -346,7 +379,7 @@ fn parse_optional_datetime(
 
 /// `create-api-key`'s `expires_at` counterpart to `parse_optional_datetime` above --
 /// non-`Option`, since lightbridge-authz#395 made an expiry mandatory on every created key.
-fn parse_required_datetime(
+pub(crate) fn parse_required_datetime(
     value: String,
     field_name: &str,
 ) -> std::result::Result<DateTime<Utc>, ErrorData> {
@@ -357,7 +390,7 @@ fn parse_required_datetime(
         })
 }
 
-fn to_tool_error(error: Error) -> ErrorData {
+pub(crate) fn to_tool_error(error: Error) -> ErrorData {
     match error {
         Error::NotFound => ErrorData::resource_not_found("not found", None),
         Error::Forbidden(msg) => ErrorData::invalid_request(msg, None),
@@ -408,7 +441,7 @@ pub(crate) fn cratestack_error_to_tool_error(error: CratestackError) -> ErrorDat
 /// See `cratestack_context_from_token_info_matches_the_shared_helper` below for the regression
 /// test pinning this delegation — it fails immediately if a future edit reintroduces a
 /// hand-rolled, out-of-sync copy here.
-async fn cratestack_context_from_token_info(
+pub(crate) async fn cratestack_context_from_token_info(
     info: &TokenInfo,
     resolver: &dyn lightbridge_authz_rest::auth_provider::SubjectResolver,
 ) -> std::result::Result<CratestackContext, ErrorData> {
@@ -419,37 +452,8 @@ async fn cratestack_context_from_token_info(
 
 /// A `find_unique` that returned `None` (row absent, or hidden by the membership read policy) is a
 /// uniform not-found for the caller, matching the RPC surface's policy-driven behavior.
-fn require_found<T>(value: Option<T>) -> std::result::Result<T, ErrorData> {
+pub(crate) fn require_found<T>(value: Option<T>) -> std::result::Result<T, ErrorData> {
     value.ok_or_else(|| ErrorData::resource_not_found("not found", None))
-}
-
-/// Lower a `serde_json::Value` (the shape MCP tool inputs speak) into cratestack's own `Value`
-/// enum, which is what the generated model input structs carry for `Json` columns. Mirrors the
-/// identical private helper in `lightbridge-authz-rest` (the two crates use different JSON value
-/// types and neither ships a cross-conversion).
-fn json_to_cratestack_value(value: Value) -> CratestackValue {
-    match value {
-        Value::Null => CratestackValue::Null,
-        Value::Bool(b) => CratestackValue::Bool(b),
-        Value::Number(n) => n
-            .as_i64()
-            .map(CratestackValue::Int)
-            .unwrap_or_else(|| CratestackValue::Float(n.as_f64().unwrap_or(0.0))),
-        Value::String(s) => CratestackValue::String(s),
-        Value::Array(items) => {
-            CratestackValue::List(items.into_iter().map(json_to_cratestack_value).collect())
-        }
-        Value::Object(map) => CratestackValue::Map(
-            map.into_iter()
-                .map(|(k, v)| (k, json_to_cratestack_value(v)))
-                .collect(),
-        ),
-    }
-}
-
-/// Build a `cratestack::Json<cratestack::Value>` payload from any serde_json value.
-fn cratestack_json(value: Value) -> cratestack::Json<CratestackValue> {
-    cratestack::Json(json_to_cratestack_value(value))
 }
 
 /// Builds the tool result for a created or rotated API key.
@@ -458,7 +462,7 @@ fn cratestack_json(value: Value) -> cratestack::Json<CratestackValue> {
 /// That is deliberate and is the guarantee -- a runtime assertion that some field is absent can be
 /// defeated by a later edit, whereas a builder that has no access to the secret cannot emit it no
 /// matter what anyone adds to it. Both `create-api-key` and `rotate-api-key` return through here.
-fn api_key_claim_response(
+pub(crate) fn api_key_claim_response(
     api_key: &lightbridge_authz_core::ApiKey,
     oauth2_url: Option<&str>,
     redeem_base_url: &str,
@@ -477,7 +481,9 @@ fn api_key_claim_response(
     })
 }
 
-fn to_json_value<T: Serialize>(value: T) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
+pub(crate) fn to_json_value<T: Serialize>(
+    value: T,
+) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
     serde_json::to_value(value)
         .map(|result| Json(EndpointResponse { result }))
         .map_err(|error| {
@@ -488,11 +494,11 @@ fn to_json_value<T: Serialize>(value: T) -> std::result::Result<Json<EndpointRes
 const DEFAULT_LIST_LIMIT: u32 = 50;
 const MAX_LIST_LIMIT: u32 = 100;
 
-fn default_list_limit() -> u32 {
+pub(crate) fn default_list_limit() -> u32 {
     DEFAULT_LIST_LIMIT
 }
 
-fn normalize_list_pagination(offset: u32, limit: u32) -> (u32, u32) {
+pub(crate) fn normalize_list_pagination(offset: u32, limit: u32) -> (u32, u32) {
     (offset, limit.clamp(1, MAX_LIST_LIMIT))
 }
 
@@ -500,7 +506,7 @@ fn normalize_list_pagination(offset: u32, limit: u32) -> (u32, u32) {
 /// raw `TokenInfo::sub` directly. Every `AuthzStoreImpl` method this feeds treats its `subject`
 /// parameter as already-resolved (see `handlers::AuthzStoreImpl`'s own call sites into
 /// `StoreRepo`), so this is the one place on the MCP surface that translation must happen.
-async fn subject_from_request_context(
+pub(crate) async fn subject_from_request_context(
     context: &RequestContext<RoleServer>,
     resolver: &dyn lightbridge_authz_rest::auth_provider::SubjectResolver,
 ) -> std::result::Result<String, ErrorData> {
@@ -514,7 +520,7 @@ async fn subject_from_request_context(
         })
 }
 
-fn token_info_from_request_context(
+pub(crate) fn token_info_from_request_context(
     context: &RequestContext<RoleServer>,
 ) -> std::result::Result<TokenInfo, ErrorData> {
     let parts = context
@@ -531,1116 +537,17 @@ fn token_info_from_request_context(
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct CreateAccountParams {
-    /// A governance tier for the account's own default-project usage, validated against the
-    /// operator-configured catalogue. Since ADR-0006 `billingIdentity` lives on `Project`, and the
-    /// account's id is taken from the caller's JWT subject rather than any input field.
-    #[serde(default)]
-    default_quota: Option<String>,
-    /// Optional human-facing display label for the account. Blank/whitespace-only is treated as
-    /// "no name" rather than rejected. Purely a label: it is never unique and nothing resolves an
-    /// account by it -- `account_id` (the caller's JWT subject) remains the only handle.
-    #[serde(default)]
-    name: Option<String>,
+pub(crate) struct AccountByIdParams {
+    pub(crate) account_id: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct ListAccountsParams {
-    #[serde(default)]
-    offset: u32,
-    #[serde(default = "default_list_limit")]
-    limit: u32,
+pub(crate) struct ProjectByIdParams {
+    pub(crate) project_id: String,
 }
-
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct AccountByIdParams {
-    account_id: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct UpdateAccountParams {
-    account_id: String,
-    /// A tier drawn from the operator-configured catalogue, or omitted/`null` to clear it. Unlike
-    /// before #379, this always writes (no PATCH "leave untouched" state) -- `updateAccountDefaultQuota`
-    /// is a dedicated single-field procedure, not the generic `model.Account.update` verb, mirroring
-    /// `SetProjectMemberQuotaTierParams::quota_tier` below.
-    #[serde(default)]
-    default_quota: Option<String>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct UpdateAccountNameParams {
-    account_id: String,
-    /// The new display label, or omitted/`null`/blank to clear it back to unnamed. Like
-    /// `UpdateAccountParams::default_quota` above this always writes -- there is no PATCH
-    /// "leave untouched" state.
-    #[serde(default)]
-    name: Option<String>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct ListProjectRosterParams {
-    project_id: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct AddProjectMemberParams {
-    project_id: String,
-    /// The account being added. Since ADR-0006 an account id *is* the member's JWT subject.
-    account_id: String,
-    /// "lead" | "member"; defaults to "member" if omitted.
-    #[serde(default)]
-    role: Option<String>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct RemoveProjectMemberParams {
-    project_id: String,
-    account_id: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct SetProjectMemberRoleParams {
-    project_id: String,
-    account_id: String,
-    /// "lead" | "member". Lead-only.
-    role: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct SetProjectMemberQuotaTierParams {
-    project_id: String,
-    account_id: String,
-    /// A tier drawn from the operator-configured catalogue, or omitted to clear the ceiling.
-    #[serde(default)]
-    quota_tier: Option<String>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct CreateProjectParams {
-    account_id: String,
-    name: String,
-    #[serde(default)]
-    default_limits: Option<DefaultLimitsInput>,
-    billing_plan: String,
-    /// Who is paying for this project. Moved here from `Account` by ADR-0006 so one account can
-    /// bill several projects to different parties; unique across all projects.
-    billing_identity: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct SetProjectQuotaParams {
-    project_id: String,
-    /// The pooled, tier-catalogue-validated ceiling shared by everyone on the project, drawn from
-    /// the operator-configured catalogue, or omitted/`null` to clear it.
-    #[serde(default)]
-    project_quota: Option<String>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct SetProjectAllowedModelsParams {
-    project_id: String,
-    /// Model ids drawn from the operator-configured catalogue (`list-model-catalog`), or omitted/
-    /// `null` for "all models allowed". Rejected (#415, ADR-0018 Decision 5) if any entry is
-    /// absent from a non-empty catalogue.
-    #[serde(default)]
-    allowed_models: Option<Vec<String>>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct SetProjectModelPolicyParams {
-    project_id: String,
-    /// One of `"allow_all"` (every model, present and future -- the default), `"allowlist"`
-    /// (only `allowed_models` entries), or `"deny_all"` (no models). Any other value is refused
-    /// (ADR-0018 Decision 5 follow-up). Switching to `"allowlist"` while the project's current
-    /// `allowed_models` is empty/absent is refused -- populate it via `set-project-allowed-models`
-    /// first. `allowed_models` itself is never touched by this tool; it is preserved across a
-    /// policy change in either direction.
-    model_policy: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct ListProjectsParams {
-    account_id: String,
-    #[serde(default)]
-    offset: u32,
-    #[serde(default = "default_list_limit")]
-    limit: u32,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct ProjectByIdParams {
-    project_id: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct UpdateProjectParams {
-    project_id: String,
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    default_limits: Option<DefaultLimitsInput>,
-    #[serde(default)]
-    billing_plan: Option<String>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct CreateApiKeyParams {
-    project_id: String,
-    name: String,
-    /// Required (RFC3339), lightbridge-authz#395: every api key must carry an expiry, no more
-    /// than `api_key_expiry.max_lifetime_days` (default 90) days out. Server-validated
-    /// regardless -- see `AuthzStoreImpl::validate_expires_at`.
-    expires_at: String,
-    billing_plan: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct ListApiKeysParams {
-    project_id: String,
-    #[serde(default)]
-    offset: u32,
-    #[serde(default = "default_list_limit")]
-    limit: u32,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct ApiKeyByIdParams {
-    key_id: String,
-}
-
-// No `expires_at` here (lightbridge-authz#395): the generic `model.ApiKey.update` verb this tool
-// wraps had its `expiresAt` field removed at the schema level (`@readonly` on `ApiKey.expiresAt`
-// in `authz.cstack`) because it was a live, unvalidated bypass -- a caller could set any expiry,
-// including explicit `null`, with no cap and no procedure in the path. Changing a key's expiry now
-// goes exclusively through `rotate-api-key` (which validates it) or minting a new key via
-// `create-api-key`.
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct UpdateApiKeyParams {
-    key_id: String,
-    #[serde(default)]
-    name: Option<String>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct RotateApiKeyParams {
-    key_id: String,
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    expires_at: Option<String>,
-    #[serde(default)]
-    grace_period_seconds: Option<i64>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct ValidateApiKeyParams {
-    api_key: String,
-    #[serde(default)]
-    ip: Option<String>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct ValidateAuthorinoApiKeyParams {
-    api_key: String,
-    #[serde(default)]
-    ip: Option<String>,
-    #[serde(default)]
-    metadata: HashMap<String, Value>,
-}
-
-#[tool_router(router = tool_router)]
-impl LightbridgeMcpHandler {
-    #[tool(
-        name = "create-account",
-        description = "Create an account (RPC procedure.createAccount); seeds the caller as the account's first member"
-    )]
-    async fn create_account_tool(
-        &self,
-        context: RequestContext<RoleServer>,
-        Parameters(params): Parameters<CreateAccountParams>,
-    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = subject_from_request_context(&context, self.resolver.as_ref()).await?;
-        let account = self
-            .issuer
-            .create_account(
-                &subject,
-                CreateAccount {
-                    default_quota: params.default_quota,
-                    name: params.name,
-                },
-            )
-            .await
-            .map_err(to_tool_error)?;
-
-        to_json_value(account)
-    }
-
-    #[tool(
-        name = "list-accounts",
-        description = "List accounts (RPC model.Account.list)"
-    )]
-    async fn list_accounts_tool(
-        &self,
-        context: RequestContext<RoleServer>,
-        Parameters(params): Parameters<ListAccountsParams>,
-    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let token_info = token_info_from_request_context(&context)?;
-        let (offset, limit) = normalize_list_pagination(params.offset, params.limit);
-        let bound = self.cratestack_db.bind_context(
-            cratestack_context_from_token_info(&token_info, self.resolver.as_ref()).await?,
-        );
-        let accounts = bound
-            .account()
-            .find_many()
-            .limit(limit as i64)
-            .offset(offset as i64)
-            .run()
-            .await
-            .map_err(cratestack_error_to_tool_error)?;
-
-        to_json_value(accounts)
-    }
-
-    #[tool(
-        name = "get-account",
-        description = "Get an account (RPC model.Account.get)"
-    )]
-    async fn get_account_tool(
-        &self,
-        context: RequestContext<RoleServer>,
-        Parameters(params): Parameters<AccountByIdParams>,
-    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let token_info = token_info_from_request_context(&context)?;
-        let bound = self.cratestack_db.bind_context(
-            cratestack_context_from_token_info(&token_info, self.resolver.as_ref()).await?,
-        );
-        let account = bound
-            .account()
-            .find_unique(params.account_id)
-            .run()
-            .await
-            .map_err(cratestack_error_to_tool_error)?;
-
-        to_json_value(require_found(account)?)
-    }
-
-    #[tool(
-        name = "update-account",
-        description = "Update an account's default quota tier (RPC procedure.updateAccountDefaultQuota); tier validated against the configured catalogue"
-    )]
-    async fn update_account_tool(
-        &self,
-        context: RequestContext<RoleServer>,
-        Parameters(params): Parameters<UpdateAccountParams>,
-    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        // Repointed from the generic `model.Account.update` client call (#379): `defaultQuota` is
-        // now `@readonly` on that verb's generated input (it has no hook for the runtime-configured
-        // quota-tier catalogue check), so this now calls the `updateAccountDefaultQuota` procedure
-        // instead, same as the RPC surface -- mirrors how `delete-account` was already repointed
-        // from `model.Account.delete` to `deleteAccountPermanently`.
-        let subject = subject_from_request_context(&context, self.resolver.as_ref()).await?;
-        let account = self
-            .issuer
-            .update_account_default_quota(
-                &subject,
-                &params.account_id,
-                params.default_quota.as_deref(),
-            )
-            .await
-            .map_err(to_tool_error)?;
-
-        to_json_value(account)
-    }
-
-    #[tool(
-        name = "update-account-name",
-        description = "Set or clear an account's human-facing display name (RPC procedure.updateAccountName); the name is a label, never an identifier"
-    )]
-    async fn update_account_name_tool(
-        &self,
-        context: RequestContext<RoleServer>,
-        Parameters(params): Parameters<UpdateAccountNameParams>,
-    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        // Separate from `update-account` rather than another optional field on it: that tool is a
-        // single-field write onto `updateAccountDefaultQuota`, and folding a second column into it
-        // would resurrect exactly the "which fields did the caller mean to leave alone" ambiguity
-        // #379 removed from the account surface. Same `account:update` permission either way.
-        let subject = subject_from_request_context(&context, self.resolver.as_ref()).await?;
-        let account = self
-            .issuer
-            .update_account_name(&subject, &params.account_id, params.name.as_deref())
-            .await
-            .map_err(to_tool_error)?;
-
-        to_json_value(account)
-    }
-
-    #[tool(
-        name = "delete-account",
-        description = "Permanently delete an account and cascade-delete its projects/api-keys/memberships (RPC procedure.deleteAccountPermanently); owner-only"
-    )]
-    async fn delete_account_tool(
-        &self,
-        context: RequestContext<RoleServer>,
-        Parameters(params): Parameters<AccountByIdParams>,
-    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        // Repointed from the generic `model.Account.delete` client call: that op is now denied
-        // unconditionally (membership-role gating -- owner-only -- can't be expressed as an
-        // `@@allow` policy, see the schema's comment on `Account`), so this now calls the
-        // `deleteAccountPermanently` procedure instead, same as the RPC surface.
-        let subject = subject_from_request_context(&context, self.resolver.as_ref()).await?;
-        let account = self
-            .issuer
-            .delete_account(&subject, &params.account_id)
-            .await
-            .map_err(to_tool_error)?;
-
-        to_json_value(account)
-    }
-
-    #[tool(
-        name = "disable-account",
-        description = "Suspend an account (RPC procedure.disableAccount); every API key beneath it fails validation"
-    )]
-    async fn disable_account_tool(
-        &self,
-        context: RequestContext<RoleServer>,
-        Parameters(params): Parameters<AccountByIdParams>,
-    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = subject_from_request_context(&context, self.resolver.as_ref()).await?;
-        let account = self
-            .issuer
-            .disable_account(&subject, &params.account_id)
-            .await
-            .map_err(to_tool_error)?;
-
-        to_json_value(account)
-    }
-
-    #[tool(
-        name = "enable-account",
-        description = "Reactivate a suspended account (RPC procedure.enableAccount)"
-    )]
-    async fn enable_account_tool(
-        &self,
-        context: RequestContext<RoleServer>,
-        Parameters(params): Parameters<AccountByIdParams>,
-    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = subject_from_request_context(&context, self.resolver.as_ref()).await?;
-        let account = self
-            .issuer
-            .enable_account(&subject, &params.account_id)
-            .await
-            .map_err(to_tool_error)?;
-
-        to_json_value(account)
-    }
-
-    #[tool(
-        name = "list-project-roster",
-        description = "List a project's roster (RPC procedure.listProjectRoster); readable by any member of the project and by the owning account"
-    )]
-    async fn list_project_roster_tool(
-        &self,
-        context: RequestContext<RoleServer>,
-        Parameters(params): Parameters<ListProjectRosterParams>,
-    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = subject_from_request_context(&context, self.resolver.as_ref()).await?;
-        let members = self
-            .issuer
-            .list_project_roster(&subject, &params.project_id)
-            .await
-            .map_err(to_tool_error)?;
-
-        to_json_value(members)
-    }
-
-    #[tool(
-        name = "add-project-member",
-        description = "Add an account to a project's roster (RPC procedure.addProjectMember); idempotent, lead-only"
-    )]
-    async fn add_project_member_tool(
-        &self,
-        context: RequestContext<RoleServer>,
-        Parameters(params): Parameters<AddProjectMemberParams>,
-    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = subject_from_request_context(&context, self.resolver.as_ref()).await?;
-        let project = self
-            .issuer
-            .add_project_member(
-                &subject,
-                &params.project_id,
-                &params.account_id,
-                params.role.as_deref(),
-            )
-            .await
-            .map_err(to_tool_error)?;
-
-        to_json_value(project)
-    }
-
-    #[tool(
-        name = "remove-project-member",
-        description = "Remove an account from a project's roster (RPC procedure.removeProjectMember); lead-only"
-    )]
-    async fn remove_project_member_tool(
-        &self,
-        context: RequestContext<RoleServer>,
-        Parameters(params): Parameters<RemoveProjectMemberParams>,
-    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = subject_from_request_context(&context, self.resolver.as_ref()).await?;
-        let project = self
-            .issuer
-            .remove_project_member(&subject, &params.project_id, &params.account_id)
-            .await
-            .map_err(to_tool_error)?;
-
-        to_json_value(project)
-    }
-
-    #[tool(
-        name = "set-project-member-role",
-        description = "Change a roster member's role between lead and member (RPC procedure.setProjectMemberRole); lead-only"
-    )]
-    async fn set_project_member_role_tool(
-        &self,
-        context: RequestContext<RoleServer>,
-        Parameters(params): Parameters<SetProjectMemberRoleParams>,
-    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = subject_from_request_context(&context, self.resolver.as_ref()).await?;
-        let project = self
-            .issuer
-            .set_project_member_role(
-                &subject,
-                &params.project_id,
-                &params.account_id,
-                &params.role,
-            )
-            .await
-            .map_err(to_tool_error)?;
-
-        to_json_value(project)
-    }
-
-    #[tool(
-        name = "set-project-member-quota-tier",
-        description = "Set a roster member's per-project spending ceiling (RPC procedure.setProjectMemberQuotaTier); lead-only, tier validated against the configured catalogue"
-    )]
-    async fn set_project_member_quota_tier_tool(
-        &self,
-        context: RequestContext<RoleServer>,
-        Parameters(params): Parameters<SetProjectMemberQuotaTierParams>,
-    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = subject_from_request_context(&context, self.resolver.as_ref()).await?;
-        let project = self
-            .issuer
-            .set_project_member_quota_tier(
-                &subject,
-                &params.project_id,
-                &params.account_id,
-                params.quota_tier.as_deref(),
-            )
-            .await
-            .map_err(to_tool_error)?;
-
-        to_json_value(project)
-    }
-
-    #[tool(
-        name = "set-project-quota",
-        description = "Set a project's pooled spending ceiling (RPC procedure.setProjectQuota); owner or any roster member, tier validated against the configured catalogue"
-    )]
-    async fn set_project_quota_tool(
-        &self,
-        context: RequestContext<RoleServer>,
-        Parameters(params): Parameters<SetProjectQuotaParams>,
-    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = subject_from_request_context(&context, self.resolver.as_ref()).await?;
-        let project = self
-            .issuer
-            .set_project_quota(
-                &subject,
-                &params.project_id,
-                params.project_quota.as_deref(),
-            )
-            .await
-            .map_err(to_tool_error)?;
-
-        to_json_value(project)
-    }
-
-    #[tool(
-        name = "set-project-allowed-models",
-        description = "Set a project's AI-model allowlist (RPC procedure.setProjectAllowedModels); owner or any roster member, every entry validated against the operator-configured model catalogue (#415, ADR-0018 Decision 5)"
-    )]
-    async fn set_project_allowed_models_tool(
-        &self,
-        context: RequestContext<RoleServer>,
-        Parameters(params): Parameters<SetProjectAllowedModelsParams>,
-    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = subject_from_request_context(&context, self.resolver.as_ref()).await?;
-        let project = self
-            .issuer
-            .set_project_allowed_models(&subject, &params.project_id, params.allowed_models)
-            .await
-            .map_err(to_tool_error)?;
-
-        to_json_value(project)
-    }
-
-    #[tool(
-        name = "set-project-model-policy",
-        description = "Set a project's model access policy to allow_all/allowlist/deny_all (RPC procedure.setProjectModelPolicy); owner or any roster member. Refuses switching to allowlist while allowedModels is empty; never touches allowedModels itself (ADR-0018 Decision 5 follow-up)"
-    )]
-    async fn set_project_model_policy_tool(
-        &self,
-        context: RequestContext<RoleServer>,
-        Parameters(params): Parameters<SetProjectModelPolicyParams>,
-    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = subject_from_request_context(&context, self.resolver.as_ref()).await?;
-        let project = self
-            .issuer
-            .set_project_model_policy(&subject, &params.project_id, &params.model_policy)
-            .await
-            .map_err(to_tool_error)?;
-
-        to_json_value(project)
-    }
-
-    #[tool(
-        name = "create-project",
-        description = "Create a project (RPC model.Project.create); allowedModels is set afterward via set-project-allowed-models, projectQuota via set-project-quota"
-    )]
-    async fn create_project_tool(
-        &self,
-        context: RequestContext<RoleServer>,
-        Parameters(params): Parameters<CreateProjectParams>,
-    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let token_info = token_info_from_request_context(&context)?;
-        let bound = self.cratestack_db.bind_context(
-            cratestack_context_from_token_info(&token_info, self.resolver.as_ref()).await?,
-        );
-        let default_limits = params
-            .default_limits
-            .map(DefaultLimits::from)
-            .unwrap_or_default();
-        let default_limits_json =
-            serde_json::to_value(default_limits).unwrap_or_else(|_| json!({}));
-        // `projectQuota`/`allowedModels` are both `@readonly` on this generated input (#379 and
-        // #415 respectively -- neither has a hook for a runtime-configured catalogue check on the
-        // generic verb) -- a brand-new project always starts with `projectQuota = NULL`/
-        // `allowedModels = NULL` (both always valid), settable afterward via the
-        // `set-project-quota`/`set-project-allowed-models` tools below.
-        let input = schema::inputs::CreateProjectInput {
-            id: cuid2(),
-            accountId: params.account_id,
-            name: params.name,
-            defaultLimits: cratestack_json(default_limits_json),
-            billingPlan: params.billing_plan,
-            billingIdentity: params.billing_identity,
-        };
-        let project = bound
-            .project()
-            .create(input)
-            .run()
-            .await
-            .map_err(cratestack_error_to_tool_error)?;
-
-        to_json_value(project)
-    }
-
-    #[tool(
-        name = "list-projects",
-        description = "List projects under an account (RPC model.Project.list)"
-    )]
-    async fn list_projects_tool(
-        &self,
-        context: RequestContext<RoleServer>,
-        Parameters(params): Parameters<ListProjectsParams>,
-    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let token_info = token_info_from_request_context(&context)?;
-        let (offset, limit) = normalize_list_pagination(params.offset, params.limit);
-        let bound = self.cratestack_db.bind_context(
-            cratestack_context_from_token_info(&token_info, self.resolver.as_ref()).await?,
-        );
-        let projects = bound
-            .project()
-            .find_many()
-            .where_(schema::project::accountId().eq(params.account_id))
-            .limit(limit as i64)
-            .offset(offset as i64)
-            .run()
-            .await
-            .map_err(cratestack_error_to_tool_error)?;
-
-        to_json_value(projects)
-    }
-
-    #[tool(
-        name = "get-project",
-        description = "Get a project (RPC model.Project.get)"
-    )]
-    async fn get_project_tool(
-        &self,
-        context: RequestContext<RoleServer>,
-        Parameters(params): Parameters<ProjectByIdParams>,
-    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let token_info = token_info_from_request_context(&context)?;
-        let bound = self.cratestack_db.bind_context(
-            cratestack_context_from_token_info(&token_info, self.resolver.as_ref()).await?,
-        );
-        let project = bound
-            .project()
-            .find_unique(params.project_id)
-            .run()
-            .await
-            .map_err(cratestack_error_to_tool_error)?;
-
-        to_json_value(require_found(project)?)
-    }
-
-    #[tool(
-        name = "update-project",
-        description = "Update a project (RPC model.Project.update); allowedModels is set via set-project-allowed-models, not this tool (#415, ADR-0018 Decision 5)"
-    )]
-    async fn update_project_tool(
-        &self,
-        context: RequestContext<RoleServer>,
-        Parameters(params): Parameters<UpdateProjectParams>,
-    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let token_info = token_info_from_request_context(&context)?;
-        let bound = self.cratestack_db.bind_context(
-            cratestack_context_from_token_info(&token_info, self.resolver.as_ref()).await?,
-        );
-        let mut input = schema::inputs::UpdateProjectInput::default();
-        if let Some(name) = params.name {
-            input.name = Some(name);
-        }
-        if let Some(billing_plan) = params.billing_plan {
-            input.billingPlan = Some(billing_plan);
-        }
-        if let Some(default_limits) = params.default_limits {
-            let value = serde_json::to_value(DefaultLimits::from(default_limits))
-                .unwrap_or_else(|_| json!({}));
-            input.defaultLimits = Some(cratestack_json(value));
-        }
-        let project = bound
-            .project()
-            .update(params.project_id)
-            .set(input)
-            .run()
-            .await
-            .map_err(cratestack_error_to_tool_error)?;
-
-        to_json_value(project)
-    }
-
-    #[tool(
-        name = "delete-project",
-        description = "Delete a project (RPC model.Project.delete)"
-    )]
-    async fn delete_project_tool(
-        &self,
-        context: RequestContext<RoleServer>,
-        Parameters(params): Parameters<ProjectByIdParams>,
-    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let token_info = token_info_from_request_context(&context)?;
-        let bound = self.cratestack_db.bind_context(
-            cratestack_context_from_token_info(&token_info, self.resolver.as_ref()).await?,
-        );
-        let project = bound
-            .project()
-            .delete(params.project_id)
-            .run()
-            .await
-            .map_err(cratestack_error_to_tool_error)?;
-
-        to_json_value(project)
-    }
-
-    #[tool(
-        name = "disable-project",
-        description = "Suspend a project (RPC procedure.disableProject); every API key beneath it fails validation"
-    )]
-    async fn disable_project_tool(
-        &self,
-        context: RequestContext<RoleServer>,
-        Parameters(params): Parameters<ProjectByIdParams>,
-    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = subject_from_request_context(&context, self.resolver.as_ref()).await?;
-        let project = self
-            .issuer
-            .disable_project(&subject, &params.project_id)
-            .await
-            .map_err(to_tool_error)?;
-
-        to_json_value(project)
-    }
-
-    #[tool(
-        name = "enable-project",
-        description = "Reactivate a suspended project (RPC procedure.enableProject)"
-    )]
-    async fn enable_project_tool(
-        &self,
-        context: RequestContext<RoleServer>,
-        Parameters(params): Parameters<ProjectByIdParams>,
-    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = subject_from_request_context(&context, self.resolver.as_ref()).await?;
-        let project = self
-            .issuer
-            .enable_project(&subject, &params.project_id)
-            .await
-            .map_err(to_tool_error)?;
-
-        to_json_value(project)
-    }
-
-    #[tool(
-        name = "set-default-project",
-        description = "Promote a different project to be its account's default (RPC procedure.setDefaultProject); frees the old default project up for hard deletion"
-    )]
-    async fn set_default_project_tool(
-        &self,
-        context: RequestContext<RoleServer>,
-        Parameters(params): Parameters<ProjectByIdParams>,
-    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = subject_from_request_context(&context, self.resolver.as_ref()).await?;
-        let project = self
-            .issuer
-            .set_default_project(&subject, &params.project_id)
-            .await
-            .map_err(to_tool_error)?;
-
-        to_json_value(project)
-    }
-
-    #[tool(
-        name = "create-api-key",
-        description = "Create an API key (RPC procedure.createApiKey; the server generates + hashes the secret, and validates the billing plan and expires_at -- required, RFC3339, at most ~90 days out by default)"
-    )]
-    async fn create_api_key_tool(
-        &self,
-        context: RequestContext<RoleServer>,
-        Parameters(params): Parameters<CreateApiKeyParams>,
-    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let token_info = token_info_from_request_context(&context)?;
-        let subject = subject_from_request_context(&context, self.resolver.as_ref()).await?;
-        let expires_at = parse_required_datetime(params.expires_at, "expires_at")?;
-
-        let api_key_secret = self
-            .issuer
-            .create_api_key(
-                &subject,
-                Some(&token_info.access_token),
-                &params.project_id,
-                CreateApiKey {
-                    name: params.name,
-                    expires_at: Some(expires_at),
-                    billing_plan: params.billing_plan,
-                },
-            )
-            .await
-            .map_err(to_tool_error)?;
-
-        // GHSA-9pc6-965v-2c44: an MCP tool result is returned into the calling model's context,
-        // so it must never carry the secret. Stash it and hand back a claim only the requesting
-        // human, in a browser, can redeem. A failure to stash REFUSES the call -- there is no
-        // fallback that returns the secret inline.
-        // Fail closed when unconfigured. The secret exists at this point and the key row is
-        // written, but there is nowhere safe to put the secret -- and a tool result is not it.
-        // Refusing is the only correct answer; returning it would reintroduce the exposure this
-        // whole mechanism exists to remove.
-        let (Some(claim_store), Some(redeem_base_url)) =
-            (self.claim_store.as_ref(), self.redeem_base_url.as_ref())
-        else {
-            return Err(ErrorData::internal_error(
-                "secret_claim is not configured on this deployment, so an API key secret cannot \
-                 be delivered safely. An MCP tool result is read by the model, so the secret is \
-                 never returned here. Configure secret_claim (encryption_key, redeem_base_url) \
-                 and retry."
-                    .to_string(),
-                None,
-            ));
-        };
-        let claim = claim_store
-            .issue(&api_key_secret.secret, &subject)
-            .await
-            .map_err(to_tool_error)?;
-        to_json_value(api_key_claim_response(
-            &api_key_secret.api_key,
-            api_key_secret.oauth2_url.as_deref(),
-            redeem_base_url,
-            &claim.token,
-            claim.expires_in_seconds,
-        ))
-    }
-
-    #[tool(
-        name = "list-api-keys",
-        description = "List API keys under a project (RPC model.ApiKey.list)"
-    )]
-    async fn list_api_keys_tool(
-        &self,
-        context: RequestContext<RoleServer>,
-        Parameters(params): Parameters<ListApiKeysParams>,
-    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let token_info = token_info_from_request_context(&context)?;
-        let (offset, limit) = normalize_list_pagination(params.offset, params.limit);
-        let bound = self.cratestack_db.bind_context(
-            cratestack_context_from_token_info(&token_info, self.resolver.as_ref()).await?,
-        );
-        let api_keys = bound
-            .api_key()
-            .find_many()
-            .where_(schema::api_key::projectId().eq(params.project_id))
-            .limit(limit as i64)
-            .offset(offset as i64)
-            .run()
-            .await
-            .map_err(cratestack_error_to_tool_error)?;
-
-        to_json_value(api_keys)
-    }
-
-    #[tool(
-        name = "get-api-key",
-        description = "Get an API key (RPC model.ApiKey.get)"
-    )]
-    async fn get_api_key_tool(
-        &self,
-        context: RequestContext<RoleServer>,
-        Parameters(params): Parameters<ApiKeyByIdParams>,
-    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let token_info = token_info_from_request_context(&context)?;
-        let bound = self.cratestack_db.bind_context(
-            cratestack_context_from_token_info(&token_info, self.resolver.as_ref()).await?,
-        );
-        let api_key = bound
-            .api_key()
-            .find_unique(params.key_id)
-            .run()
-            .await
-            .map_err(cratestack_error_to_tool_error)?;
-
-        to_json_value(require_found(api_key)?)
-    }
-
-    #[tool(
-        name = "update-api-key",
-        description = "Update an API key's name (RPC model.ApiKey.update); expires_at can only be changed via rotate-api-key or by creating a new key (lightbridge-authz#395)"
-    )]
-    async fn update_api_key_tool(
-        &self,
-        context: RequestContext<RoleServer>,
-        Parameters(params): Parameters<UpdateApiKeyParams>,
-    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let token_info = token_info_from_request_context(&context)?;
-        let bound = self.cratestack_db.bind_context(
-            cratestack_context_from_token_info(&token_info, self.resolver.as_ref()).await?,
-        );
-        let mut input = schema::inputs::UpdateApiKeyInput::default();
-        if let Some(name) = params.name {
-            input.name = Some(name);
-        }
-        let api_key = bound
-            .api_key()
-            .update(params.key_id)
-            .set(input)
-            .run()
-            .await
-            .map_err(cratestack_error_to_tool_error)?;
-
-        to_json_value(api_key)
-    }
-
-    #[tool(
-        name = "delete-api-key",
-        description = "Delete (soft-delete) an API key (RPC model.ApiKey.delete)"
-    )]
-    async fn delete_api_key_tool(
-        &self,
-        context: RequestContext<RoleServer>,
-        Parameters(params): Parameters<ApiKeyByIdParams>,
-    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let token_info = token_info_from_request_context(&context)?;
-        let bound = self.cratestack_db.bind_context(
-            cratestack_context_from_token_info(&token_info, self.resolver.as_ref()).await?,
-        );
-        let api_key = bound
-            .api_key()
-            .delete(params.key_id)
-            .run()
-            .await
-            .map_err(cratestack_error_to_tool_error)?;
-
-        to_json_value(api_key)
-    }
-
-    #[tool(
-        name = "revoke-api-key",
-        description = "Revoke an API key (RPC procedure.revokeApiKey)"
-    )]
-    async fn revoke_api_key_tool(
-        &self,
-        context: RequestContext<RoleServer>,
-        Parameters(params): Parameters<ApiKeyByIdParams>,
-    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let subject = subject_from_request_context(&context, self.resolver.as_ref()).await?;
-        let api_key = self
-            .issuer
-            .revoke_api_key(&subject, &params.key_id)
-            .await
-            .map_err(to_tool_error)?;
-
-        to_json_value(api_key)
-    }
-
-    #[tool(
-        name = "rotate-api-key",
-        description = "Rotate an API key (RPC procedure.rotateApiKey)"
-    )]
-    async fn rotate_api_key_tool(
-        &self,
-        context: RequestContext<RoleServer>,
-        Parameters(params): Parameters<RotateApiKeyParams>,
-    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        let token_info = token_info_from_request_context(&context)?;
-        let subject = subject_from_request_context(&context, self.resolver.as_ref()).await?;
-        let expires_at = parse_optional_datetime(params.expires_at, "expires_at")?;
-
-        let api_key_secret = self
-            .issuer
-            .rotate_api_key(
-                &subject,
-                Some(&token_info.access_token),
-                &params.key_id,
-                RotateApiKey {
-                    name: params.name,
-                    expires_at,
-                    grace_period_seconds: params.grace_period_seconds,
-                },
-            )
-            .await
-            .map_err(to_tool_error)?;
-
-        // GHSA-9pc6-965v-2c44: an MCP tool result is returned into the calling model's context,
-        // so it must never carry the secret. Stash it and hand back a claim only the requesting
-        // human, in a browser, can redeem. A failure to stash REFUSES the call -- there is no
-        // fallback that returns the secret inline.
-        // Fail closed when unconfigured. The secret exists at this point and the key row is
-        // written, but there is nowhere safe to put the secret -- and a tool result is not it.
-        // Refusing is the only correct answer; returning it would reintroduce the exposure this
-        // whole mechanism exists to remove.
-        let (Some(claim_store), Some(redeem_base_url)) =
-            (self.claim_store.as_ref(), self.redeem_base_url.as_ref())
-        else {
-            return Err(ErrorData::internal_error(
-                "secret_claim is not configured on this deployment, so an API key secret cannot \
-                 be delivered safely. An MCP tool result is read by the model, so the secret is \
-                 never returned here. Configure secret_claim (encryption_key, redeem_base_url) \
-                 and retry."
-                    .to_string(),
-                None,
-            ));
-        };
-        let claim = claim_store
-            .issue(&api_key_secret.secret, &subject)
-            .await
-            .map_err(to_tool_error)?;
-        to_json_value(api_key_claim_response(
-            &api_key_secret.api_key,
-            api_key_secret.oauth2_url.as_deref(),
-            redeem_base_url,
-            &claim.token,
-            claim.expires_in_seconds,
-        ))
-    }
-
-    #[tool(
-        name = "validate-api-key",
-        description = "Validate an API key: hash lookup with status/expiry check, returns account/project context"
-    )]
-    async fn validate_api_key_tool(
-        &self,
-        Parameters(params): Parameters<ValidateApiKeyParams>,
-    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        run_validate_api_key(&self.opa_state, params).await
-    }
-
-    #[tool(
-        name = "validate-authorino-api-key",
-        description = "Validate an API key and return account/project context plus dynamic metadata enrichment"
-    )]
-    async fn validate_authorino_api_key(
-        &self,
-        Parameters(params): Parameters<ValidateAuthorinoApiKeyParams>,
-    ) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-        run_validate_authorino(&self.opa_state, params).await
-    }
-}
-
-/// Core of the `validate-api-key` tool, factored out of the RBAC-gated tool method (which takes
-/// no `RequestContext`, so the method itself is already directly callable, but keeping the two
-/// validation tools symmetric makes the "unauthorized" branch trivial to exercise in isolation).
-async fn run_validate_api_key(
-    opa_state: &Arc<OpaState>,
-    params: ValidateApiKeyParams,
-) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-    let validated = validate_api_key_context(opa_state, &params.api_key, params.ip)
-        .await
-        .map_err(to_tool_error)?;
-
-    let Some(validated) = validated else {
-        return Err(ErrorData::invalid_params(
-            "unauthorized",
-            Some(json!({ "http_status": 401 })),
-        ));
-    };
-
-    // `account_id`, not a nested `account` object: introspection stopped fetching the account row
-    // in Phase E (ADR-0006) because the `api_key_validation` view already carries the id, so there
-    // is no `Account` here to embed and re-adding the query would undo that. Matches
-    // `IntrospectResponse.account_id` on the REST surface.
-    to_json_value(json!({
-        "api_key": validated.api_key,
-        "project": validated.project,
-        "account_id": validated.account_id
-    }))
-}
-
-/// Core of the `validate-authorino-api-key` tool (validation + dynamic-metadata enrichment),
-/// factored out of the RBAC-gated tool method so it can be exercised directly in tests.
-async fn run_validate_authorino(
-    opa_state: &Arc<OpaState>,
-    params: ValidateAuthorinoApiKeyParams,
-) -> std::result::Result<Json<EndpointResponse>, ErrorData> {
-    let validated = validate_api_key_context(opa_state, &params.api_key, params.ip)
-        .await
-        .map_err(to_tool_error)?;
-
-    let Some(validated) = validated else {
-        return Err(ErrorData::invalid_params(
-            "unauthorized",
-            Some(json!({ "http_status": 401 })),
-        ));
-    };
-
-    let dynamic_metadata = AuthorinoMetadata {
-        account_id: validated.account_id.clone(),
-        project_id: validated.project.id.clone(),
-        api_key_id: validated.api_key.id.clone(),
-        api_key_status: validated.api_key.status.to_string(),
-        extra: params.metadata,
-    };
-
-    to_json_value(json!({
-        "api_key": validated.api_key,
-        "project": validated.project,
-        "account_id": validated.account_id,
-        "dynamic_metadata": dynamic_metadata
-    }))
+pub(crate) struct ApiKeyByIdParams {
+    pub(crate) key_id: String,
 }
 
 /// Build the streamable-HTTP transport config for the MCP server.
@@ -3023,6 +1930,66 @@ mod tests {
              (#720 added provision-account); update this count deliberately when the RPC surface \
              grows"
         );
+    }
+
+    /// lightbridge-authz#520 regression: the tool router's full output (name, description, input
+    /// AND output schema) must be byte-identical before and after splitting the single
+    /// `#[tool_router(router = tool_router)]` impl block into the `mcp_tools_*.rs` domain modules.
+    ///
+    /// `tests/fixtures/mcp_tool_snapshot.json` is a captured, sorted-by-name dump of
+    /// `lazy_handler().tool_router.list_all()` taken from `mcp.rs` on `main` at
+    /// `164b6a4` (this ticket's branch point), BEFORE any of the split's edits landed --
+    /// see the `dump_pre_split_tool_snapshot_520` temporary test used to capture it (removed
+    /// after capture; the PR description documents the exact steps). Comparing the RAW
+    /// `tool_router.list_all()` output (not `advertised_tools()`) deliberately excludes the
+    /// billing-plan description annotation, which is `create_api_key_tool_advertises_configured_billing_plans`'s
+    /// job, not this test's.
+    ///
+    /// Proven to catch drift (see the PR's Verification section for the actual run): temporarily
+    /// renaming `create-account` to `create-account-v2` in `mcp_tools_accounts.rs` made this test
+    /// fail with a diff at index 3 (`left: "create-account", right: "create-account-v2"`) before
+    /// the rename was reverted -- exactly the class of regression (a tool silently renamed during
+    /// the split) this test exists to catch.
+    #[tokio::test]
+    async fn advertised_tool_inventory_is_unchanged_by_the_520_domain_split() {
+        let handler = lazy_handler();
+        let mut live_tools = handler.tool_router.list_all();
+        live_tools.sort_by(|a, b| a.name.cmp(&b.name));
+
+        let fixture = include_str!("../tests/fixtures/mcp_tool_snapshot.json");
+        let expected_tools: Vec<rmcp::model::Tool> =
+            serde_json::from_str(fixture).expect("fixture should deserialize as Vec<Tool>");
+
+        assert_eq!(
+            live_tools.len(),
+            expected_tools.len(),
+            "tool count drifted from the pre-#520-split snapshot -- a tool was added, removed, or \
+             dropped during the domain-file split"
+        );
+        for (live, expected) in live_tools.iter().zip(expected_tools.iter()) {
+            assert_eq!(
+                live.name, expected.name,
+                "tool at this sorted position renamed or reordered relative to the pre-split \
+                 snapshot"
+            );
+            assert_eq!(
+                live.description, expected.description,
+                "tool `{}` description changed during the #520 split -- descriptions must move \
+                 verbatim",
+                live.name
+            );
+            assert_eq!(
+                live.input_schema, expected.input_schema,
+                "tool `{}` input schema changed during the #520 split -- Params structs must move \
+                 verbatim",
+                live.name
+            );
+            assert_eq!(
+                live.output_schema, expected.output_schema,
+                "tool `{}` output schema changed during the #520 split",
+                live.name
+            );
+        }
     }
 
     #[tokio::test]
