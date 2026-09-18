@@ -1,0 +1,2091 @@
+[
+  {
+    "name": "activate-budget-policy",
+    "description": "Activate a budget policy revision, hot-swapping the live evaluation engine (RPC procedure.activateBudgetPolicy)",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "description": "The procedure's input object, identical to the RPC request body's `args` field.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "args"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "add-project-member",
+    "description": "Add an account to a project's roster (RPC procedure.addProjectMember); idempotent, lead-only",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "account_id": {
+          "description": "The account being added. Since ADR-0006 an account id *is* the member's JWT subject.",
+          "type": "string"
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "role": {
+          "default": null,
+          "description": "\"lead\" | \"member\"; defaults to \"member\" if omitted.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "project_id",
+        "account_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "result": {
+          "type": [
+            "object",
+            "array",
+            "string",
+            "number",
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "approve-augmentation-request",
+    "description": "Approve a pending augmentation request (RPC procedure.approveAugmentationRequest)",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "description": "The procedure's input object, identical to the RPC request body's `args` field.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "args"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "create-account",
+    "description": "Create an account (RPC procedure.createAccount); seeds the caller as the account's first member",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "default_quota": {
+          "default": null,
+          "description": "A governance tier for the account's own default-project usage, validated against the\noperator-configured catalogue. Since ADR-0006 `billingIdentity` lives on `Project`, and the\naccount's id is taken from the caller's JWT subject rather than any input field.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "default": null,
+          "description": "Optional human-facing display label for the account. Blank/whitespace-only is treated as\n\"no name\" rather than rejected. Purely a label: it is never unique and nothing resolves an\naccount by it -- `account_id` (the caller's JWT subject) remains the only handle.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "result": {
+          "type": [
+            "object",
+            "array",
+            "string",
+            "number",
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "create-api-key",
+    "description": "Create an API key (RPC procedure.createApiKey; the server generates + hashes the secret, and validates the billing plan and expires_at -- required, RFC3339, at most ~90 days out by default)",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "billing_plan": {
+          "type": "string"
+        },
+        "expires_at": {
+          "description": "Required (RFC3339), lightbridge-authz#395: every api key must carry an expiry, no more\nthan `api_key_expiry.max_lifetime_days` (default 90) days out. Server-validated\nregardless -- see `AuthzStoreImpl::validate_expires_at`.",
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "project_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id",
+        "name",
+        "expires_at",
+        "billing_plan"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "result": {
+          "type": [
+            "object",
+            "array",
+            "string",
+            "number",
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "create-budget-policy-revision",
+    "description": "Author a new budget policy revision without activating it (RPC procedure.createBudgetPolicyRevision)",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "description": "The procedure's input object, identical to the RPC request body's `args` field.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "args"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "create-budget-reset-schedule",
+    "description": "Create a standing budget reset schedule (RPC procedure.createBudgetResetSchedule)",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "description": "The procedure's input object, identical to the RPC request body's `args` field.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "args"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "create-project",
+    "description": "Create a project (RPC model.Project.create); allowedModels is set afterward via set-project-allowed-models, projectQuota via set-project-quota",
+    "inputSchema": {
+      "$defs": {
+        "DefaultLimitsInput": {
+          "properties": {
+            "concurrent_requests": {
+              "default": null,
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "requests_per_day": {
+              "default": null,
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "requests_per_second": {
+              "default": null,
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "account_id": {
+          "type": "string"
+        },
+        "billing_identity": {
+          "description": "Who is paying for this project. Moved here from `Account` by ADR-0006 so one account can\nbill several projects to different parties; unique across all projects.",
+          "type": "string"
+        },
+        "billing_plan": {
+          "type": "string"
+        },
+        "default_limits": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DefaultLimitsInput"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "account_id",
+        "name",
+        "billing_plan",
+        "billing_identity"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "result": {
+          "type": [
+            "object",
+            "array",
+            "string",
+            "number",
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "delete-account",
+    "description": "Permanently delete an account and cascade-delete its projects/api-keys/memberships (RPC procedure.deleteAccountPermanently); owner-only",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "account_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "account_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "result": {
+          "type": [
+            "object",
+            "array",
+            "string",
+            "number",
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "delete-api-key",
+    "description": "Delete (soft-delete) an API key (RPC model.ApiKey.delete)",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "key_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "key_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "result": {
+          "type": [
+            "object",
+            "array",
+            "string",
+            "number",
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "delete-budget-reset-schedule",
+    "description": "Delete a standing budget reset schedule (RPC procedure.deleteBudgetResetSchedule)",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "description": "The procedure's input object, identical to the RPC request body's `args` field.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "args"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "delete-project",
+    "description": "Delete a project (RPC model.Project.delete)",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "project_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "result": {
+          "type": [
+            "object",
+            "array",
+            "string",
+            "number",
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "disable-account",
+    "description": "Suspend an account (RPC procedure.disableAccount); every API key beneath it fails validation",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "account_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "account_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "result": {
+          "type": [
+            "object",
+            "array",
+            "string",
+            "number",
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "disable-project",
+    "description": "Suspend a project (RPC procedure.disableProject); every API key beneath it fails validation",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "project_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "result": {
+          "type": [
+            "object",
+            "array",
+            "string",
+            "number",
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "enable-account",
+    "description": "Reactivate a suspended account (RPC procedure.enableAccount)",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "account_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "account_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "result": {
+          "type": [
+            "object",
+            "array",
+            "string",
+            "number",
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "enable-project",
+    "description": "Reactivate a suspended project (RPC procedure.enableProject)",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "project_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "result": {
+          "type": [
+            "object",
+            "array",
+            "string",
+            "number",
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "get-account",
+    "description": "Get an account (RPC model.Account.get)",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "account_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "account_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "result": {
+          "type": [
+            "object",
+            "array",
+            "string",
+            "number",
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "get-api-key",
+    "description": "Get an API key (RPC model.ApiKey.get)",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "key_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "key_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "result": {
+          "type": [
+            "object",
+            "array",
+            "string",
+            "number",
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "get-budget-balance",
+    "description": "Read any account's budget balance in integer micro-USD (RPC procedure.getBudgetBalance)",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "description": "The procedure's input object, identical to the RPC request body's `args` field.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "args"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "get-budget-policy-status",
+    "description": "Report which budget policy revision is currently serving (RPC procedure.getBudgetPolicyStatus)",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "description": "The procedure's input object, identical to the RPC request body's `args` field.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "args"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "get-build-info",
+    "description": "Return this process's build stamp (version, commit, image), same values as GET /version (RPC procedure.getBuildInfo)",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "description": "The procedure's input object, identical to the RPC request body's `args` field.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "args"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "get-effective-reset-schedule",
+    "description": "Report which schedule governs one account, and when it next fires (RPC procedure.getEffectiveResetSchedule)",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "description": "The procedure's input object, identical to the RPC request body's `args` field.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "args"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "get-my-access",
+    "description": "Return the caller's own roles and the permission set the server derives from them (RPC procedure.getMyAccess)",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "description": "The procedure's input object, identical to the RPC request body's `args` field.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "args"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "get-my-budget-balance",
+    "description": "Read the caller's own budget balance in integer micro-USD (RPC procedure.getMyBudgetBalance)",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "description": "The procedure's input object, identical to the RPC request body's `args` field.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "args"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "get-my-budget-refill-ladder",
+    "description": "Preview the caller's own position on the refill ladder before requesting (RPC procedure.getMyBudgetRefillLadder)",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "description": "The procedure's input object, identical to the RPC request body's `args` field.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "args"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "get-project",
+    "description": "Get a project (RPC model.Project.get)",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "project_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "result": {
+          "type": [
+            "object",
+            "array",
+            "string",
+            "number",
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "grant-budget",
+    "description": "Write a direct budget grant, bypassing self-service policy evaluation (RPC procedure.grantBudget)",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "description": "The procedure's input object, identical to the RPC request body's `args` field.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "args"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "grant-platform-role",
+    "description": "Grant a platform role to a subject; the role must exist in the configured catalogue (RPC procedure.grantPlatformRole)",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "description": "The procedure's input object, identical to the RPC request body's `args` field.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "args"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "list-accounts",
+    "description": "List accounts (RPC model.Account.list)",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "limit": {
+          "default": 50,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "offset": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "result": {
+          "type": [
+            "object",
+            "array",
+            "string",
+            "number",
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "list-api-keys",
+    "description": "List API keys under a project (RPC model.ApiKey.list)",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "limit": {
+          "default": 50,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "offset": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "project_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "result": {
+          "type": [
+            "object",
+            "array",
+            "string",
+            "number",
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "list-billing-plans",
+    "description": "List the operator-configured billing plan ids a new API key may be created against (RPC procedure.listBillingPlans)",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "description": "The procedure's input object, identical to the RPC request body's `args` field.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "args"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "list-budget-grants",
+    "description": "Page through any account's budget grant ledger (audit read) (RPC procedure.listBudgetGrants)",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "description": "The procedure's input object, identical to the RPC request body's `args` field.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "args"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "list-budget-reset-schedules",
+    "description": "List the standing budget reset schedules (RPC procedure.listBudgetResetSchedules)",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "description": "The procedure's input object, identical to the RPC request body's `args` field.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "args"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "list-model-catalog",
+    "description": "List the model catalogue a project's allowedModels/modelPolicy is edited against (RPC procedure.listModelCatalog)",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "description": "The procedure's input object, identical to the RPC request body's `args` field.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "args"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "list-my-augmentation-requests",
+    "description": "Page through the caller's own augmentation-request history (RPC procedure.listMyAugmentationRequests)",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "description": "The procedure's input object, identical to the RPC request body's `args` field.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "args"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "list-my-budget-grants",
+    "description": "Page through the caller's own budget grant ledger (RPC procedure.listMyBudgetGrants)",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "description": "The procedure's input object, identical to the RPC request body's `args` field.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "args"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "list-my-expiring-api-keys",
+    "description": "List the caller's own API keys expiring within a window, across every project (RPC procedure.listMyExpiringApiKeys)",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "description": "The procedure's input object, identical to the RPC request body's `args` field.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "args"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "list-pending-augmentation-requests",
+    "description": "Page through augmentation requests awaiting review (RPC procedure.listPendingAugmentationRequests)",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "description": "The procedure's input object, identical to the RPC request body's `args` field.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "args"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "list-platform-role-grants",
+    "description": "Page through platform role grants (RPC procedure.listPlatformRoleGrants)",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "description": "The procedure's input object, identical to the RPC request body's `args` field.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "args"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "list-project-roster",
+    "description": "List a project's roster (RPC procedure.listProjectRoster); readable by any member of the project and by the owning account",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "project_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "result": {
+          "type": [
+            "object",
+            "array",
+            "string",
+            "number",
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "list-projects",
+    "description": "List projects under an account (RPC model.Project.list)",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "account_id": {
+          "type": "string"
+        },
+        "limit": {
+          "default": 50,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "offset": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "account_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "result": {
+          "type": [
+            "object",
+            "array",
+            "string",
+            "number",
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "provision-account",
+    "description": "Create an account for an arbitrary Keycloak subject who cannot self-provision one (admin) (RPC procedure.provisionAccount)",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "description": "The procedure's input object, identical to the RPC request body's `args` field.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "args"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "query-sessions",
+    "description": "Page through sessions; own-scope callers see only their own rows regardless of filter (RPC procedure.querySessions)",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "description": "The procedure's input object, identical to the RPC request body's `args` field.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "args"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "reject-augmentation-request",
+    "description": "Reject a pending augmentation request (RPC procedure.rejectAugmentationRequest)",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "description": "The procedure's input object, identical to the RPC request body's `args` field.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "args"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "remove-project-member",
+    "description": "Remove an account from a project's roster (RPC procedure.removeProjectMember); lead-only",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "account_id": {
+          "type": "string"
+        },
+        "project_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id",
+        "account_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "result": {
+          "type": [
+            "object",
+            "array",
+            "string",
+            "number",
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "request-budget-refill",
+    "description": "Request a self-service budget refill, evaluated against the active policy (RPC procedure.requestBudgetRefill)",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "description": "The procedure's input object, identical to the RPC request body's `args` field.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "args"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "resolve-actor-labels",
+    "description": "Batch-resolve user/account/project/API-key ids to display labels (RPC procedure.resolveActorLabels)",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "description": "The procedure's input object, identical to the RPC request body's `args` field.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "args"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "resolve-user-profiles",
+    "description": "Batch-resolve account ids to display profiles (RPC procedure.resolveUserProfiles)",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "description": "The procedure's input object, identical to the RPC request body's `args` field.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "args"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "revoke-api-key",
+    "description": "Revoke an API key (RPC procedure.revokeApiKey)",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "key_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "key_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "result": {
+          "type": [
+            "object",
+            "array",
+            "string",
+            "number",
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "revoke-budget-grant",
+    "description": "Revoke a previously written budget grant (RPC procedure.revokeBudgetGrant)",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "description": "The procedure's input object, identical to the RPC request body's `args` field.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "args"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "revoke-own-sessions",
+    "description": "Revoke every refresh-token session belonging to the caller (RPC procedure.revokeOwnSessions)",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "description": "The procedure's input object, identical to the RPC request body's `args` field.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "args"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "revoke-platform-role",
+    "description": "Revoke a platform role from a subject (RPC procedure.revokePlatformRole)",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "description": "The procedure's input object, identical to the RPC request body's `args` field.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "args"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "revoke-session",
+    "description": "Revoke one session by id; revoking someone else's additionally requires session:revoke (RPC procedure.revokeSession)",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "description": "The procedure's input object, identical to the RPC request body's `args` field.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "args"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "revoke-subject-sessions",
+    "description": "Revoke every refresh-token session belonging to a named subject (offboarding kill switch) (RPC procedure.revokeSubjectSessions)",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "description": "The procedure's input object, identical to the RPC request body's `args` field.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "args"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "rotate-api-key",
+    "description": "Rotate an API key (RPC procedure.rotateApiKey)",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "expires_at": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "grace_period_seconds": {
+          "default": null,
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "key_id": {
+          "type": "string"
+        },
+        "name": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "key_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "result": {
+          "type": [
+            "object",
+            "array",
+            "string",
+            "number",
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "run-budget-reset-schedule-now",
+    "description": "Fire a reset schedule by hand; dryRun still enumerates the whole estate, so it is gated at the same budget:schedule-manage permission (RPC procedure.runBudgetResetScheduleNow)",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "description": "The procedure's input object, identical to the RPC request body's `args` field.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "args"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "search-users",
+    "description": "Search the estate's users by name or email (RPC procedure.searchUsers)",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "description": "The procedure's input object, identical to the RPC request body's `args` field.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "args"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "set-default-project",
+    "description": "Promote a different project to be its account's default (RPC procedure.setDefaultProject); frees the old default project up for hard deletion",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "project_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "result": {
+          "type": [
+            "object",
+            "array",
+            "string",
+            "number",
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "set-project-allowed-models",
+    "description": "Set a project's AI-model allowlist (RPC procedure.setProjectAllowedModels); owner or any roster member, every entry validated against the operator-configured model catalogue (#415, ADR-0018 Decision 5)",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "allowed_models": {
+          "default": null,
+          "description": "Model ids drawn from the operator-configured catalogue (`list-model-catalog`), or omitted/\n`null` for \"all models allowed\". Rejected (#415, ADR-0018 Decision 5) if any entry is\nabsent from a non-empty catalogue.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "project_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "result": {
+          "type": [
+            "object",
+            "array",
+            "string",
+            "number",
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "set-project-member-quota-tier",
+    "description": "Set a roster member's per-project spending ceiling (RPC procedure.setProjectMemberQuotaTier); lead-only, tier validated against the configured catalogue",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "account_id": {
+          "type": "string"
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "quota_tier": {
+          "default": null,
+          "description": "A tier drawn from the operator-configured catalogue, or omitted to clear the ceiling.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "project_id",
+        "account_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "result": {
+          "type": [
+            "object",
+            "array",
+            "string",
+            "number",
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "set-project-member-role",
+    "description": "Change a roster member's role between lead and member (RPC procedure.setProjectMemberRole); lead-only",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "account_id": {
+          "type": "string"
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "role": {
+          "description": "\"lead\" | \"member\". Lead-only.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id",
+        "account_id",
+        "role"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "result": {
+          "type": [
+            "object",
+            "array",
+            "string",
+            "number",
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "set-project-model-policy",
+    "description": "Set a project's model access policy to allow_all/allowlist/deny_all (RPC procedure.setProjectModelPolicy); owner or any roster member. Refuses switching to allowlist while allowedModels is empty; never touches allowedModels itself (ADR-0018 Decision 5 follow-up)",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "model_policy": {
+          "description": "One of `\"allow_all\"` (every model, present and future -- the default), `\"allowlist\"`\n(only `allowed_models` entries), or `\"deny_all\"` (no models). Any other value is refused\n(ADR-0018 Decision 5 follow-up). Switching to `\"allowlist\"` while the project's current\n`allowed_models` is empty/absent is refused -- populate it via `set-project-allowed-models`\nfirst. `allowed_models` itself is never touched by this tool; it is preserved across a\npolicy change in either direction.",
+          "type": "string"
+        },
+        "project_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id",
+        "model_policy"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "result": {
+          "type": [
+            "object",
+            "array",
+            "string",
+            "number",
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "set-project-quota",
+    "description": "Set a project's pooled spending ceiling (RPC procedure.setProjectQuota); owner or any roster member, tier validated against the configured catalogue",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "project_id": {
+          "type": "string"
+        },
+        "project_quota": {
+          "default": null,
+          "description": "The pooled, tier-catalogue-validated ceiling shared by everyone on the project, drawn from\nthe operator-configured catalogue, or omitted/`null` to clear it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "project_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "result": {
+          "type": [
+            "object",
+            "array",
+            "string",
+            "number",
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "simulate-budget-policy",
+    "description": "Evaluate a proposed policy against a supplied scenario, in memory, with no DB write (RPC procedure.simulateBudgetPolicy)",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "description": "The procedure's input object, identical to the RPC request body's `args` field.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "args"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "update-account",
+    "description": "Update an account's default quota tier (RPC procedure.updateAccountDefaultQuota); tier validated against the configured catalogue",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "account_id": {
+          "type": "string"
+        },
+        "default_quota": {
+          "default": null,
+          "description": "A tier drawn from the operator-configured catalogue, or omitted/`null` to clear it. Unlike\nbefore #379, this always writes (no PATCH \"leave untouched\" state) -- `updateAccountDefaultQuota`\nis a dedicated single-field procedure, not the generic `model.Account.update` verb, mirroring\n`SetProjectMemberQuotaTierParams::quota_tier` below.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "account_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "result": {
+          "type": [
+            "object",
+            "array",
+            "string",
+            "number",
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "update-account-name",
+    "description": "Set or clear an account's human-facing display name (RPC procedure.updateAccountName); the name is a label, never an identifier",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "account_id": {
+          "type": "string"
+        },
+        "name": {
+          "default": null,
+          "description": "The new display label, or omitted/`null`/blank to clear it back to unnamed. Like\n`UpdateAccountParams::default_quota` above this always writes -- there is no PATCH\n\"leave untouched\" state.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "account_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "result": {
+          "type": [
+            "object",
+            "array",
+            "string",
+            "number",
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "update-api-key",
+    "description": "Update an API key's name (RPC model.ApiKey.update); expires_at can only be changed via rotate-api-key or by creating a new key (lightbridge-authz#395)",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "key_id": {
+          "type": "string"
+        },
+        "name": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "key_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "result": {
+          "type": [
+            "object",
+            "array",
+            "string",
+            "number",
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "update-budget-reset-schedule",
+    "description": "Update a standing budget reset schedule (RPC procedure.updateBudgetResetSchedule)",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "description": "The procedure's input object, identical to the RPC request body's `args` field.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "args"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "update-project",
+    "description": "Update a project (RPC model.Project.update); allowedModels is set via set-project-allowed-models, not this tool (#415, ADR-0018 Decision 5)",
+    "inputSchema": {
+      "$defs": {
+        "DefaultLimitsInput": {
+          "properties": {
+            "concurrent_requests": {
+              "default": null,
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "requests_per_day": {
+              "default": null,
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "requests_per_second": {
+              "default": null,
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "billing_plan": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "default_limits": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DefaultLimitsInput"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "name": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "project_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "result": {
+          "type": [
+            "object",
+            "array",
+            "string",
+            "number",
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "validate-api-key",
+    "description": "Validate an API key: hash lookup with status/expiry check, returns account/project context",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "api_key": {
+          "type": "string"
+        },
+        "ip": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "api_key"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "result": {
+          "type": [
+            "object",
+            "array",
+            "string",
+            "number",
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "validate-authorino-api-key",
+    "description": "Validate an API key and return account/project context plus dynamic metadata enrichment",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "api_key": {
+          "type": "string"
+        },
+        "ip": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "metadata": {
+          "additionalProperties": true,
+          "default": {},
+          "type": "object"
+        }
+      },
+      "required": [
+        "api_key"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "result": {
+          "type": [
+            "object",
+            "array",
+            "string",
+            "number",
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "type": "object"
+    }
+  }
+]

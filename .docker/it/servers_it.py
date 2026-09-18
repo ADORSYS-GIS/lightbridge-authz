@@ -38,7 +38,9 @@ MAX_WAIT_SECONDS = int(os.environ.get("MAX_WAIT_SECONDS", "180"))
 # tools in lightbridge-authz#645 without touching it is exactly how it broke `main`
 # (lightbridge-authz#671). If you add or rename a tool, grep for the tool name and update BOTH.
 EXPECTED_MCP_TOOLS = {
-    # Hand-written tools (`#[tool]` methods in `app/lightbridge-authz/src/mcp.rs`).
+    # Hand-written tools (`#[tool]` methods split by domain across
+    # `app/lightbridge-authz/src/mcp_tools_*.rs` since lightbridge-authz#520; `mcp.rs` itself now
+    # owns only server construction and cross-domain support code).
     "create-account",
     "list-accounts",
     "get-account",
