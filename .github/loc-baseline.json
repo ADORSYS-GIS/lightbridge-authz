@@ -1,6 +1,6 @@
 {
   "app/lightbridge-authz/src/main.rs": 212,
-  "app/lightbridge-authz/src/mcp.rs": 3590,
+  "app/lightbridge-authz/src/mcp.rs": 2473,
   "crates/lightbridge-authz-api-key/src/repo.rs": 3515,
   "crates/lightbridge-authz-bearer/src/lib.rs": 500,
   "crates/lightbridge-authz-budget/src/augmentation.rs": 748,
