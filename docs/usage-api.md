@@ -448,28 +448,23 @@ The aggregate names are part of the API surface — a KPI query reads them direc
 
 | KPI measure | Aggregate (view) | Grain source | Bucket |
 | --- | --- | --- | --- |
-| spend | `mv_executions_spend_hourly` | `usage_executions.estimated_cost_micro_usd` | hourly |
-| requests | `mv_executions_requests_hourly` | `usage_executions` | hourly |
-| latency p50/p95/p99 | `mv_executions_latency_hourly` | `usage_executions.duration_ms` | hourly |
-| tokens | `mv_model_calls_tokens_hourly` | `usage_model_calls.input_tokens`/`output_tokens` | hourly |
-| spend | `mv_model_calls_spend_hourly` | `usage_model_calls.cost_micro_usd` | hourly |
-| requests | `mv_model_calls_requests_hourly` | `usage_model_calls` | hourly |
 | active users | `mv_day_facts_active_users_daily` | `usage_day_facts.total_active_users` | daily |
 | acceptances | `mv_day_facts_acceptances_daily` | `usage_day_facts.total_acceptances_count` | daily |
 | spend | `mv_day_facts_spend_daily` | `usage_day_facts.cost_micro_usd` | daily |
 | active seats | `mv_seat_snapshots_active_daily` | `usage_seat_snapshots.pending_cancellation_date` | daily |
 
+Only the day/seat grains are aggregate-backed. The execution/model-call grains have **no**
+aggregate: their query endpoint spans grains (executions + model_calls + tool_calls), so per the
+"no aggregate spans grains" rule it reads raw — a refreshed-but-never-read aggregate would be dead
+weight (the #587 review's P2).
+
 - **Money discipline (ADR-0028 D0):** every spend aggregate carries both the `SUM(...)` of known
   costs (NULL when every row in the bucket is unknown — never coerced to 0) and a separate
   `unknown_cost_count` of the rows whose cost was NULL, so unknown-cost rows are counted separately
   and never silently folded in as free.
-- **Latency percentiles** use Postgres's exact `percentile_cont` ordered-set aggregate, computed
-  once at refresh time (the percentile becomes a lookup, not a per-query computation). No
-  `timescaledb_toolkit` is needed on plain Postgres, so no approximation is used and none needs
-  naming here.
-- **Granularity:** execution/model-call aggregates are hourly; day/seat aggregates are daily. A
-  coarser query re-buckets the view's bucket column; a query finer than the view's granularity is
-  not representable from the aggregate and must read the raw grain table.
+- **Granularity:** the day/seat aggregates are daily. A coarser query re-buckets the view's bucket
+  column; a query finer than the view's granularity is not representable from the aggregate and
+  must read the raw grain table.
 - **Routing:** the day-facts (`/usage/v1/usage/facts/query`) and seat (`/usage/v1/usage/seats/query`)
   endpoints read from these aggregates when they exist, falling back to the raw grain table when
   absent (e.g. before the migration has run). The execution endpoint (`/usage/v1/usage/executions/

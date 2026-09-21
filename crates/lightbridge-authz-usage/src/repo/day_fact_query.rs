@@ -55,14 +55,9 @@ impl StoreRepo {
         // table. The day-facts aggregates carry the full dimension set and pre-computed measures,
         // so the routing is semantically equivalent (see `build_day_fact_query`). ALL THREE must
         // exist: the aggregate path joins them, so a missing one would be a hard 500, not a
-        // graceful degradation to the raw table.
-        let use_aggregate = self
-            .aggregates_exist(&[
-                "mv_day_facts_acceptances_daily",
-                "mv_day_facts_active_users_daily",
-                "mv_day_facts_spend_daily",
-            ])
-            .await?;
+        // graceful degradation to the raw table. The existence decision is TTL-cached
+        // (`aggregate_views_available`) so it does not probe the DB on every request.
+        let use_aggregate = self.aggregate_views_available().await?;
         let mut builder = build_day_fact_query(input, use_aggregate);
         let rows: Vec<DayFactQueryRow> = builder.build_query_as().fetch_all(self.pool()).await?;
 

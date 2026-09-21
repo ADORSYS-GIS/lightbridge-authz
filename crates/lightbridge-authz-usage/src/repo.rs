@@ -16,7 +16,7 @@ use lightbridge_authz_core::db::DbPoolTrait;
 use lightbridge_authz_core::{Error, Result};
 use sqlx::{FromRow, PgPool, Postgres, QueryBuilder};
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tracing::{debug, instrument};
 
 #[derive(Debug, Clone)]
@@ -64,6 +64,10 @@ pub struct UsageEvent {
 #[derive(Debug, Clone)]
 pub struct StoreRepo {
     pool: Arc<dyn DbPoolTrait>,
+    /// TTL cache for the KPI-aggregate existence probe (#587). The query endpoints route to the
+    /// aggregates when they exist and fall back to the raw grain table when absent; this cache
+    /// stops that `to_regclass` probe from running on every request (the #587 review's P2).
+    aggregate_cache: Arc<Mutex<aggregate::AggregateCache>>,
 }
 
 #[derive(Debug, FromRow)]
@@ -100,7 +104,10 @@ struct UsageQueryRow {
 
 impl StoreRepo {
     pub fn new(pool: Arc<dyn DbPoolTrait>) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            aggregate_cache: Arc::new(Mutex::new(aggregate::AggregateCache::new())),
+        }
     }
 
     pub(crate) fn pool(&self) -> &PgPool {

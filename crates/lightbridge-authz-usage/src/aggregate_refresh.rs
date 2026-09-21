@@ -22,13 +22,12 @@ use crate::aggregate_refresh_config::AggregateRefreshConfig;
 /// The named KPI aggregates, in dependency-free order (each is independent, built on one grain
 /// table). This list is the single source of truth for what the refresh job refreshes and what the
 /// existence/refresh tests assert -- keep it in lockstep with the migration's materialized views.
+///
+/// Only the day/seat grains are aggregate-backed: the day-facts and seat query endpoints route to
+/// these views, while the execution/model-call endpoints span grains and stay raw (see the
+/// migration header). There is deliberately no hourly aggregate here -- a refreshed-but-never-read
+/// view is dead weight (the #587 review's P2).
 pub const AGGREGATE_VIEWS: &[&str] = &[
-    "mv_executions_spend_hourly",
-    "mv_executions_requests_hourly",
-    "mv_executions_latency_hourly",
-    "mv_model_calls_tokens_hourly",
-    "mv_model_calls_spend_hourly",
-    "mv_model_calls_requests_hourly",
     "mv_day_facts_active_users_daily",
     "mv_day_facts_acceptances_daily",
     "mv_day_facts_spend_daily",
@@ -59,10 +58,16 @@ pub async fn run_aggregate_refresh_loop(pool: Arc<PgPool>, config: AggregateRefr
     loop {
         ticker.tick().await;
         match refresh_all_aggregates(&pool).await {
-            Ok(()) => {
+            Ok(true) => {
+                // A refresh actually ran; record it so a test or operator can prove it.
                 if let Err(e) = record_last_refresh(&pool).await {
                     warn!("usage aggregate refresh: failed to record last refresh: {e}");
                 }
+            }
+            Ok(false) => {
+                // Skipped because another replica holds the refresh lock; nothing was refreshed, so
+                // we deliberately do NOT record a last_refreshed_at for a run that refreshed
+                // nothing (the #587 review's P2: a silent skip must not masquerade as a refresh).
             }
             Err(e) => warn!("usage aggregate refresh run failed: {e}"),
         }
@@ -73,7 +78,11 @@ pub async fn run_aggregate_refresh_loop(pool: Arc<PgPool>, config: AggregateRefr
 /// session-level advisory lock so concurrent replicas do not refresh the same view at once. Each
 /// view is refreshed in its own statement; a failure aborts the run (the loop logs and retries next
 /// tick).
-pub async fn refresh_all_aggregates(pool: &PgPool) -> Result<()> {
+///
+/// Returns `Ok(true)` when a refresh actually ran, `Ok(false)` when this run was skipped because
+/// another replica holds the refresh lock (the caller must NOT record a `last_refreshed_at` for a
+/// run that refreshed nothing), and `Err` on a real failure.
+pub async fn refresh_all_aggregates(pool: &PgPool) -> Result<bool> {
     let mut conn = pool.acquire().await?;
 
     // Exclusive advisory lock for the refresh job, so two replicas never run `REFRESH ...
@@ -90,8 +99,10 @@ pub async fn refresh_all_aggregates(pool: &PgPool) -> Result<()> {
         .map_err(|e| Error::Database(format!("usage aggregate refresh lock failed: {e}")))?;
 
     if !lock_acquired {
-        // Another replica is currently refreshing; skip this run gracefully.
-        return Ok(());
+        // Another replica is currently refreshing; skip this run. Log it (a silent skip would
+        // masquerade as a refresh -- the #587 review's P2) and report that nothing was refreshed.
+        warn!("usage aggregate refresh: another replica holds the refresh lock; skipping this run");
+        return Ok(false);
     }
 
     let result = async {
@@ -112,13 +123,18 @@ pub async fn refresh_all_aggregates(pool: &PgPool) -> Result<()> {
     .await;
 
     // Always release the session lock, whether the refresh succeeded or failed, so a failed run
-    // does not leave the lock held on a pooled connection.
-    sqlx::query("SELECT pg_advisory_unlock(587000001)")
+    // does not leave the lock held on a pooled connection. If the unlock itself fails, log it (a
+    // held lock on a pooled connection would block future refreshes) but do NOT let it mask the
+    // refresh result -- the refresh error, if any, is the more important signal (the #587 review's
+    // P2: an unlock failure must not overwrite a refresh failure).
+    if let Err(e) = sqlx::query("SELECT pg_advisory_unlock(587000001)")
         .execute(&mut *conn)
         .await
-        .map_err(|e| Error::Database(format!("usage aggregate refresh unlock failed: {e}")))?;
+    {
+        warn!("usage aggregate refresh: failed to release advisory lock: {e}");
+    }
 
-    result
+    result.map(|()| true)
 }
 
 /// Records the last successful refresh into `usage_aggregate_refresh_state`, so a test or operator

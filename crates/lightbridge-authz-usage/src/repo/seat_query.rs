@@ -50,10 +50,9 @@ impl StoreRepo {
         // #587: route to the KPI aggregate when it exists, else fall back to the raw grain table.
         // The seat aggregate preserves every dimension the query can filter/group on and carries
         // the three pre-computed counts, so the routing is semantically equivalent at any bucket
-        // granularity (seat data is daily; the aggregate is daily).
-        let use_aggregate = self
-            .aggregate_exists("mv_seat_snapshots_active_daily")
-            .await?;
+        // granularity (seat data is daily; the aggregate is daily). The existence decision is
+        // TTL-cached (`aggregate_views_available`) so it does not probe the DB on every request.
+        let use_aggregate = self.aggregate_views_available().await?;
         let mut builder = build_seat_snapshot_query(input, use_aggregate);
         let rows: Vec<SeatSnapshotQueryRow> =
             builder.build_query_as().fetch_all(self.pool()).await?;

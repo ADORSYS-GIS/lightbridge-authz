@@ -69,20 +69,20 @@ async fn refresh_records_last_refresh(pool: PgPool) {
     );
 }
 
-/// AC4: money discipline on the execution-grain spend aggregate. A row with NULL cost must be
-/// counted in `unknown_cost_count` and must NOT make `cost_micro_usd` read as 0.
+/// AC4: money discipline on the day-facts spend aggregate. A row with NULL cost must be counted in
+/// `unknown_cost_count` and must NOT make the bucket's `cost_micro_usd` read as 0.
 #[sqlx::test(migrations = "../../migrations-usage")]
 async fn spend_aggregate_counts_unknown_cost_separately(pool: PgPool) {
-    let t: DateTime<Utc> = Utc::now();
+    let d = NaiveDate::from_ymd_opt(2026, 9, 1).expect("valid date");
 
-    // Two executions in the same hour: one with a known cost, one with unknown (NULL) cost.
+    // Two day-facts rows on the same day: one with a known cost, one with unknown (NULL) cost.
     sqlx::query(
-        "INSERT INTO usage_executions (id, observed_at, source, trace_id, span_id, estimated_cost_micro_usd)
+        "INSERT INTO usage_day_facts (source, day, subject_kind, subject_id, cost_micro_usd)
          VALUES
-            ('exec_a', $1, 'eaig', 't1', 's1', 500),
-            ('exec_b', $1, 'eaig', 't2', 's2', NULL)",
+            ('github-copilot', $1, 'org', 'org-1', 500),
+            ('github-copilot', $1, 'org', 'org-2', NULL)",
     )
-    .bind(t)
+    .bind(d)
     .execute(&pool)
     .await
     .expect("insert should succeed");
@@ -92,12 +92,12 @@ async fn spend_aggregate_counts_unknown_cost_separately(pool: PgPool) {
         .expect("refresh should succeed");
 
     let (cost, unknown): (Option<i64>, i64) = sqlx::query_as(
-        "SELECT cost_micro_usd, unknown_cost_count
-         FROM mv_executions_spend_hourly WHERE source = 'eaig'",
+        "SELECT SUM(cost_micro_usd)::bigint, SUM(unknown_cost_count)::bigint
+         FROM mv_day_facts_spend_daily WHERE source = 'github-copilot'",
     )
     .fetch_one(&pool)
     .await
-    .expect("aggregate row should exist");
+    .expect("aggregate query should succeed");
 
     assert_eq!(
         cost,
@@ -110,19 +110,19 @@ async fn spend_aggregate_counts_unknown_cost_separately(pool: PgPool) {
     );
 }
 
-/// AC4 (all-unknown bucket): when EVERY row in a bucket has unknown cost, `cost_micro_usd` must be
-/// NULL (never 0) and `unknown_cost_count` must equal the row count.
+/// AC4 (all-unknown bucket): when EVERY row in a bucket has unknown cost, the bucket's
+/// `cost_micro_usd` must be NULL (never 0) and `unknown_cost_count` must equal the row count.
 #[sqlx::test(migrations = "../../migrations-usage")]
 async fn spend_aggregate_all_unknown_is_null_not_zero(pool: PgPool) {
-    let t: DateTime<Utc> = Utc::now();
+    let d = NaiveDate::from_ymd_opt(2026, 9, 1).expect("valid date");
 
     sqlx::query(
-        "INSERT INTO usage_executions (id, observed_at, source, trace_id, span_id, estimated_cost_micro_usd)
+        "INSERT INTO usage_day_facts (source, day, subject_kind, subject_id, cost_micro_usd)
          VALUES
-            ('exec_a', $1, 'eaig', 't1', 's1', NULL),
-            ('exec_b', $1, 'eaig', 't2', 's2', NULL)",
+            ('github-copilot', $1, 'org', 'org-1', NULL),
+            ('github-copilot', $1, 'org', 'org-2', NULL)",
     )
-    .bind(t)
+    .bind(d)
     .execute(&pool)
     .await
     .expect("insert should succeed");
@@ -132,45 +132,18 @@ async fn spend_aggregate_all_unknown_is_null_not_zero(pool: PgPool) {
         .expect("refresh should succeed");
 
     let (cost, unknown): (Option<i64>, i64) = sqlx::query_as(
-        "SELECT cost_micro_usd, unknown_cost_count
-         FROM mv_executions_spend_hourly WHERE source = 'eaig'",
+        "SELECT SUM(cost_micro_usd)::bigint, SUM(unknown_cost_count)::bigint
+         FROM mv_day_facts_spend_daily WHERE source = 'github-copilot'",
     )
     .fetch_one(&pool)
     .await
-    .expect("aggregate row should exist");
+    .expect("aggregate query should succeed");
 
     assert!(
         cost.is_none(),
         "an all-unknown bucket must report cost_micro_usd = NULL, never 0 (ADR-0028 D0)"
     );
     assert_eq!(unknown, 2, "both unknown rows must be counted separately");
-}
-
-/// AC3: an EXPLAIN of a KPI query against the aggregate proves the aggregate is read -- the plan
-/// references the materialized view and NOT the raw grain table. This is the "prove the aggregate
-/// is read, not assumed" check: a query that silently fell back to a raw-table scan would name the
-/// raw table instead.
-#[sqlx::test(migrations = "../../migrations-usage")]
-async fn explain_proves_aggregate_is_read_not_raw_scan(pool: PgPool) {
-    // `EXPLAIN` returns one row per plan line; fetch them all and join so the full plan is asserted.
-    let lines: Vec<String> = sqlx::query_scalar(
-        "EXPLAIN SELECT source, SUM(cost_micro_usd) AS cost
-         FROM mv_executions_spend_hourly
-         GROUP BY source",
-    )
-    .fetch_all(&pool)
-    .await
-    .expect("EXPLAIN should succeed");
-    let plan = lines.join("\n");
-
-    assert!(
-        plan.contains("mv_executions_spend_hourly"),
-        "the plan must read the aggregate mv_executions_spend_hourly; got: {plan}"
-    );
-    assert!(
-        !plan.contains("usage_executions"),
-        "the plan must NOT scan the raw usage_executions table; got: {plan}"
-    );
 }
 
 /// AC1 (no cross-grain): the day-facts and seat aggregates exist and are queryable, and the
