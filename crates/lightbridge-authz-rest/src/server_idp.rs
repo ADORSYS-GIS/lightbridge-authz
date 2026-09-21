@@ -71,7 +71,7 @@ const CLIENT_ASSERTION_JTI_KEY_PREFIX: &str = "authz-api:client-assertion-jti:";
 /// pool with no operational separation from tenant-context resolution -- the duplicate parameters
 /// exist purely as independent test-injection seams, see `TokenExchangeOpStore`'s own field doc
 /// comments for why.
-pub fn build_token_exchange_state(
+pub(crate) fn build_token_exchange_state(
     oauth2: &Oauth2,
     repo: Arc<StoreRepo>,
     budget_repo: Arc<lightbridge_authz_budget::repo::BudgetRepo>,
@@ -219,7 +219,10 @@ pub fn build_token_exchange_state(
 /// a mandatory dependency" house rule documents for a different dependency). Presence PLUS
 /// [`Federation::validate`]'s offline shape check -- never a live reachability probe against the
 /// issuer, matching `oauth2.relying_party`'s own startup-validation posture.
-pub fn require_federation<'a>(oauth2: &'a Oauth2, component: &str) -> Result<&'a Federation> {
+pub(crate) fn require_federation<'a>(
+    oauth2: &'a Oauth2,
+    component: &str,
+) -> Result<&'a Federation> {
     let federation = oauth2.federation.as_ref().ok_or_else(|| {
         Error::Server(format!(
             "oauth2.federation.issuer is required for {component} (ADR-0025) -- set the \
@@ -233,7 +236,7 @@ pub fn require_federation<'a>(oauth2: &'a Oauth2, component: &str) -> Result<&'a
 
 /// Shared by `start_api_server`/`start_idp_server`/`start_budget_server`. Fails when
 /// `oauth2.jwks_ca_bundle_path` is unreadable/malformed (lightbridge-authz#625).
-pub fn build_bearer_service(oauth2: &Oauth2) -> Result<Arc<dyn BearerTokenServiceTrait>> {
+pub(crate) fn build_bearer_service(oauth2: &Oauth2) -> Result<Arc<dyn BearerTokenServiceTrait>> {
     let service = BearerTokenService::new(oauth2.clone())
         .map_err(|e| Error::Server(format!("failed to build bearer JWKS client: {e}")))?;
     Ok(Arc::new(service))

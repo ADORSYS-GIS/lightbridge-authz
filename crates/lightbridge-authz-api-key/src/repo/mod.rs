@@ -144,6 +144,19 @@ impl StoreRepo {
         Ok(row)
     }
 
+    /// Authorizes a lead-gated roster mutation (`add_project_member`, `remove_project_member`,
+    /// `set_project_member_role`, `set_project_member_quota_tier`) or lead-gated `create_api_key`:
+    /// `subject` must be either the project's account owner (`projects.account_id = subject`) or
+    /// hold a `project_members` row with `role = 'lead'` on `project_id`. There is no last-lead
+    /// lockout to guard here (unlike the deleted `remove_account_member`/`set_account_member_role`'s
+    /// last-owner guards) -- the account owner is always a standing alternate authority over the
+    /// roster, so a project can never be left with nobody able to manage it the way an account
+    /// could before ADR-0006 removed account-level membership entirely.
+    ///
+    /// Mirrors the deleted `add_account_member`'s NotFound/Forbidden split: a subject with no
+    /// visibility into the project at all (not the owner, not on the roster in any role) gets
+    /// `NotFound` so project existence isn't leaked; a subject who can see the project as a plain
+    /// `member` but lacks lead standing gets `Forbidden`.
     pub(super) async fn authorize_project_lead(
         &self,
         project_id: &str,

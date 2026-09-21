@@ -457,7 +457,22 @@ impl StoreRepo {
         Ok(Self::to_project(row))
     }
 
-    #[instrument(skip(self))]
+    /// Sets `Project.modelPolicy` (ADR-0018 Decision 5 follow-up, #415's own tracked next step).
+    /// Backs `AuthzStoreImpl::set_project_model_policy` -- `model_policy` is validated to be one of
+    /// the three canonical wire strings there (`ModelPolicy::parse_strict`) before this method is
+    /// ever called, so `model_policy` here is trusted input, same layering as `set_project_quota`/
+    /// `set_project_allowed_models` above.
+    ///
+    /// Runs in a transaction, unlike the two setters immediately above, because this method also
+    /// enforces a business rule this repo's owner decided is a refusal, not a warning or a
+    /// silent allow (see the schema doc comment on `setProjectModelPolicy` for the full
+    /// reasoning): switching to `allowlist` while `allowed_models` is empty/absent would silently
+    /// deny every model -- a lockout by configuration, the same class of footgun ADR-0018 Decision
+    /// 5 already closed for a typo'd model id. That check needs to read the row's *current*
+    /// `allowed_models` under lock (`FOR UPDATE`) so a concurrent `set_project_allowed_models` call
+    /// racing this one cannot slip an empty list past the guard between the check and the write --
+    /// same transactional-invariant shape as `set_default_project` below, just guarding a business
+    /// rule instead of the "at most one default project" structural invariant.
     pub async fn set_project_model_policy(
         &self,
         account_id: &AccountId,

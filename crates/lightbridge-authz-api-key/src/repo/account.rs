@@ -110,8 +110,32 @@ impl StoreRepo {
         Ok(Self::to_account(account))
     }
 
-    /// The admin-targets-an-arbitrary-subject account bootstrap (#720).
-    #[instrument(skip(self))]
+    /// The admin-targets-an-arbitrary-subject account bootstrap (#720). Unlike [`Self::create_account`]
+    /// above, `subject` is operator-supplied, not the caller's own identity -- this exists because
+    /// a Keycloak-authenticated subject with no `accounts` row can never complete `authz-idp`'s
+    /// `/idp/callback` (ADR-0024's 2026-08-25 correction removed the old mint-on-login branch), and
+    /// ADR-0025's `NoAccount` self-service bootstrap fallback is unreachable in production (`authz-api`'s
+    /// bearer middleware there validates against `authz-idp`'s own JWKS, not Keycloak's). Before this
+    /// method existed, the only remedy was a manual SQL `INSERT` against production.
+    ///
+    /// Always mints the subject's ANCHOR account (`id = subject`, never a minted CUID2) -- this
+    /// procedure only ever creates the FIRST account for a subject, so unlike `create_account`'s
+    /// ADR-0026 "several accounts per identity" contract, a second call for the same subject is
+    /// `Error::Conflict`, not a new row.
+    ///
+    /// Also creates the account's mandatory default `projects` row in the SAME transaction: an
+    /// account with no `is_default` project still dead-ends the browser SSO callback one step later
+    /// (`find_default_project_id`, `crates/lightbridge-authz-rest/src/relying_party.rs`), so
+    /// provisioning the account alone would not actually unblock sign-in. `email` becomes that
+    /// project's `billing_identity` (globally unique via `idx_projects_billing_identity`); a
+    /// collision is `Error::Conflict`, and -- since both inserts share one transaction -- never a
+    /// partial write (an orphaned account with no default project).
+    ///
+    /// `user_id` is left unbound on the `accounts` insert so `accounts_set_user`'s `BEFORE INSERT`
+    /// trigger provisions the `users` row and sets `user_id := id`, exactly as `create_account`'s
+    /// own bootstrap branch does. `projects.is_default` is likewise left for
+    /// `projects_set_is_default`'s `BEFORE INSERT` trigger to compute -- `true` here, since this is
+    /// the account's first (and, until a caller adds more via `model.Project.create`, only) project.
     pub async fn provision_account(
         &self,
         subject: &AccountId,
@@ -260,8 +284,15 @@ impl StoreRepo {
         Ok(Self::to_account(row))
     }
 
-    /// Permanently delete `account_id`.
-    #[instrument(skip(self))]
+    /// Permanently delete `account_id` (cascades to projects, their api-keys, and their
+    /// `project_members` rows via the existing `ON DELETE CASCADE` foreign keys). Per ADR-0006
+    /// there is no more owner/role concept to gate this with -- one account is one person, so the
+    /// authorization collapses to "the caller is this account" (`id = subject`), enforced directly
+    /// in the `WHERE` clause rather than a separate role lookup. The removed default-account
+    /// undeletable guard (`accounts.is_default`) no longer applies -- that column and the whole
+    /// default-*account* feature were dropped outright (ADR-0006 decision 2); only
+    /// `projects.is_default` (default-*project*) survives, and it is enforced on `Project`, not
+    /// here.
     pub async fn delete_account(
         &self,
         acting_account_id: &AccountId,

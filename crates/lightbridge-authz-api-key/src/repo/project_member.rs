@@ -98,7 +98,20 @@ impl StoreRepo {
         project.ok_or(Error::NotFound)
     }
 
-    #[instrument(skip(self))]
+    /// Lists `project_id`'s roster. Backs `listProjectRoster`, the roster's only read path.
+    ///
+    /// Authorization is deliberately WIDER than the four mutations above: any member of the
+    /// project may read it, plus the owning account. Leads are not privileged here -- knowing who
+    /// you are working alongside is not a management capability, and gating it on `lead` would
+    /// leave plain members unable to see the roster they are on. A caller with no standing at all
+    /// gets `NotFound`, matching `authorize_project_lead`'s no-existence-leak contract rather than
+    /// distinguishing "no such project" from "not yours".
+    ///
+    /// `id` is synthesised from the composite primary key. The real `project_members` table is
+    /// keyed `(project_id, account_id)` and has no `id` column -- the schema's `ProjectMember.id`
+    /// exists only because cratestack requires exactly one scalar `@id` -- so this is the one
+    /// place that has to invent it, and it must stay stable for a given row because clients use
+    /// it as a list key.
     pub async fn list_project_roster(
         &self,
         account_id: &AccountId,

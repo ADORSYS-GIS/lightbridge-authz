@@ -45,7 +45,17 @@ impl StoreRepo {
         }
     }
 
-    #[instrument(skip(self, subject, grandfather_issuer))]
+    /// Fine-grained twin of [`Self::resolve_account_for_federated_subject`], which stays the
+    /// externally-uniform `Result<String>` every ingress except one already relies on. This
+    /// method exists ONLY for
+    /// `lightbridge_authz_rest::auth_provider::FederatedSubjectResolver::resolve` (ADR-0025
+    /// Correction, "the Stage 2..5 bootstrap window"): that caller needs to tell "wrong issuer"
+    /// apart from "no account yet" to decide whether the temporary grandfather-issuer bootstrap
+    /// fallback applies, WITHOUT the distinction ever leaking past that one internal seam --
+    /// `resolve_account_for_federated_subject` above still collapses both cases to the identical
+    /// `Error::Forbidden` message no caller can distinguish, so this repo remains exactly as much
+    /// of an account-existence non-oracle as it always was. Do not add a second caller without
+    /// re-reading that ADR section first.
     pub async fn resolve_account_for_federated_subject_detailed(
         &self,
         issuer: &str,
@@ -127,7 +137,13 @@ impl StoreRepo {
         Ok(FederatedResolution::Resolved(account_id))
     }
 
-    #[instrument(skip(self, input))]
+    /// `grandfather_issuer` mirrors `resolve_account_for_federated_subject`'s own parameter of the
+    /// same name (ADR-0025): only a subject presented by the ONE configured grandfather issuer may
+    /// adopt a pre-existing `accounts.id == subject` row. Without this pin, ANY issuer whose token
+    /// happens to carry a `sub` matching an existing account id could adopt it -- first-mover-wins
+    /// across any future second issuer, contradicting the resolver's own issuer-pinned rule. The
+    /// existing-row UPDATE branch below stays un-pinned: the row itself already proves which issuer
+    /// legitimately owns this `(issuer, subject)` pair, so there is nothing left to check.
     pub async fn upsert_federated_identity(
         &self,
         input: UpsertFederatedIdentity,

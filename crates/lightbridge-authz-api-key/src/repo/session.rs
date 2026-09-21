@@ -65,6 +65,33 @@ impl StoreRepo {
         Ok(row)
     }
 
+    /// Revokes every currently-active session for `subject` -- of EITHER `kind` (ADR-0021
+    /// Decision 3: the query is deliberately `kind`-blind, which is exactly what makes it cover
+    /// both `kind = 'token'` and `kind = 'browser'` rows in one call) -- and cascades to revoke
+    /// every `exchange_refresh_tokens` row chained under one of those sessions (ADR-0020 Decision
+    /// 9), so a bulk "log out everywhere" cannot leave a live refresh token behind for a session
+    /// it just killed. Backs both the self-service "log out everywhere" RPC procedure and the
+    /// admin offboarding kill switch (`docs/rbac.md`'s `session:revoke-own`/`session:revoke`).
+    /// Returns how many SESSIONS were revoked (not refresh-token rows), so the caller gets
+    /// confirmation the kill switch did something; `0` (not an error) when the subject has no
+    /// active sessions of either kind. Two statements in one transaction, not a single query --
+    /// see the module doc comment on why this repo keeps this operation hand-written rather than
+    /// cratestack-generated (ADR-0020 Decision 9).
+    ///
+    /// Matches on `sessions.subject` (the real authenticated actor), never `sessions.account_id`
+    /// (#492): `account_id` always holds the PROJECT's OWNING account (`resolve_context`'s
+    /// documented behavior), identical for every session ever minted against a given project
+    /// regardless of which real person -- owner or roster member -- minted it. Keying this query
+    /// on `account_id` mixed up "which project" with "which person": a roster member's own
+    /// "log out everywhere" silently no-opped on their own session (it never matched), while the
+    /// project owner's own "log out everywhere" collaterally revoked every OTHER member's session
+    /// on a shared project too (it always matched). `subject` is populated for every session this
+    /// repo creates -- `kind = 'browser'` rows since
+    /// `migrations/20260824000003_sessions_add_subject.sql`, `kind = 'token'` rows since this
+    /// fix's companion change to `oauth2_op::store::TokenExchangeOpStore`'s two `create_session`
+    /// call sites -- so only sessions minted before this fix (`subject IS NULL`) go unmatched
+    /// here; those are TTL-bounded and self-heal on their own expiry, the same trade-off the
+    /// nullable-column migration already made for pre-migration browser rows.
     pub async fn revoke_sessions_and_cascade(&self, account_id: &AccountId) -> Result<u64> {
         let mut tx = self.pool().begin().await?;
         let revoked_sessions = sqlx::query(

@@ -172,6 +172,32 @@ impl StoreRepo {
         Ok(row)
     }
 
+    /// Atomically consumes an `approved`/`denied` row exactly once (backs
+    /// `authkestra_op::device::DeviceCodeStore::consume_device_code`, called from the CLI's
+    /// `/oauth2/token` poll once it observes a non-`pending` status). Single-use enforcement, same
+    /// CAS guard as [`Self::consume_exchange_refresh_token`] (`WHERE status IN ('approved',
+    /// 'denied') ...`), so two concurrent polls presenting the same `device_code` can never both
+    /// observe a claimable status and both succeed -- exactly one call ever gets `Some(..)` back;
+    /// every other concurrent or later call gets `Ok(None)`.
+    ///
+    /// Unlike every other CAS method in this file, this one is a `WITH ... FOR UPDATE` CTE feeding
+    /// an `UPDATE ... FROM`, not a plain `UPDATE ... RETURNING` -- deliberately, because the
+    /// caller needs the row's PRE-consume `status`/`subject` (to know whether the device code was
+    /// approved or denied, and by whom) and plain `RETURNING` only ever exposes the POST-update
+    /// row, which would come back as `status = 'consumed'` -- a value
+    /// `oauth2_op::device_store::row_to_session` has no way to map back onto the upstream
+    /// `DeviceCodeStatus` enum (only `Pending`/`Approved`/`Denied` exist there; this was caught by
+    /// this repo's own it-tests, not by inspection -- see #423's PR description). The `FOR UPDATE`
+    /// inside the CTE still holds the row lock for the whole statement's duration -- the second of
+    /// two concurrent callers blocks on it until the first's `UPDATE` commits, then re-evaluates
+    /// the CTE's `WHERE status IN (...)` and finds nothing, so this remains a single atomic
+    /// statement and the CAS property holds exactly as it does everywhere else in this file.
+    ///
+    /// Kept as a `status = 'consumed'` flip rather than a hard `DELETE` -- consistent with this
+    /// codebase's ledger-like convention for CAS-consumed rows (`exchange_refresh_tokens` does the
+    /// same) -- and every read path already treats `consumed` as absent (see
+    /// [`Self::find_active_device_authorization_by_device_code`]), so the row is functionally
+    /// "consumed-and-gone" per ADR-0012 Decision 7 even though the audit trail survives.
     pub async fn consume_device_authorization(
         &self,
         device_code: &str,

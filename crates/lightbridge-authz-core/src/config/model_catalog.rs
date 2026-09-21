@@ -5,8 +5,9 @@ use utoipa::ToSchema;
 /// -- since #415 (ADR-0018 Decision 5) -- the catalogue `setProjectAllowedModels` validates every
 /// `allowedModels` entry against before writing. Populated from env — either a single
 /// `MODEL_CATALOG` JSON-array env var (e.g. `models: "${MODEL_CATALOG}"`) or an inline YAML/JSON
-/// sequence of model objects — the same shape and env-driven loading as `Billing`/`QuotaTiers`
-/// above. Unlike `Billing`, an empty/absent catalogue is the supported default (see the
+/// sequence of model objects — the same shape and env-driven loading as `billing::Billing`/
+/// `quota_tiers::QuotaTiers`. Unlike `Billing`, an empty/absent catalogue is the supported
+/// default (see the
 /// `Config::models` field doc comment and `invalid_ids` below): nothing here needs to fail startup
 /// when unset, and until an operator populates a real catalogue every `allowedModels` value is
 /// accepted uncritically, same as `QuotaTiers::is_allowed`'s contract for an empty tier list.
@@ -63,8 +64,8 @@ impl ModelCatalog {
 
 /// Accepts a JSON-array string (the single-env-var case, e.g. `${MODEL_CATALOG}`), an inline
 /// YAML/JSON sequence of model objects, or null/blank. A null value or a blank/unset env var yields
-/// an empty catalogue rather than a parse error -- mirrors `deserialize_plan_list`/
-/// `deserialize_tier_list` above.
+/// an empty catalogue rather than a parse error -- mirrors `billing::deserialize_plan_list` and
+/// `quota_tiers::deserialize_tier_list`.
 fn deserialize_model_list<'de, D>(
     deserializer: D,
 ) -> std::result::Result<Vec<ModelCatalogEntry>, D::Error>

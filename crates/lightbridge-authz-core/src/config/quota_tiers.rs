@@ -54,7 +54,7 @@ impl QuotaTiers {
 
 /// Accepts a JSON-array string (the single-env-var case, e.g. `${QUOTA_TIERS}`), an inline
 /// YAML/JSON sequence of tier objects, or null/blank. A null value or a blank/unset env var yields
-/// an empty catalogue rather than a parse error -- mirrors `deserialize_plan_list` above.
+/// an empty catalogue rather than a parse error -- mirrors `billing::deserialize_plan_list`.
 fn deserialize_tier_list<'de, D>(deserializer: D) -> std::result::Result<Vec<QuotaTier>, D::Error>
 where
     D: serde::Deserializer<'de>,
