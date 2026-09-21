@@ -6,7 +6,9 @@ use std::sync::LazyLock;
 
 pub mod claude_code;
 pub mod codex;
+pub mod day_grain;
 pub mod eaig;
+pub mod execution_grain;
 pub mod github_copilot;
 pub mod microsoft_foundry;
 pub mod opencode;
