@@ -4,7 +4,8 @@ use utoipa::ToSchema;
 /// Operator-configured catalogue of governance quota tiers (ADR-0006). Referenced by three write
 /// paths -- `Account.defaultQuota`, `Project.projectQuota`, `ProjectMember.quotaTier` -- all
 /// validated against this catalogue at write time (config, not DB), same shape and env-driven
-/// loading (`QUOTA_TIERS` JSON-array string, or an inline YAML/JSON sequence) as `Billing` above.
+/// loading (`QUOTA_TIERS` JSON-array string, or an inline YAML/JSON sequence) as
+/// `billing::Billing`.
 /// Deliberately more permissive than `Billing`, though: `Billing::validate` requires a key-issuing
 /// server to configure a non-empty catalogue, but an empty/absent tier catalogue here is the
 /// supported default (see `is_allowed`) so existing deployments and charts keep working before

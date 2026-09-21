@@ -6,10 +6,11 @@ use serde::Deserialize;
 /// the future, and no further out than `now + max_lifetime_days`
 /// (`AuthzStoreImpl::validate_expires_at`, `crates/lightbridge-authz-rest/src/handlers/mod.rs`).
 ///
-/// Deliberately the opposite default posture from `QuotaTiers`/`ModelCatalog` above: those two
-/// treat an empty/absent catalogue as "accept anything" because they gate optional, informational
-/// fields. This gates a mandatory credential-lifetime ceiling, so absent must resolve to a real,
-/// conservative number (90 days) instead -- never to "no ceiling". `Default` and serde's
+/// Deliberately the opposite default posture from `quota_tiers::QuotaTiers`/
+/// `model_catalog::ModelCatalog`: those two treat an empty/absent catalogue as "accept anything"
+/// because they gate optional, informational fields. This gates a mandatory credential-lifetime
+/// ceiling, so absent must resolve to a real, conservative number (90 days) instead -- never to
+/// "no ceiling". `Default` and serde's
 /// `#[serde(default)]` both route through the same `default_api_key_max_lifetime_days` constant so
 /// "field omitted from YAML" and "struct built directly in Rust with `..Default::default()`" can
 /// never disagree.

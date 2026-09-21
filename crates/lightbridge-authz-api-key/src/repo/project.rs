@@ -10,6 +10,13 @@ use crate::entities::project_row::{ProjectChangeset, ProjectRow};
 use crate::repo::StoreRepo;
 
 impl StoreRepo {
+    /// Creation stays account-owner-only (`account.id == auth().id`, per the schema's
+    /// `@@allow("create", ...)` on `Project`) -- not the broader "owner or any project member" rule
+    /// the mechanical rescoping below applies to read/update/delete, since a project's own roster
+    /// can't authorize creating a *different* project under someone else's account. `billing_identity`
+    /// and `project_quota` are now caller-supplied per ADR-0006 (billing identity moved here from
+    /// `Account`); a duplicate `billing_identity` hits `idx_projects_billing_identity` and is
+    /// surfaced as `Conflict`, mirroring `create_account`'s 23505 handling.
     #[instrument(skip(self))]
     pub async fn create_project(
         &self,
@@ -78,6 +85,17 @@ impl StoreRepo {
         Ok(Self::to_project(row))
     }
 
+    /// Resolves `subject`'s own auto-provisioned default project (`projects.is_default`), used by
+    /// the native token-exchange grant (`oauth2_op::store::TokenExchangeOpStore::handle_token_exchange`)
+    /// when the caller omits `project_id` -- a first-time caller has no way to know their project
+    /// id yet. Since `accounts.id` IS the subject (ADR-0006), "subject's own default project" is
+    /// exactly the project row with `account_id = subject AND is_default = true`; at most one such
+    /// row can exist (`projects_account_id_default_uidx`, migration
+    /// `20260725000001_default_account_project.sql`), so `fetch_optional` is unambiguous. Returns
+    /// `None` when the account has zero projects yet -- a real, reachable state (account creation
+    /// and the bootstrap "ensure default project" flow are two separate calls) -- callers must
+    /// treat that identically to `resolve_context`'s own `NotFound`, not as a distinct error class,
+    /// to preserve the same non-leaking behavior.
     #[instrument(skip(self, account_id))]
     pub async fn find_default_project_id(&self, account_id: &AccountId) -> Result<Option<String>> {
         let row: Option<(String,)> = sqlx::query_as(
@@ -94,6 +112,10 @@ impl StoreRepo {
         Ok(row.map(|(id,)| id))
     }
 
+    /// Project-scoped rule (see the module-level mechanical rescoping this whole file follows):
+    /// visible when `subject` owns the project's account OR holds ANY `project_members` row on it,
+    /// matching the schema's `@@allow("read", account.id==auth().id || members.some.accountId==
+    /// auth().id)` -- unlike `create_project`, any member (not just the owner) may list/read.
     #[instrument(skip(self))]
     pub async fn list_projects(
         &self,
@@ -215,6 +237,12 @@ impl StoreRepo {
         Ok(row.map(Self::to_project))
     }
 
+    /// Project-scoped rule, same visibility boundary as `list_projects`/`get_project` (owner or any
+    /// member may update). `billing_identity`/`project_quota` are intentionally NOT part of this
+    /// hand-written update path -- only `create_project` accepts them; changing a project's billing
+    /// identity or pooled quota post-creation is out of this phase's scope (see the generic
+    /// cratestack-generated `model.Project.update` verb for that, which reads the schema's own
+    /// field-level policy independently of this method).
     #[instrument(skip(self))]
     pub async fn update_project(
         &self,
@@ -284,6 +312,13 @@ impl StoreRepo {
         Ok(Self::to_project(row))
     }
 
+    /// Project-scoped rule, same visibility boundary as `list_projects`/`get_project`/
+    /// `update_project` (owner or any member may delete) -- preserved unchanged from the
+    /// pre-ADR-0006 behavior (any account member, of any role, could already delete a project; this
+    /// method never enforced an owner-only or non-default restriction, unlike the generic
+    /// cratestack-generated `model.Project.delete` verb's stricter `isDefault != true &&
+    /// account.id == auth().id` schema policy, which is a separate code path this method does not
+    /// back).
     #[instrument(skip(self))]
     pub async fn delete_project(&self, account_id: &AccountId, project_id: &str) -> Result<()> {
         let result = sqlx::query(
@@ -312,6 +347,9 @@ impl StoreRepo {
         Ok(())
     }
 
+    /// Suspend/resume a project. Project-scoped rule -- the project's account owner or ANY
+    /// `project_members` row authorizes this (not lead-gated), matching the cstack schema doc's
+    /// `disableProject`/`enableProject` contract.
     #[instrument(skip(self))]
     pub async fn set_project_status(
         &self,
@@ -360,6 +398,15 @@ impl StoreRepo {
         Ok(Self::to_project(row))
     }
 
+    /// Sets `Project.projectQuota` (#379, completing #177/#375). Backs `setProjectQuota` -- the
+    /// sole write path left now that `Project.projectQuota` is `@readonly` on both generic
+    /// `model.Project.create`/`.update` verbs. Project-scoped rule, same as `set_project_status`:
+    /// the project's account owner or ANY `project_members` row authorizes this (not lead-gated,
+    /// matching `model.Project.update`'s own dropped `@@allow` policy exactly rather than the
+    /// lead-only roster procedures' narrower rule); a non-authorized subject or unknown project is
+    /// `NotFound`. The tier value itself is NOT validated against the operator-configured
+    /// quota-tier catalogue here -- same layering as `set_project_member_quota_tier`: that check
+    /// happens in `AuthzStoreImpl::set_project_quota`, before this method is ever called.
     #[instrument(skip(self))]
     pub async fn set_project_quota(
         &self,
@@ -408,6 +455,13 @@ impl StoreRepo {
         Ok(Self::to_project(row))
     }
 
+    /// Project-scoped rule, identical to `set_project_quota` immediately above (owner or any
+    /// roster member; a non-authorized subject or unknown project is `NotFound`). Backs
+    /// `AuthzStoreImpl::set_project_allowed_models` (#415, ADR-0018 Decision 5). The catalogue
+    /// check itself does NOT happen here -- same layering as `set_project_quota`: it happens in
+    /// `AuthzStoreImpl::set_project_allowed_models`, before this method is ever called. `None` maps
+    /// to SQL `NULL` (via `Self::vec_to_json`, the same mapping `create_project`/`update_project`
+    /// already use) -- see that helper's own doc comment for why NULL, not jsonb `null`.
     #[instrument(skip(self))]
     pub async fn set_project_allowed_models(
         &self,
@@ -564,6 +618,16 @@ impl StoreRepo {
         Ok(Self::to_project(row))
     }
 
+    /// Promote `project_id` to be its account's new default project, atomically demoting whichever
+    /// project is currently default for that account. Relies on `projects_account_id_default_uidx`
+    /// (a partial unique index on `(account_id) WHERE is_default`) to guarantee the invariant even
+    /// under a race -- a concurrent reassignment targeting a different project for the same account
+    /// fails the unset-then-set with a unique-violation instead of silently producing two defaults.
+    /// Project-scoped rule, same as `set_project_status`: the project's account owner or ANY
+    /// `project_members` row authorizes this; a non-authorized subject or unknown project is
+    /// `NotFound`. (The deleted `set_default_account` had no such column left to reassign at all --
+    /// ADR-0006 dropped `accounts.is_default` outright once one subject could only ever have one
+    /// account, so "default account" stopped being a meaningful concept.)
     #[instrument(skip(self))]
     pub async fn set_default_project(
         &self,

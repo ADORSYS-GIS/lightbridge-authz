@@ -45,6 +45,9 @@ impl StoreRepo {
         let now = Utc::now();
         let mut tx = self.pool().begin().await?;
 
+        // The acting account is the caller's home account (or nothing at all, if this identity is
+        // bootstrapping its very first one). `FOR UPDATE` serializes two concurrent creates by the
+        // same person so they cannot both read "no owner yet" and both try to claim the anchor.
         let existing_owner: Option<(String,)> =
             sqlx::query_as("SELECT user_id FROM accounts WHERE id = $1 FOR UPDATE")
                 .bind(acting_account_id.as_str())
@@ -52,7 +55,10 @@ impl StoreRepo {
                 .await?;
 
         let (new_id, owner_user_id) = match existing_owner {
+            // Bootstrap: the anchor. `user_id` stays NULL so the `accounts_set_user` trigger
+            // provisions it (and the `users` row) exactly as it always has.
             None => (acting_account_id.as_str().to_string(), None),
+            // Second and subsequent: minted id, inherited owner.
             Some((user_id,)) => (cuid2(), Some(user_id)),
         };
 
@@ -81,11 +87,18 @@ impl StoreRepo {
         .map_err(|e| {
             if let sqlx::Error::Database(db_err) = &e {
                 match db_err.code().as_deref() {
+                    // Two concurrent bootstraps for the same identity raced for the anchor id.
+                    // Still a `Conflict`, and still the ONLY way this method produces one -- an
+                    // ordinary second account can no longer collide, since its id is minted.
                     Some("23505") => {
                         return Error::Conflict(
                             "account already exists for this subject".to_string(),
                         );
                     }
+                    // `user_id` referenced a `users` row that vanished, i.e. the acting account was
+                    // deleted between this transaction's own SELECT and this INSERT. Same meaning,
+                    // and the same error, as `upsert_federated_identity`'s 23503 arm: "this subject
+                    // has no lightbridge account right now."
                     Some("23503") => {
                         return Error::Forbidden("acting account no longer exists".to_string());
                     }
@@ -203,7 +216,18 @@ impl StoreRepo {
         Ok(Self::to_account(account))
     }
 
-    /// Lists every account the caller OWNS (ADR-0026).
+    /// Lists every account the caller OWNS (ADR-0026), not just the one that IS them.
+    ///
+    /// The owner is derived rather than passed: `accounts.user_id` is always the owner's
+    /// home-account id, and `acting_account_id` is always that home account, so the correlated
+    /// subquery is an indexed PK lookup that reads "everyone owned by the same person as me".
+    /// Deriving it here rather than threading a `UserId` down from the ingress keeps the seam in
+    /// one place and means an acting account that does not exist (a bootstrapping identity)
+    /// yields `user_id = NULL`, which matches no row -- fail-closed, an empty list, never a
+    /// wildcard.
+    ///
+    /// `ORDER BY created_at` (never by id -- ADR-0039: CUID2 has no ordering) is covered by
+    /// `idx_accounts_user_id_created_at`.
     #[instrument(skip(self))]
     pub async fn list_accounts(
         &self,
@@ -229,7 +253,11 @@ impl StoreRepo {
         Ok(rows.into_iter().map(Self::to_account).collect())
     }
 
-    /// Reads one account the caller OWNS.
+    /// Reads one account the caller OWNS. Was `WHERE id = $1 AND id = $2` ("the target must BE
+    /// me"); ADR-0026 makes it "the target must be owned by the same person as me", via the same
+    /// derived-owner subquery as [`Self::list_accounts`]. A target the caller does not own is
+    /// `None`, exactly as before -- not an error, and indistinguishable from a target that does
+    /// not exist, so this never becomes an account-existence oracle.
     #[instrument(skip(self))]
     pub async fn get_account(
         &self,
@@ -300,6 +328,20 @@ impl StoreRepo {
     ) -> Result<Account> {
         let mut tx = self.pool().begin().await?;
 
+        // Ownership, plus one thing the WHERE clause alone must not decide silently. ADR-0026 lets
+        // a person own several accounts, and exactly one of them is the HOME account -- the
+        // identity's anchor, the row `federated_identities` adopted by matching
+        // `accounts.id == subject`, and the only id `auth().id` is ever set to.
+        //
+        // Deleting the anchor while other accounts are still owned would ORPHAN them: the
+        // `federated_identities` row cascades away with it, the next login resolves through
+        // ADR-0025's bootstrap fallback to a subject with no `accounts` row, and
+        // `user_id = (SELECT user_id FROM accounts WHERE id = $subject)` then yields NULL -- so the
+        // surviving accounts match nothing and become permanently unreachable, with their projects
+        // and keys still live. Refuse it explicitly; a `WHERE` clause that just failed to match
+        // would surface as `NotFound` and read like the account did not exist.
+        //
+        // Deleting the home account when it is the ONLY one is untouched, pre-ADR-0026 behaviour.
         let target: Option<(bool, bool)> = sqlx::query_as(
             r#"
             SELECT
@@ -346,7 +388,10 @@ impl StoreRepo {
         Ok(Self::to_account(row))
     }
 
-    /// Suspend/resume an account.
+    /// Suspend/resume an account. Per ADR-0006 there is no more owner/admin role to gate this with
+    /// -- one account is one person, so authorization collapses to "the caller is this account"
+    /// (`id = subject`), enforced directly in the `WHERE` clause. Replaces the deleted
+    /// `member_role`-based owner-or-admin check.
     #[instrument(skip(self))]
     pub async fn set_account_status(
         &self,
@@ -373,7 +418,17 @@ impl StoreRepo {
         Ok(Self::to_account(row))
     }
 
-    /// Updates `Account.defaultQuota` (#379).
+    /// Updates `Account.defaultQuota` (#379, completing #177/#375). Backs
+    /// `updateAccountDefaultQuota` -- the sole write path left now that `Account.defaultQuota` is
+    /// `@readonly` on the generic `model.Account.update` verb. Same authorization shape as
+    /// `set_account_status`: since ADR-0006 there is no owner/role concept left, so "the caller is
+    /// this account" (`id = account_id = subject`) is the entire check, enforced in the `WHERE`
+    /// clause -- a mismatched `account_id`/`subject` pair or an unknown account is `NotFound`. The
+    /// tier value itself is NOT validated against the operator-configured quota-tier catalogue
+    /// here -- same layering as `create_account`/`set_project_member_quota_tier`: that check
+    /// happens in `AuthzStoreImpl::update_account_default_quota`, before this method is ever
+    /// called, so an empty/absent catalogue transparently accepts any value with no special casing
+    /// needed here.
     #[instrument(skip(self))]
     pub async fn update_account_default_quota(
         &self,
@@ -400,7 +455,19 @@ impl StoreRepo {
         Ok(Self::to_account(row))
     }
 
-    /// Sets `Account.name`.
+    /// Sets `Account.name`. Backs `updateAccountName` -- the sole write path for that column, since
+    /// `model.Account.update` does not exist (#398) and the field is `@readonly` in the schema.
+    /// Authorization is identical to [`Self::update_account_default_quota`] directly above: since
+    /// ADR-0006 there is no owner/role concept left, so "the caller is this account"
+    /// (`id = account_id = subject`) is the entire check and it lives in the `WHERE` clause -- a
+    /// mismatched `account_id`/`subject` pair and an unknown account are the same `NotFound`, so
+    /// this cannot be used to probe which accounts exist.
+    ///
+    /// `name` is free text with no catalogue to validate against, but it MUST already be
+    /// normalised (blank/whitespace-only collapsed to `None`) by
+    /// `AuthzStoreImpl::update_account_name` before it reaches here -- same layering as the
+    /// quota-tier checks -- so the DB `CHECK (name IS NULL OR btrim(name) <> '')` never fires from
+    /// this path. Passing `None` clears the name back to unnamed; this is a set, not a PATCH.
     #[instrument(skip(self))]
     pub async fn update_account_name(
         &self,

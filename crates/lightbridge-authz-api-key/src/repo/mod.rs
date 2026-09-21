@@ -162,6 +162,17 @@ impl StoreRepo {
         project_id: &str,
         account_id: &AccountId,
     ) -> Result<()> {
+        // COALESCE is load-bearing, not defensive noise: an actor with no `accounts` row at all
+        // (a bootstrapping identity) makes the inner subquery NULL, so the comparison is NULL
+        // rather than false, and decoding NULL into `bool` fails -- turning a clean `NotFound`
+        // into a database error. Caught by `access_control_allows_project_members_and_rejects_
+        // non_members`, which asserts the exact error VARIANT an outsider gets.
+        //
+        // ADR-0026: "the project's account owner" is no longer "the project's account IS me" --
+        // one person may own several accounts, and a project inside a secondary account is just as
+        // much theirs. Compare by OWNER, not by account identity, or the owner gets `NotFound` on
+        // their own project. The member branch below deliberately still compares `auth().id`
+        // directly (ADR-0026 D5: a roster may only ever name an anchor account).
         let owns_project: Option<bool> = sqlx::query_scalar(
             r#"
             SELECT COALESCE(

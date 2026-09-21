@@ -8,6 +8,8 @@ use crate::entities::session_row::{
 use crate::repo::StoreRepo;
 
 impl StoreRepo {
+    /// Inserts a new `sessions` row (ADR-0020 Decision 1). Every call site this PR touches mints
+    /// `kind = "token"` -- see [`NewSession`]'s own doc comment.
     pub async fn create_session(&self, input: NewSession) -> Result<SessionRow> {
         let row: SessionRow = sqlx::query_as(
             r#"
@@ -29,6 +31,12 @@ impl StoreRepo {
         Ok(row)
     }
 
+    /// ADR-0020 Decision 4 / #437: the current `status`/`expires_at` of the `sessions` row named
+    /// `session_id`, for introspection's fail-closed status check. `Ok(None)` (never an error) for
+    /// an unrecognized `session_id` -- distinguishing "not found" from a real DB error is exactly
+    /// what lets the caller (`resolve_exchange_token_context`) tell "session doesn't exist" (fail
+    /// to `active: false`) apart from "couldn't check" (fail the whole call closed, propagate
+    /// `Err`).
     pub async fn find_session_status(&self, session_id: &str) -> Result<Option<SessionStatusRow>> {
         let row = sqlx::query_as(
             r#"

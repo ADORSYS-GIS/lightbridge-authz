@@ -7,6 +7,14 @@ use crate::entities::device_authorization_row::{DeviceAuthorizationRow, NewDevic
 use crate::repo::StoreRepo;
 
 impl StoreRepo {
+    /// Inserts a fresh `pending` `device_authorizations` row (ADR-0012 Decision 7 / #423). A
+    /// `user_code` collision (the table's unique index) surfaces as `Error::Conflict`, same
+    /// convention as [`Self::create_account`]'s `23505` handling -- the caller (see
+    /// `oauth2_op::device_store::create_pending_device_authorization`) is expected to regenerate
+    /// the code and retry, per the ticket's own "unique index + retry-on-conflict at insert time,
+    /// not a pre-check-then-insert race" risk mitigation. A `device_code` collision (astronomically
+    /// unlikely given its entropy) surfaces the same way; this method does not attempt to tell the
+    /// two apart, since both are handled identically by the caller (retry with fresh values).
     #[instrument(skip(self, input))]
     pub async fn create_device_authorization(
         &self,
@@ -45,6 +53,14 @@ impl StoreRepo {
         Ok(row)
     }
 
+    /// Looks up a still-live `device_authorizations` row by `device_code` (backs
+    /// `authkestra_op::device::DeviceCodeStore::get_device_code`/`consume_device_code`'s
+    /// pre-checks). "Live" means not expired AND not already `consumed` -- a consumed row is
+    /// treated as gone for every read path, exactly like an expired one (ADR-0012 Decision 7: "a
+    /// device code must be atomically claimed exactly once"; once claimed, later reads of the same
+    /// code see nothing, matching `find_active_exchange_refresh_token`'s posture on `expires_at`).
+    /// `Ok(None)` covers unknown/expired/consumed uniformly -- callers must not try to distinguish
+    /// them from this call alone.
     pub async fn find_active_device_authorization_by_device_code(
         &self,
         device_code: &str,
@@ -66,6 +82,9 @@ impl StoreRepo {
         Ok(row)
     }
 
+    /// Reads a device authorization without treating expiry or consumption as absence. The token
+    /// endpoint uses this to return RFC 8628's distinct `expired_token` response while keeping all
+    /// other lookup paths enumeration-safe.
     pub async fn find_device_authorization_by_device_code(
         &self,
         device_code: &str,
@@ -83,6 +102,11 @@ impl StoreRepo {
         Ok(row)
     }
 
+    /// Same as [`Self::find_active_device_authorization_by_device_code`], keyed by `user_code`
+    /// instead (the verification-page submission path -- RFC 8628 §6.1). Callers MUST upper-case
+    /// `user_code` before calling (matching `generate_user_code`'s always-upper-case output and
+    /// the migration's case-insensitive-by-convention unique index) -- this method does no
+    /// normalization of its own.
     pub async fn find_active_device_authorization_by_user_code(
         &self,
         user_code: &str,
@@ -104,6 +128,15 @@ impl StoreRepo {
         Ok(row)
     }
 
+    /// CAS-updates `last_polled_at` on a still-`pending` row (backs
+    /// `authkestra_op::device::DeviceCodeStore::store_device_code`'s re-store-while-polling call
+    /// site -- see `oauth2_op::device_store`'s doc comment for why that trait method is called a
+    /// second time with the same `device_code` during ordinary polling). Deliberately does NOT
+    /// touch `status`/`subject` -- unlike [`Self::approve_device_authorization`]/
+    /// [`Self::deny_device_authorization`], this is not a state transition, just a liveness
+    /// timestamp, so the `WHERE status = 'pending'` guard exists only to make this a safe no-op
+    /// once the row has moved on (never to let a stale "store" call clobber an already-decided
+    /// row). `Ok(None)` (not an error) when the row is gone/expired/already transitioned.
     pub async fn touch_device_authorization_poll(
         &self,
         device_code: &str,
@@ -126,6 +159,15 @@ impl StoreRepo {
         Ok(row)
     }
 
+    /// Atomically transitions a `pending` row to `approved`, stamping `subject` (ADR-0025: the
+    /// resolved acting account id, never the raw Keycloak `sub` directly) in the same statement --
+    /// a single `UPDATE ... WHERE status = 'pending' ... RETURNING` is its own compare-and-swap,
+    /// mirroring [`Self::consume_exchange_refresh_token`] exactly: Postgres holds the row lock for
+    /// the statement's duration, so two concurrent approval attempts (or an approve racing a deny,
+    /// see [`Self::deny_device_authorization`]) can never both observe `status = 'pending'` and
+    /// both succeed. `Ok(None)` when the row is gone/expired/already decided -- the caller (a
+    /// future verification-page ticket) must treat that as "someone already acted on this code",
+    /// not a generic failure.
     pub async fn approve_device_authorization(
         &self,
         device_code: &str,
@@ -150,6 +192,10 @@ impl StoreRepo {
         Ok(row)
     }
 
+    /// The `deny` mirror of [`Self::approve_device_authorization`] -- same single-statement CAS
+    /// shape, `WHERE status = 'pending'` guard, `Ok(None)` on an already-decided/gone row. Leaves
+    /// `subject` `NULL` (the migration's `device_authorizations_subject_only_when_approved` CHECK
+    /// constraint enforces this at the database level too).
     pub async fn deny_device_authorization(
         &self,
         device_code: &str,
@@ -227,6 +273,10 @@ impl StoreRepo {
         Ok(row)
     }
 
+    /// Unconditional hard delete, backing
+    /// `authkestra_op::device::DeviceCodeStore::delete_device_code`. A no-op (not an error) when
+    /// the row is already gone -- deleting something already absent is not a failure, matching
+    /// every other unconditional-delete/revoke convention in this file.
     pub async fn delete_device_authorization(&self, device_code: &str) -> Result<()> {
         sqlx::query(
             r#"

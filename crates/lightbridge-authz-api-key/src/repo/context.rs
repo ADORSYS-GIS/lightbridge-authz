@@ -46,6 +46,24 @@ impl StoreRepo {
         })
     }
 
+    /// Backs `authz-opa`'s `POST /idp/v1/authorize-usage-scope` (#570): does the already-ADR-0025-
+    /// resolved `account_id` own `scope_id` under `scope`? `lightbridge-authz-usage`'s query
+    /// listener has no database of its own to answer "does this end user own this account/
+    /// project" -- this is the one place that predicate is evaluated, mirroring `resolve_context`'s
+    /// own ownership semantics exactly rather than inventing a second one:
+    ///
+    /// - `scope == "account"`: `account_id` owns `scope_id` when they share the same ADR-0026
+    ///   identity anchor (`accounts.user_id`), the identical `owned.user_id = (SELECT user_id FROM
+    ///   accounts WHERE id = $2)` join `resolve_context`'s ownership branch uses.
+    /// - `scope == "project"`: identical predicate to `resolve_context` itself -- owns the
+    ///   project's account (by the same anchor join) OR holds a `project_members` row on it.
+    /// - anything else (including `"user"`/`"api_key"`, which have no resolvable authority) is an
+    ///   immediate `NotFound`, with no query at all -- there is no ownership predicate to evaluate
+    ///   for them, so refusing here also can never leak whether `scope_id` exists.
+    ///
+    /// One query per scope, one `NotFound` branch each: "unknown scope_id" and "known scope_id the
+    /// caller doesn't own" must resolve identically, exactly like `resolve_context`'s own
+    /// non-leaking-oracle contract.
     #[instrument(skip(self, account_id))]
     pub async fn authorize_usage_scope(
         &self,
