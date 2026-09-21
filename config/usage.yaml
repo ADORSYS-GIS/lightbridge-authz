@@ -94,3 +94,11 @@ retention:
   raw_days: 90
   rollup_days: 365
   interval_seconds: 3600
+# #587: KPI aggregate refresh. The named KPI aggregates (plain-Postgres materialized views, one per
+# KPI measure, each on one grain table -- migration 20260918000001) are refreshed by a background
+# job in the usage service with REFRESH MATERIALIZED VIEW CONCURRENTLY. Unlike retention, this is
+# non-destructive and idempotent, so it defaults ON (a stale aggregate silently serves stale KPIs).
+# The loop records its last successful refresh in usage_aggregate_refresh_state.
+aggregate_refresh:
+  enabled: true
+  interval_seconds: 3600

@@ -20,6 +20,25 @@ pub(super) fn validate_bucket_interval(bucket: &str) -> Result<()> {
     }
 }
 
+/// Rejects sub-day buckets for the day/seat grains (#727/#728). The day and seat grains are daily
+/// (`usage_day_facts.day`, `usage_seat_snapshots.snapshot_day` are `DATE`s), so a sub-day bucket
+/// would collapse every row into the midnight bucket -- degenerate and misleading. Call AFTER
+/// [`validate_bucket_interval`], which has already guaranteed the format.
+pub(super) fn validate_day_grain_bucket(bucket: &str) -> Result<()> {
+    static SUB_DAY_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"^\d+\s+(second|seconds|minute|minutes|hour|hours)$")
+            .expect("sub-day bucket regex should be valid")
+    });
+    if SUB_DAY_RE.is_match(bucket.trim()) {
+        Err(Error::BadRequest(
+            "the day/seat grain is daily; bucket must be at least 1 day (e.g. `1 day`, `7 days`)"
+                .to_string(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -37,5 +56,18 @@ mod tests {
         assert!(validate_bucket_interval("hour").is_err());
         assert!(validate_bucket_interval("1month").is_err());
         assert!(validate_bucket_interval("1 week").is_err());
+    }
+
+    #[test]
+    fn validate_day_grain_bucket_rejects_sub_day_units() {
+        assert!(validate_day_grain_bucket("1 second").is_err());
+        assert!(validate_day_grain_bucket("30 minutes").is_err());
+        assert!(validate_day_grain_bucket("2 hours").is_err());
+    }
+
+    #[test]
+    fn validate_day_grain_bucket_accepts_day_and_coarser() {
+        assert!(validate_day_grain_bucket("1 day").is_ok());
+        assert!(validate_day_grain_bucket("7 days").is_ok());
     }
 }

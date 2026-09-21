@@ -4,8 +4,10 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use tracing::debug;
 
-// `RetentionConfig` lives in `retention_config` (split out by the LoC gate); re-export it here so
-// every existing `use config::RetentionConfig` path still resolves.
+// `RetentionConfig` lives in `retention_config` and `AggregateRefreshConfig` in
+// `aggregate_refresh_config` (both split out by the LoC gate); re-export them here so every
+// existing `use config::{RetentionConfig, AggregateRefreshConfig}` path still resolves.
+pub use crate::aggregate_refresh_config::AggregateRefreshConfig;
 pub use crate::retention_config::RetentionConfig;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -33,6 +35,11 @@ pub struct UsageConfig {
     /// hourly. See [`RetentionConfig`].
     #[serde(default)]
     pub retention: RetentionConfig,
+    /// KPI aggregate refresh (#587). Optional with safe defaults: the background job is ON by
+    /// default (refreshing a materialized view is non-destructive and idempotent, unlike
+    /// retention), and refreshes the named KPI aggregates hourly. See [`AggregateRefreshConfig`].
+    #[serde(default)]
+    pub aggregate_refresh: AggregateRefreshConfig,
     /// #585: authenticated ingest configuration. Optional -- when absent, the authenticated
     /// `/auth/v1/otel/*` routes are simply not mounted, and the existing unauthenticated
     /// `/v1/otel/*` surface (the gateway exception, AC5) continues to serve as the only ingest

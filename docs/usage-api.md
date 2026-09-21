@@ -432,3 +432,57 @@ The `retention` config block is optional with safe defaults (`enabled: true`, `r
 `rollup_days: 365`, `interval_seconds: 3600`). `raw_days` MUST stay >= 90 to keep the full dashboard
 window in raw; `rollup_days` MUST be > `raw_days` (otherwise a rolled-up day is deleted from the
 rollup in the same transaction that wrote it).
+
+## KPI aggregates (#587)
+
+The KPI read path is served by **named aggregates** — one per KPI measure, each built on exactly
+one grain table, never spanning grains (governance#166). The owner decision (2026-09-21) is
+**no TimescaleDB in this project**: the "continuous aggregates" are plain-Postgres materialized
+views (created by `migrations-usage/20260918000001_usage_kpi_aggregates.sql`), refreshed by the
+usage service's `aggregate_refresh` background loop (`crates/lightbridge-authz-usage/src/
+aggregate_refresh.rs`, driven by the `aggregate_refresh` config block). `REFRESH MATERIALIZED VIEW
+CONCURRENTLY` needs the per-view unique index the migration creates; the loop records its last
+successful refresh in `usage_aggregate_refresh_state` so a refresh can be proven to have run.
+
+The aggregate names are part of the API surface — a KPI query reads them directly:
+
+| KPI measure | Aggregate (view) | Grain source | Bucket |
+| --- | --- | --- | --- |
+| spend | `mv_executions_spend_hourly` | `usage_executions.estimated_cost_micro_usd` | hourly |
+| requests | `mv_executions_requests_hourly` | `usage_executions` | hourly |
+| latency p50/p95/p99 | `mv_executions_latency_hourly` | `usage_executions.duration_ms` | hourly |
+| tokens | `mv_model_calls_tokens_hourly` | `usage_model_calls.input_tokens`/`output_tokens` | hourly |
+| spend | `mv_model_calls_spend_hourly` | `usage_model_calls.cost_micro_usd` | hourly |
+| requests | `mv_model_calls_requests_hourly` | `usage_model_calls` | hourly |
+| active users | `mv_day_facts_active_users_daily` | `usage_day_facts.total_active_users` | daily |
+| acceptances | `mv_day_facts_acceptances_daily` | `usage_day_facts.total_acceptances_count` | daily |
+| spend | `mv_day_facts_spend_daily` | `usage_day_facts.cost_micro_usd` | daily |
+| active seats | `mv_seat_snapshots_active_daily` | `usage_seat_snapshots.pending_cancellation_date` | daily |
+
+- **Money discipline (ADR-0028 D0):** every spend aggregate carries both the `SUM(...)` of known
+  costs (NULL when every row in the bucket is unknown — never coerced to 0) and a separate
+  `unknown_cost_count` of the rows whose cost was NULL, so unknown-cost rows are counted separately
+  and never silently folded in as free.
+- **Latency percentiles** use Postgres's exact `percentile_cont` ordered-set aggregate, computed
+  once at refresh time (the percentile becomes a lookup, not a per-query computation). No
+  `timescaledb_toolkit` is needed on plain Postgres, so no approximation is used and none needs
+  naming here.
+- **Granularity:** execution/model-call aggregates are hourly; day/seat aggregates are daily. A
+  coarser query re-buckets the view's bucket column; a query finer than the view's granularity is
+  not representable from the aggregate and must read the raw grain table.
+- **Routing:** the day-facts (`/usage/v1/usage/facts/query`) and seat (`/usage/v1/usage/seats/query`)
+  endpoints read from these aggregates when they exist, falling back to the raw grain table when
+  absent (e.g. before the migration has run). The execution endpoint (`/usage/v1/usage/executions/
+  query`) spans grains (executions + model_calls + tool_calls), so per the "no aggregate spans
+  grains" rule it is not aggregate-backed and reads raw.
+- **Day/seat grain constraints:** the day and seat grains are daily, so their endpoints reject
+  sub-day buckets (`400`) — a sub-day bucket would collapse every row into the midnight bucket.
+  Both endpoints (and the legacy/execution endpoints) cap `limit` at `MAX_LIMIT` (10 000) to bound
+  how many buckets a single query can materialize. The day-facts aggregate path FULL OUTER JOINs
+  the three per-measure day-facts views (acceptances/active-users/spend) rather than INNER JOINing
+  them: the three views are refreshed independently, so an INNER JOIN could silently drop a row
+  present in one view but not another; the FULL OUTER JOIN keeps every row and reports a measure as
+  `null` exactly when its owning view lacks the row.
+- **Refresh:** the `aggregate_refresh` config block is optional with safe defaults
+  (`enabled: true`, `interval_seconds: 3600`). Unlike retention, refreshing a materialized view is
+  non-destructive and idempotent, so it defaults ON — a stale aggregate silently serves stale KPIs.

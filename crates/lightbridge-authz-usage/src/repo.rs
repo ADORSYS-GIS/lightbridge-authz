@@ -1,6 +1,8 @@
+mod aggregate;
 mod bucket;
 mod day_fact_filters;
 pub mod day_fact_query;
+mod day_fact_query_builder;
 pub mod day_grain;
 pub mod execution;
 mod execution_filters;
@@ -104,6 +106,7 @@ impl StoreRepo {
     pub(crate) fn pool(&self) -> &PgPool {
         self.pool.pool()
     }
+
     // `skip_all` + an explicit count, for the same reason `handlers::ingest`'s handlers do it
     // (owner report, 2026-09-03): `#[instrument(skip(self))]` recorded the `events` ARGUMENT into
     // the span, and a `UsageEvent`'s `Debug` used to include its whole `attributes` blob -- so

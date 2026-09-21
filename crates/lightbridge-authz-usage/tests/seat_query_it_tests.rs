@@ -71,6 +71,14 @@ async fn insert_seat(
     .execute(pool)
     .await
     .expect("insert seat snapshot");
+
+    // #587: the query endpoint routes to the KPI aggregate `mv_seat_snapshots_active_daily` when it
+    // exists (it does, the migration applied), so refresh it after seeding or the query would see
+    // an empty aggregate. Refreshing per insert is wasteful in prod but cheap and robust in tests.
+    sqlx::query("REFRESH MATERIALIZED VIEW CONCURRENTLY mv_seat_snapshots_active_daily")
+        .execute(pool)
+        .await
+        .expect("refresh seat aggregate");
 }
 
 fn repo(pool: &PgPool) -> StoreRepo {

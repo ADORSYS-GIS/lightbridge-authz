@@ -14,6 +14,8 @@ use tracing::{info, warn};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
+pub mod aggregate_refresh;
+pub mod aggregate_refresh_config;
 pub mod config;
 pub mod handlers;
 pub mod instrumentation;
@@ -32,7 +34,10 @@ pub mod spend;
 pub mod state;
 pub mod verify;
 
-pub use config::{RetentionConfig, ScopeAuthorityConfig, UsageConfig, UsageServer, load_from_path};
+pub use config::{
+    AggregateRefreshConfig, RetentionConfig, ScopeAuthorityConfig, UsageConfig, UsageServer,
+    load_from_path,
+};
 use repo::StoreRepo;
 use scope_authority::{RemoteScopeAuthority, ScopeAuthority};
 
@@ -159,6 +164,13 @@ pub fn build_query_router(
 /// `/usage/v1/spend/query`) -- see `UsageServerGroup`'s doc comment for why these are two ports,
 /// not one. Either listener failing to bind/serve fails this function; `tokio::try_join!` runs
 /// them concurrently rather than sequentially so one listener's lifetime never blocks the other's.
+// `expect`: the function already carried 7 config args (the clippy ceiling) before #587 added the
+// `aggregate_refresh` config, and each arg is a distinct, cohesive config slice the caller already
+// holds -- grouping them into a struct would be a churnier refactor than the 8th arg is worth.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one config slice per background job; 8th arg is the #587 aggregate_refresh block"
+)]
 pub async fn start_usage_server(
     usage: &UsageServer,
     query: &UsageServer,
@@ -167,6 +179,7 @@ pub async fn start_usage_server(
     scope_authority: &ScopeAuthorityConfig,
     ingest_auth: Option<&config::IngestAuthConfig>,
     retention: &RetentionConfig,
+    aggregate_refresh: &AggregateRefreshConfig,
 ) -> Result<()> {
     let pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::new(database).await?);
 
@@ -184,6 +197,13 @@ pub async fn start_usage_server(
                  has run before starting): {e}"
             ))
         })?;
+
+    // The KPI aggregate schema (migration 20260918000001) is NOT a startup precondition: the query
+    // endpoints route to the aggregates when they exist and fall back to the raw grain table when
+    // absent (see `repo::day_fact_query` / `repo::seat_query`), so a server started before the
+    // migration serves correct raw data rather than failing to boot. The aggregate-refresh loop
+    // likewise logs and retries if the views are not yet present. This is the documented graceful
+    // degradation, not a silent stale-aggregate risk.
 
     let repo: Arc<dyn UsageRepoTrait> = Arc::new(StoreRepo::new(pool.clone()));
     let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(
@@ -206,6 +226,15 @@ pub async fn start_usage_server(
     tokio::spawn(retention::run_retention_loop(
         Arc::new(pool.pool().clone()),
         retention.clone(),
+    ));
+
+    // #587: the KPI aggregate-refresh background job. Same shape as the retention loop -- its own
+    // `PgPool` clone, independent of both listeners, a failure logged and retried, never fatal.
+    // Refreshing a materialized view is non-destructive, so this defaults ON (see
+    // `AggregateRefreshConfig`).
+    tokio::spawn(aggregate_refresh::run_aggregate_refresh_loop(
+        Arc::new(pool.pool().clone()),
+        aggregate_refresh.clone(),
     ));
 
     let dev_cors = dev_cors_enabled();
