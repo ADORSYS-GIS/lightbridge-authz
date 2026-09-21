@@ -13,7 +13,11 @@ static RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 pub fn load_from_path<P: AsRef<std::path::Path>>(path: P) -> Result<Config> {
-    load_yaml_from_path(path)
+    let content = read_to_string(path.as_ref())?;
+    let interpolated = interpolate_env_vars(&content);
+    let cfg: Config = from_str(&interpolated)?;
+    super::unknown_keys::warn_unknown_keys_in_config(&interpolated);
+    Ok(cfg)
 }
 
 pub fn load_yaml_from_path<T, P>(path: P) -> Result<T>

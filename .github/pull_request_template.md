@@ -31,9 +31,9 @@ Closes #
 
 State the **mechanism**, not the verdict. "This clones per request" is actionable; "looks fine" is not.
 
-1. **Fail-closed behaviour** — State the mechanism by which this code fails closed when a dependency is unavailable (auth, Redis, JWKS, Keycloak). Identify any `unwrap_or(false)` on an authorization check; that is an outage bypass.
-2. **Ownership shape** — State any clone in a per-request path. `Arc::clone` to satisfy a `'static` bound is a refcount bump, not a defect — distinguish them from value clones.
-3. **Error type level** — State whether new error variants stay at this crate's abstraction level. Leaking a dependency's error type into a public enum is a breaking change on every dep bump.
+1. **Fail-closed behaviour** — State the mechanism by which this code fails closed when a dependency is unavailable (auth, Redis, JWKS, Keycloak), and what a missing or unparseable claim resolves to — "unknown" routes to the strictest branch, it is never a default. Identify any `unwrap_or(false)` on an authorization check; that is an outage bypass.
+2. **Ownership shape** — State whether any new function takes `T` where `&T` would do, forcing callers to clone, and name any clone in a per-request path. `Arc::clone` to satisfy a `'static` bound is a refcount bump, not a defect — distinguish them from value clones.
+3. **Error type level** — State which cases a caller can distinguish from any new error variants, and whether those variants stay at this crate's abstraction level. Leaking a dependency's error type into a public enum is a breaking change on every dep bump.
 4. **Tests prove the logic** — State what would happen to each new test if the logic it covers were wrong. A test that cannot fail regardless of the implementation adds no coverage.
 5. **Locks across `.await`** — State whether any `Mutex` or `RwLock` guard is held across an `.await` point (`clippy::await_holding_lock`).
 

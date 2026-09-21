@@ -7,6 +7,11 @@
 # recorded count. Re-run this only when the debt is deliberately reduced (a file
 # split, a test module extracted) — never to paper over a file that grew.
 #
+# That rule is now enforced, not just stated: loc-gate.sh diffs this file
+# between base and head and fails any PR where an entry rises or a new key
+# appears without the `loc-baseline-raise` PR label
+# (ADORSYS-GIS/lightbridge-authz#622).
+#
 # Usage: generate-baseline.sh [threshold] [output-file]
 set -euo pipefail
 

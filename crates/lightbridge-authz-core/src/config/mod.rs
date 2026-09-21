@@ -11,6 +11,8 @@ pub mod model_catalog;
 pub mod oauth2;
 pub mod quota_tiers;
 pub mod server;
+mod unknown_keys;
+mod unknown_keys_data;
 
 pub use api_key_expiry::ApiKeyExpiry;
 pub use billing::{Billing, BillingLimits, BillingPlan, deserialize_null_default};

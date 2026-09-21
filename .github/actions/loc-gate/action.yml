@@ -2,7 +2,10 @@ name: LoC Gate
 description: >-
   Fails when a Rust file added or modified in a PR exceeds the 200-LoC ceiling.
   Files already over the ceiling are grandfathered against a committed baseline:
-  they may be touched but must not grow. See ADORSYS-GIS/lightbridge-governance#172.
+  they may be touched but must not grow, and the baseline file itself may not
+  rise in the same change (ADORSYS-GIS/lightbridge-authz#622) unless the PR
+  carries an explicit `loc-baseline-raise` label. See
+  ADORSYS-GIS/lightbridge-governance#172.
 inputs:
   base-sha:
     description: >-
@@ -29,6 +32,14 @@ inputs:
       are ignored.
     required: false
     default: crates app
+  labels:
+    description: >-
+      Comma-separated PR labels. A baseline raise (an entry going up, or a new
+      key appearing) fails unless this contains `loc-baseline-raise`. Wire it
+      as `join(github.event.pull_request.labels.*.name, ',')` — empty on push
+      events, where raises must fail.
+    required: false
+    default: ""
 runs:
   using: composite
   steps:
@@ -40,4 +51,5 @@ runs:
         INPUT_THRESHOLD: ${{ inputs.threshold }}
         INPUT_BASELINE_FILE: ${{ inputs.baseline-file }}
         INPUT_PATHS: ${{ inputs.paths }}
+        INPUT_LABELS: ${{ inputs.labels }}
       run: ${{ github.action_path }}/loc-gate.sh
