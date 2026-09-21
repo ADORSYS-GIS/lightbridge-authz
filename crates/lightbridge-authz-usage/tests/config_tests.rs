@@ -250,6 +250,34 @@ fn config_rejects_rollup_days_not_greater_than_raw_days() {
     );
 }
 
+/// #587 review P2: a degenerate background-job cadence must fail at load, not be silently coerced
+/// to a 1s loop by `interval_seconds.max(1)`. A sub-60s `aggregate_refresh.interval_seconds`
+/// (e.g. a unit-mix typo, or a literal `0`) would otherwise run expensive
+/// `REFRESH MATERIALIZED VIEW CONCURRENTLY` statements effectively continuously.
+#[test]
+fn config_rejects_sub_minute_aggregate_refresh_interval() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time should be monotonic")
+        .as_nanos();
+    let path =
+        std::env::temp_dir().join(format!("usage-config-bad-refresh-interval-{unique}.yaml"));
+    let content = format!(
+        "{}\noauth2:\n  type: external\n  jwks_url: \"http://keycloak:9100/realms/dev/protocol/openid-connect/certs\"\nscope_authority:\n  base_url: \"https://authz-opa:3001\"\n  username: \"authorino\"\n  password: \"change-me\"\naggregate_refresh:\n  enabled: true\n  interval_seconds: 1\n",
+        valid_server_and_logging_block()
+    );
+    fs::write(&path, content).expect("temp config should be written");
+
+    let result = load_from_path(&path);
+    fs::remove_file(&path).expect("temp config should be removed");
+
+    assert!(
+        result.is_err(),
+        "a sub-60s aggregate_refresh.interval_seconds must fail to load, not run the refresh loop \
+         continuously"
+    );
+}
+
 /// The `oauth2` + `scope_authority` blocks every test below needs before it can reach the
 /// `ingest_auth` validation (both are mandatory, so a config omitting either fails earlier).
 fn valid_auth_block() -> &'static str {

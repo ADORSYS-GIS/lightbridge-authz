@@ -168,6 +168,24 @@ pub fn load_from_path<P: AsRef<std::path::Path>>(path: P) -> Result<UsageConfig>
         )));
     }
 
+    // Fail-loud on a degenerate background-job cadence, the same class as the retention bounds
+    // above. Both loops coerce `interval_seconds.max(1)`, so a `0` would silently become a 1s
+    // cadence -- running expensive `REFRESH MATERIALIZED VIEW CONCURRENTLY` (aggregate_refresh) or
+    // destructive rollup (retention) statements effectively continuously, hammering the DB. A
+    // unit-mix typo (e.g. `60` meaning minutes) is caught here at startup, not in prod.
+    if config.aggregate_refresh.interval_seconds < 60 {
+        return Err(lightbridge_authz_core::Error::Server(format!(
+            "aggregate_refresh.interval_seconds must be >= 60 (got {})",
+            config.aggregate_refresh.interval_seconds
+        )));
+    }
+    if config.retention.interval_seconds < 60 {
+        return Err(lightbridge_authz_core::Error::Server(format!(
+            "retention.interval_seconds must be >= 60 (got {})",
+            config.retention.interval_seconds
+        )));
+    }
+
     validate_ingest_auth(&config)?;
 
     debug!("loaded usage config successfully");

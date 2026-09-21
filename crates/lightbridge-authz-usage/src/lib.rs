@@ -8,7 +8,9 @@ use lightbridge_authz_core::{
     server::{dev_cors_enabled, serve_tls},
 };
 use serde::{Deserialize, Serialize};
+use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
+use std::time::Duration;
 use tower_http::cors::CorsLayer;
 use tracing::{info, warn};
 use utoipa::OpenApi;
@@ -220,20 +222,22 @@ pub async fn start_usage_server(
         raw_days: retention.enabled.then_some(retention.raw_days),
     });
 
-    // #549 AC2: the retention/rollup background job. It owns its own `PgPool` clone (the shared
-    // pool is behind a `dyn DbPoolTrait`), and runs independently of both listeners -- a retention
-    // failure is logged and retried, never fatal.
+    // #549 AC2: the retention/rollup background job. It runs on its OWN small dedicated pool, NOT
+    // a shallow clone of the shared request pool: the rollup holds a connection for the whole run
+    // (a `DELETE ... RETURNING` feeding an `INSERT ... SELECT ... ON CONFLICT`), so sharing the
+    // request pool would let a long rollup starve the mTLS query listener's requests for
+    // connections. A failure is logged and retried, never fatal.
     tokio::spawn(retention::run_retention_loop(
-        Arc::new(pool.pool().clone()),
+        Arc::new(build_background_pool(database)?),
         retention.clone(),
     ));
 
     // #587: the KPI aggregate-refresh background job. Same shape as the retention loop -- its own
-    // `PgPool` clone, independent of both listeners, a failure logged and retried, never fatal.
-    // Refreshing a materialized view is non-destructive, so this defaults ON (see
-    // `AggregateRefreshConfig`).
+    // small dedicated pool (see `build_background_pool`), independent of both listeners, a failure
+    // logged and retried, never fatal. Refreshing a materialized view is non-destructive, so this
+    // defaults ON (see `AggregateRefreshConfig`).
     tokio::spawn(aggregate_refresh::run_aggregate_refresh_loop(
-        Arc::new(pool.pool().clone()),
+        Arc::new(build_background_pool(database)?),
         aggregate_refresh.clone(),
     ));
 
@@ -271,6 +275,24 @@ pub async fn start_usage_server(
     );
     tokio::try_join!(ingest, query)?;
     Ok(())
+}
+
+/// Builds a small, dedicated connection pool for a background job (retention, aggregate-refresh).
+///
+/// This is deliberately NOT a shallow clone of the shared request pool: a background job holds a
+/// connection for the whole run (a rollup, or up to four `REFRESH MATERIALIZED VIEW CONCURRENTLY`
+/// statements that can take minutes on the day/seat matviews at scale), so sharing the request
+/// pool would let a long job starve the mTLS query listener's requests for connections. A pool of
+/// 2 keeps the job from contending with request traffic while still being small. `connect_lazy`
+/// defers the actual dial until first use -- the shared pool has already verified connectivity at
+/// startup, so a lazy background pool adds no startup ordering dependency.
+fn build_background_pool(database: &Database) -> Result<sqlx::PgPool> {
+    PgPoolOptions::new()
+        .max_connections(2)
+        .min_connections(1)
+        .acquire_timeout(Duration::from_secs(30))
+        .connect_lazy(&database.url)
+        .map_err(|e| Error::Server(format!("failed to build background job pool: {e}")))
 }
 
 async fn root_handler() -> (StatusCode, Json<RootResponse>) {

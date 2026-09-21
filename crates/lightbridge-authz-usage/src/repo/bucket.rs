@@ -7,17 +7,29 @@ use std::sync::LazyLock;
 
 pub(super) fn validate_bucket_interval(bucket: &str) -> Result<()> {
     static BUCKET_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(r"^\d+\s+(second|seconds|minute|minutes|hour|hours|day|days)$")
+        regex::Regex::new(r"^(\d+)\s+(second|seconds|minute|minutes|hour|hours|day|days)$")
             .expect("bucket regex should be valid")
     });
 
-    if BUCKET_RE.is_match(bucket.trim()) {
-        Ok(())
-    } else {
-        Err(Error::BadRequest(
+    let trimmed = bucket.trim();
+    let Some(caps) = BUCKET_RE.captures(trimmed) else {
+        return Err(Error::BadRequest(
             "bucket must look like `5 minutes`, `1 hour`, or `1 day`".to_string(),
-        ))
+        ));
+    };
+
+    // A zero interval is degenerate for EVERY grain: `date_bin(CAST('0 days' AS interval), ...)`
+    // fails server-side with a Postgres error, so a zero bucket would 500 instead of 400. Reject it
+    // here, the shared format gate every query path calls first (execution, day-facts, seat, and
+    // the legacy `query_usage`), so `0 days`/`0 seconds`/... never reach `date_bin`.
+    let count: u64 = caps[1].parse().expect("regex guarantees a digit string");
+    if count == 0 {
+        return Err(Error::BadRequest(
+            "bucket must be a positive interval (e.g. `5 minutes`, `1 hour`, `1 day`)".to_string(),
+        ));
     }
+
+    Ok(())
 }
 
 /// Rejects sub-day buckets for the day/seat grains (#727/#728). The day and seat grains are daily
@@ -56,6 +68,17 @@ mod tests {
         assert!(validate_bucket_interval("hour").is_err());
         assert!(validate_bucket_interval("1month").is_err());
         assert!(validate_bucket_interval("1 week").is_err());
+    }
+
+    #[test]
+    fn validate_bucket_interval_rejects_zero_interval() {
+        // A zero interval passes the format regex but would make `date_bin(CAST('0 days' AS
+        // interval), ...)` fail server-side with a Postgres error (500 instead of 400) -- it must
+        // be rejected here, the shared gate every query path calls first.
+        assert!(validate_bucket_interval("0 days").is_err());
+        assert!(validate_bucket_interval("0 seconds").is_err());
+        assert!(validate_bucket_interval("0 hours").is_err());
+        assert!(validate_bucket_interval("0 minutes").is_err());
     }
 
     #[test]
