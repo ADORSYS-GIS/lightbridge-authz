@@ -124,14 +124,10 @@ const COST_KEYS: [&str; 4] = [
 /// A bare `duration` key would normally be too ambiguous to trust -- it names no unit. It is here
 /// because this deployment's emitter is known, not guessed: no `gen_ai.*` or `http.*` latency
 /// attribute exists anywhere in that gateway's config, and the AI Gateway ExtProc's
-/// `llmRequestCosts` dynamic metadata (the channel that produces
-/// `io.envoy.ai_gateway.llm_custom_total_cost` above) exposes token and cost keys only, never a
-/// duration. The remaining entries are conventional names kept so a different emitter is not
-/// silently dropped.
-///
+/// `llmRequestCosts` dynamic metadata exposes token and cost keys only, never a duration. The
+/// remaining entries are conventional names kept so a different emitter is not silently dropped.
 /// `http.server.duration` sits here because the pre-1.23 HTTP semantic conventions specified it in
-/// milliseconds; its successor `http.server.request.duration` is in seconds and lives in the other
-/// list.
+/// milliseconds; its successor `http.server.request.duration` is in seconds and lives in the other list.
 const LATENCY_MS_KEYS: [&str; 9] = [
     "duration",
     "x-envoy-upstream-service-time",
@@ -236,15 +232,10 @@ const OPERATION_OTHER: &str = "other";
     ),
     tag = "ingest"
 )]
-// `skip_all` + an explicit `bytes` field, deliberately (owner report, 2026-09-03). The previous
-// `#[instrument(skip(state, headers))]` left `body` UNSKIPPED, and `#[instrument]` records every
-// non-skipped argument into the span with its `Debug` representation -- so every OTLP export
-// stamped the entire compressed protobuf payload into the span name, producing log lines like
-// `ingest_logs{body=b"\x1f\x8b\x08\x00..."}` on EVERY request. That is two problems, not one:
-// it is unreadable noise at the volume this endpoint runs at, and an OTLP log/trace body carries
-// whatever the exporter put in it -- prompts, user names, request bodies -- so the raw bytes have
-// no business in a log sink at all. `bytes = body.len()` keeps the one thing the field was ever
-// useful for (how big was this export) and drops the payload.
+// `skip_all` + an explicit `bytes` field, deliberately (owner report, 2026-09-03): the previous
+// `#[instrument(skip(state, headers))]` left `body` UNSKIPPED, so every OTLP export stamped the
+// entire compressed protobuf payload (prompts, user names, request bodies) into the span name on
+// EVERY request. `bytes = body.len()` keeps the one useful thing (how big was this export).
 #[instrument(skip_all, fields(bytes = body.len()))]
 pub async fn ingest_traces(
     State(state): State<Arc<UsageState>>,
@@ -252,6 +243,17 @@ pub async fn ingest_traces(
     body: Bytes,
 ) -> Result<(StatusCode, Json<IngestResponse>)> {
     let source = crate::normalizer::resolve_source(&headers)?;
+    // Agent-tool traces are execution-grain (ADR-0027): route them to the execution-grain
+    // receiver, never the request-grain `usage_events` path (#588, AC2).
+    if crate::normalizer::execution_grain::is_execution_grain_source(source) {
+        return crate::handlers::execution_ingest::ingest_execution_grain_traces(
+            State(state),
+            headers,
+            body,
+            source,
+        )
+        .await;
+    }
     let payload =
         decode_otlp_request_async::<ExportTraceServiceRequest>(headers, body, "trace").await?;
     let events = extract_trace_events(payload, source);
@@ -312,6 +314,15 @@ pub async fn ingest_logs(
     body: Bytes,
 ) -> Result<(StatusCode, Json<IngestResponse>)> {
     let source = crate::normalizer::resolve_source(&headers)?;
+    if source == crate::normalizer::day_grain::DAY_GRAIN_SOURCE {
+        return crate::handlers::day_grain::ingest_day_grain_logs(
+            State(state),
+            headers,
+            body,
+            source,
+        )
+        .await;
+    }
     let payload =
         decode_otlp_request_async::<ExportLogsServiceRequest>(headers, body, "logs").await?;
     let events = extract_log_events(payload, source);
@@ -979,7 +990,7 @@ fn nanos_to_datetime(nanos: u64) -> DateTime<Utc> {
     DateTime::from_timestamp(secs, sub_nanos).unwrap_or_else(Utc::now)
 }
 
-fn key_values_to_map(values: &[KeyValue]) -> HashMap<String, Value> {
+pub(crate) fn key_values_to_map(values: &[KeyValue]) -> HashMap<String, Value> {
     let mut map = HashMap::new();
     for kv in values {
         let value = kv
@@ -992,7 +1003,7 @@ fn key_values_to_map(values: &[KeyValue]) -> HashMap<String, Value> {
     map
 }
 
-fn merge_attr_maps(
+pub(crate) fn merge_attr_maps(
     base: &HashMap<String, Value>,
     additional: &HashMap<String, Value>,
 ) -> HashMap<String, Value> {
@@ -2620,6 +2631,27 @@ mod tests {
         impl crate::UsageRepoTrait for PartialInsertRepo {
             async fn insert_usage_events(&self, _events: &[UsageEvent]) -> Result<usize> {
                 Ok(self.persisted)
+            }
+
+            async fn upsert_day_facts(
+                &self,
+                _facts: &[crate::models::day_seat::DayFact],
+            ) -> Result<usize> {
+                Ok(0)
+            }
+
+            async fn upsert_seat_snapshots(
+                &self,
+                _snapshots: &[crate::models::day_seat::SeatSnapshot],
+            ) -> Result<usize> {
+                Ok(0)
+            }
+
+            async fn upsert_execution_grain(
+                &self,
+                _batch: &crate::models::execution_ingest::ExecutionGrainBatch,
+            ) -> Result<usize> {
+                Ok(0)
             }
 
             async fn query_usage(

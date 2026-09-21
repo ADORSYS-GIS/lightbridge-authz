@@ -23,10 +23,12 @@ use lightbridge_authz_usage_rest::{
     models::{
         UsageGroupBy, UsageQueryFilters, UsageQueryRequest, UsageQueryResponse, UsageScope,
         UsageSeriesPoint,
+        day_seat::{DayFact, SeatSnapshot},
         execution::{
             ExecutionQueryFilters, ExecutionQueryRequest, ExecutionQueryResponse,
             ExecutionSeriesPoint,
         },
+        execution_ingest::ExecutionGrainBatch,
     },
     repo::{StoreRepo, UsageEvent},
 };
@@ -62,6 +64,18 @@ struct MockUsageRepo {
 impl UsageRepoTrait for MockUsageRepo {
     async fn insert_usage_events(&self, _events: &[UsageEvent]) -> Result<usize> {
         Ok(self.inserted_events)
+    }
+
+    async fn upsert_day_facts(&self, _facts: &[DayFact]) -> Result<usize> {
+        Ok(0)
+    }
+
+    async fn upsert_seat_snapshots(&self, _snapshots: &[SeatSnapshot]) -> Result<usize> {
+        Ok(0)
+    }
+
+    async fn upsert_execution_grain(&self, _batch: &ExecutionGrainBatch) -> Result<usize> {
+        Ok(0)
     }
 
     async fn query_usage(
