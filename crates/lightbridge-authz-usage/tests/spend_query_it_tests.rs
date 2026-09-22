@@ -3,18 +3,24 @@
 #[path = "support/mod.rs"]
 mod support;
 
-use axum::body::{Body, to_bytes};
-use axum::http::{Request, StatusCode, header};
+use std::sync::Arc;
+
+use axum::{
+    body::{Body, to_bytes},
+    http::{Request, StatusCode, header},
+};
 use chrono::{DateTime, Utc};
-use lightbridge_authz_core::cuid::cuid2;
-use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
-use lightbridge_authz_usage_rest::UsageState;
-use lightbridge_authz_usage_rest::build_query_router;
-use lightbridge_authz_usage_rest::models::SpendQueryResponse;
-use lightbridge_authz_usage_rest::repo::{StoreRepo, UsageEvent};
+use lightbridge_authz_core::{
+    cuid::cuid2,
+    db::{DbPool, DbPoolTrait},
+};
+use lightbridge_authz_usage_rest::{
+    UsageState, build_query_router,
+    models::SpendQueryResponse,
+    repo::{StoreRepo, UsageEvent},
+};
 use serde_json::json;
 use sqlx::PgPool;
-use std::sync::Arc;
 use tower::ServiceExt;
 
 fn parse_timestamp(value: &str) -> DateTime<Utc> {
@@ -47,6 +53,7 @@ async fn app(pool: PgPool) -> axum::Router {
 
 fn sample_event(account_id: &str, observed_at: DateTime<Utc>, total_cost: f64) -> UsageEvent {
     UsageEvent {
+        dedup_key: None,
         observed_at,
         signal_type: "trace".to_string(),
         source: Some("eaig".to_string()),
@@ -72,16 +79,41 @@ fn sample_event(account_id: &str, observed_at: DateTime<Utc>, total_cost: f64) -
 
 async fn insert(pool: &PgPool, event: &UsageEvent) {
     sqlx::query(
-        "INSERT INTO usage_events (observed_at, signal_type, account_id, total_cost) \
-         VALUES ($1, $2, $3, $4)",
+        "INSERT INTO usage_events (observed_at, signal_type, account_id, source, total_cost) \
+         VALUES ($1, $2, $3, $4, $5)",
     )
     .bind(event.observed_at)
     .bind(&event.signal_type)
     .bind(&event.account_id)
+    .bind(&event.source)
     .bind(event.total_cost)
     .execute(pool)
     .await
     .expect("inserting a test usage_events row must succeed");
+}
+
+/// Inserts directly into the daily rollup table -- `usage_events_daily` is never written by the
+/// ingest handlers, only by the retention job's `ROLLUP_AND_PURGE_SQL`, so a test that wants a
+/// row already "aged into the rollup" has to seed it here rather than through `insert` + a real
+/// rollup run.
+async fn insert_daily(
+    pool: &PgPool,
+    account_id: &str,
+    bucket_start: DateTime<Utc>,
+    source: Option<&str>,
+    total_cost: f64,
+) {
+    sqlx::query(
+        "INSERT INTO usage_events_daily (bucket_start, account_id, source, total_cost) \
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(bucket_start)
+    .bind(account_id)
+    .bind(source)
+    .bind(total_cost)
+    .execute(pool)
+    .await
+    .expect("inserting a test usage_events_daily row must succeed");
 }
 
 /// This test helper sends no client certificate -- irrelevant here since `.oneshot()` never opens
@@ -256,6 +288,80 @@ async fn usage_query_endpoint_application_logic_is_unaffected_by_mtls(pool: PgPo
         .await
         .expect("router must produce a response");
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+/// governance#358 / ADR-0028 D8: EAIG is the sole spend authority. A public IDE collector may
+/// observe the same model call EAIG already billed through the gateway, so its rows must never
+/// add to spend -- summing both would double-bill the account.
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn spend_query_excludes_ide_sourced_raw_rows(pool: PgPool) {
+    let account_id = cuid2();
+    let mid_period = parse_timestamp("2026-08-15T12:00:00Z");
+    let mut eaig_event = sample_event(&account_id, mid_period, 1.0);
+    eaig_event.source = Some("eaig".to_string());
+    insert(&pool, &eaig_event).await;
+    let mut claude_code_event = sample_event(&account_id, mid_period, 100.0);
+    claude_code_event.source = Some("claude-code".to_string());
+    insert(&pool, &claude_code_event).await;
+
+    let start = parse_timestamp("2026-08-01T00:00:00Z");
+    let end = parse_timestamp("2026-09-01T00:00:00Z");
+    let (status, body) = query_spend(app(pool).await, &account_id, start, end).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let response: SpendQueryResponse =
+        serde_json::from_value(body).expect("response body must be a SpendQueryResponse");
+    assert_eq!(
+        response.total_cost,
+        Some(1.0),
+        "the claude-code row must not be added to EAIG spend"
+    );
+}
+
+/// Same guarantee once a day has aged into the rollup -- the rollup arm needs the identical
+/// exclusion, or spend correctness would depend on how old the data is.
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn spend_query_excludes_ide_sourced_rollup_rows(pool: PgPool) {
+    let account_id = cuid2();
+    let bucket_start = parse_timestamp("2026-07-15T00:00:00Z");
+    insert_daily(&pool, &account_id, bucket_start, Some("eaig"), 2.0).await;
+    insert_daily(&pool, &account_id, bucket_start, Some("codex"), 250.0).await;
+
+    let start = parse_timestamp("2026-07-01T00:00:00Z");
+    let end = parse_timestamp("2026-08-01T00:00:00Z");
+    let (status, body) = query_spend(app(pool).await, &account_id, start, end).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let response: SpendQueryResponse =
+        serde_json::from_value(body).expect("response body must be a SpendQueryResponse");
+    assert_eq!(
+        response.total_cost,
+        Some(2.0),
+        "the codex rollup row must not be added to EAIG spend"
+    );
+}
+
+/// A row from before `source` tracking existed carries `NULL`, not `'eaig'` -- but every such row
+/// is, in substance, 100% EAIG traffic (the IDE ingest leg didn't exist yet). Excluding `NULL`
+/// would silently undercount that legacy spend, so it must be treated as EAIG.
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn spend_query_treats_null_source_as_eaig_for_backward_compatibility(pool: PgPool) {
+    let account_id = cuid2();
+    let mid_period = parse_timestamp("2026-08-15T12:00:00Z");
+    let mut legacy_event = sample_event(&account_id, mid_period, 5.0);
+    legacy_event.source = None;
+    insert(&pool, &legacy_event).await;
+    let bucket_start = parse_timestamp("2026-07-15T00:00:00Z");
+    insert_daily(&pool, &account_id, bucket_start, None, 3.0).await;
+
+    let start = parse_timestamp("2026-07-01T00:00:00Z");
+    let end = parse_timestamp("2026-09-01T00:00:00Z");
+    let (status, body) = query_spend(app(pool).await, &account_id, start, end).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let response: SpendQueryResponse =
+        serde_json::from_value(body).expect("response body must be a SpendQueryResponse");
+    assert_eq!(response.total_cost, Some(8.0));
 }
 
 /// #570: `/usage/v1/spend/query` is a service-to-service route with no per-caller ownership

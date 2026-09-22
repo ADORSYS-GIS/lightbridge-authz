@@ -23,10 +23,15 @@ use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 
 use crate::{
     UsageState,
-    handlers::ingest::{decode_otlp_request_async, key_values_to_map, merge_attr_maps},
-    handlers::payload_identity::check_identity_mismatch,
-    models::IngestResponse,
-    models::day_seat::{DayFact, SeatSnapshot},
+    handlers::{
+        attribute_merge::merge_attr_maps,
+        ingest::{decode_otlp_request_async, key_values_to_map},
+        payload_identity::check_identity_mismatch,
+    },
+    models::{
+        IngestResponse,
+        day_seat::{DayFact, SeatSnapshot},
+    },
     normalizer::day_grain::{DayGrainRecord, parse_day_grain},
 };
 
@@ -80,8 +85,10 @@ fn extract_day_grain(
             .unwrap_or_default();
         for scope_logs in resource_logs.scope_logs {
             for log_record in scope_logs.log_records {
+                // Verified resource identity must survive a record that tries to override it --
+                // see `merge_attr_maps`'s doc comment (governance#358).
                 let attrs =
-                    merge_attr_maps(&resource_attrs, &key_values_to_map(&log_record.attributes));
+                    merge_attr_maps(&key_values_to_map(&log_record.attributes), &resource_attrs);
                 check_identity_mismatch(&attrs, source);
                 match parse_day_grain(&attrs, source)? {
                     Some(DayGrainRecord::DayFact(f)) => facts.push(f),

@@ -23,6 +23,8 @@
 
 mod credential;
 
+use std::sync::Arc;
+
 use axum::{
     Json,
     body::Bytes,
@@ -30,20 +32,21 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
+use credential::authenticate_and_authorize;
 use prost::Message;
-use std::sync::Arc;
 
 use crate::{
     UsageState,
-    handlers::ingest::{
-        decode_otlp_request_async, extract_log_events, extract_metric_events, extract_trace_events,
-        persist_events,
+    handlers::{
+        ingest::{
+            decode_otlp_request_async, extract_log_events, extract_metric_events,
+            extract_trace_events, persist_events,
+        },
+        source_resolution::SourceTrust,
     },
     models::IngestResponse,
     repo::UsageEvent,
 };
-
-use credential::authenticate_and_authorize;
 
 /// The single body shared by all three authenticated handlers: authorize, decode, extract,
 /// persist.
@@ -124,12 +127,21 @@ where
     }
 }
 
+// Every wrapper below passes `SourceTrust::CredentialIsFinal` -- see this module's own doc: a
+// per-request machine credential already maps 1:1 to exactly one source here, so a resource-level
+// claim must never be allowed to relabel it (only `/v1/otel/*`'s shared-credential collectors
+// need `ResourceMayRefine`). The closures are capture-free, so they still coerce to the same bare
+// `fn(P, &str) -> Vec<UsageEvent>` pointer type `ingest`'s generic `extract` parameter expects.
+
 pub async fn auth_ingest_traces(
     State(state): State<Arc<UsageState>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    ingest(state, headers, body, "trace", "trace", extract_trace_events).await
+    ingest(state, headers, body, "trace", "trace", |p, s| {
+        extract_trace_events(p, s, SourceTrust::CredentialIsFinal)
+    })
+    .await
 }
 
 pub async fn auth_ingest_metrics(
@@ -137,14 +149,9 @@ pub async fn auth_ingest_metrics(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    ingest(
-        state,
-        headers,
-        body,
-        "metrics",
-        "metric",
-        extract_metric_events,
-    )
+    ingest(state, headers, body, "metrics", "metric", |p, s| {
+        extract_metric_events(p, s, SourceTrust::CredentialIsFinal)
+    })
     .await
 }
 
@@ -153,5 +160,8 @@ pub async fn auth_ingest_logs(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    ingest(state, headers, body, "logs", "log", extract_log_events).await
+    ingest(state, headers, body, "logs", "log", |p, s| {
+        extract_log_events(p, s, SourceTrust::CredentialIsFinal)
+    })
+    .await
 }

@@ -57,9 +57,9 @@ pub fn parse_execution_grain(
             .unwrap_or_default();
         for scope_spans in resource_spans.scope_spans {
             for span in scope_spans.spans {
-                let attrs = crate::handlers::ingest::merge_attr_maps(
-                    &resource_attrs,
+                let attrs = crate::handlers::attribute_merge::merge_attr_maps(
                     &crate::handlers::ingest::key_values_to_map(&span.attributes),
+                    &resource_attrs,
                 );
                 check_identity_mismatch(&attrs, source);
                 let trace_id = hex::encode(&span.trace_id);

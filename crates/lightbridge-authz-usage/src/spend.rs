@@ -39,6 +39,19 @@ use tracing::debug;
 /// billing periods are month-aligned (day boundaries) and always within the raw window, so the
 /// rollup arm is empty -- but callers should treat spend over a rolled-up period as
 /// day-granular, not sub-day-exact.
+///
+/// ## EAIG is the sole spend authority (governance#358, ADR-0028 D8)
+///
+/// Public IDE collectors (Claude Code, Codex, OpenCode) may write request-grain observations of
+/// the *same* model calls EAIG already bills through the gateway. Summing both would double the
+/// account's spend, so both arms restrict to `source IS NULL OR source = 'eaig'`. `NULL` is
+/// deliberately treated as EAIG, not excluded: every row written before `usage_events.source`
+/// existed (20260908000003) and every row rolled up before `usage_events_daily.source` existed
+/// (20260922000002) is `NULL` there and is, in substance, 100% EAIG traffic -- excluding `NULL`
+/// would silently undercount that legacy spend. Only a row *affirmatively* tagged with a non-eaig
+/// source (`claude-code`, `codex`, `opencode`, ...) is excluded. This is a restriction, not a
+/// join, so it costs nothing when no non-eaig source has ever been written -- the common case
+/// today.
 pub async fn spend_for_account(
     pool: &PgPool,
     account_id: &str,
@@ -53,9 +66,11 @@ pub async fn spend_for_account(
         "SELECT SUM(total_cost)::double precision FROM ( \
              SELECT total_cost FROM usage_events \
              WHERE account_id = $1 AND observed_at >= $2 AND observed_at < $3 \
+                 AND (source IS NULL OR source = 'eaig') \
              UNION ALL \
              SELECT total_cost FROM usage_events_daily \
              WHERE account_id = $1 AND bucket_start >= $2 AND bucket_start < $3 \
+                 AND (source IS NULL OR source = 'eaig') \
          ) AS spend_rows",
     )
     .bind(account_id)

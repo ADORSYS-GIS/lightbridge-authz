@@ -23,6 +23,11 @@ use prost::Message;
 use serde_json::{Map, Value, json};
 use tracing::{debug, instrument, warn};
 
+use super::{
+    attribute_merge::merge_attr_maps,
+    identity_keys::{ACCOUNT_KEYS, API_KEY_KEYS, PROJECT_KEYS, USER_KEYS, USER_NAME_KEYS},
+    source_resolution::{SourceTrust, resolve_event_source},
+};
 use crate::{
     UsageState,
     handlers::payload_identity::check_identity_mismatch,
@@ -31,43 +36,6 @@ use crate::{
     repo::UsageEvent,
 };
 
-const ACCOUNT_KEYS: [&str; 5] = [
-    "account_id",
-    "account.id",
-    "x-account-id",
-    "authz.account_id",
-    "lb.account_id",
-];
-const PROJECT_KEYS: [&str; 5] = [
-    "project_id",
-    "project.id",
-    "x-project-id",
-    "authz.project_id",
-    "lb.project_id",
-];
-const API_KEY_KEYS: [&str; 5] = [
-    "api_key_id",
-    "api_key.id",
-    "x-api-key-id",
-    "authz.api_key_id",
-    "lb.api_key_id",
-];
-const USER_KEYS: [&str; 6] = [
-    "user_id",
-    "user.id",
-    "end_user.id",
-    "lc_user_id",
-    "x-user-id",
-    "authz.user_id",
-];
-const USER_NAME_KEYS: [&str; 6] = [
-    "user_name",
-    "user.name",
-    "end_user.name",
-    "lc_user_name",
-    "x-user-name",
-    "authz.user_name",
-];
 const MODEL_KEYS: [&str; 5] = [
     "model",
     "llm.model",
@@ -256,7 +224,7 @@ pub async fn ingest_traces(
     }
     let payload =
         decode_otlp_request_async::<ExportTraceServiceRequest>(headers, body, "trace").await?;
-    let events = extract_trace_events(payload, source);
+    let events = extract_trace_events(payload, source, SourceTrust::ResourceMayRefine);
     let accepted_events = persist_events(&state, "trace", &events).await?;
 
     debug!("accepted {} trace events", accepted_events);
@@ -286,7 +254,7 @@ pub async fn ingest_metrics(
     let source = crate::normalizer::resolve_source(&headers)?;
     let payload =
         decode_otlp_request_async::<ExportMetricsServiceRequest>(headers, body, "metrics").await?;
-    let events = extract_metric_events(payload, source);
+    let events = extract_metric_events(payload, source, SourceTrust::ResourceMayRefine);
     let accepted_events = persist_events(&state, "metric", &events).await?;
 
     debug!("accepted {} metric events", accepted_events);
@@ -325,7 +293,7 @@ pub async fn ingest_logs(
     }
     let payload =
         decode_otlp_request_async::<ExportLogsServiceRequest>(headers, body, "logs").await?;
-    let events = extract_log_events(payload, source);
+    let events = extract_log_events(payload, source, SourceTrust::ResourceMayRefine);
     let accepted_events = persist_events(&state, "log", &events).await?;
 
     debug!("accepted {} log events", accepted_events);
@@ -540,21 +508,23 @@ pub fn apply_normalizer(
 pub(crate) fn extract_log_events(
     payload: ExportLogsServiceRequest,
     source: &str,
+    trust: SourceTrust,
 ) -> Vec<UsageEvent> {
     let mut events = Vec::new();
-    let normalizer = crate::normalizer::REGISTRY.get(source);
 
     for resource_logs in payload.resource_logs {
         let resource_attrs = resource_logs
             .resource
             .map(|resource| key_values_to_map(&resource.attributes))
             .unwrap_or_default();
+        let resolved_source = resolve_event_source(&resource_attrs, source, trust);
+        let normalizer = crate::normalizer::REGISTRY.get(resolved_source);
 
         for scope_logs in resource_logs.scope_logs {
             for log_record in scope_logs.log_records {
                 let attrs =
-                    merge_attr_maps(&resource_attrs, &key_values_to_map(&log_record.attributes));
-                check_identity_mismatch(&attrs, source);
+                    merge_attr_maps(&key_values_to_map(&log_record.attributes), &resource_attrs);
+                check_identity_mismatch(&attrs, resolved_source);
 
                 let observed_nanos = if log_record.time_unix_nano > 0 {
                     log_record.time_unix_nano
@@ -582,9 +552,12 @@ pub(crate) fn extract_log_events(
                 let latency_ms = norm.latency_ms.or_else(|| extract_latency_ms(&attrs));
 
                 events.push(UsageEvent {
+                    dedup_key: (observed_nanos > 0)
+                        .then(|| super::request_dedup::request_key(&attrs))
+                        .flatten(),
                     observed_at: nanos_to_datetime(observed_nanos),
                     signal_type: "log".to_string(),
-                    source: Some(source.to_string()),
+                    source: Some(resolved_source.to_string()),
                     account_id: extract_string(&attrs, &ACCOUNT_KEYS),
                     project_id: extract_string(&attrs, &PROJECT_KEYS),
                     api_key_id: extract_string(&attrs, &API_KEY_KEYS),
@@ -620,20 +593,22 @@ fn is_json_content(headers: &HeaderMap) -> bool {
 pub(crate) fn extract_trace_events(
     payload: ExportTraceServiceRequest,
     source: &str,
+    trust: SourceTrust,
 ) -> Vec<UsageEvent> {
     let mut events = Vec::new();
-    let normalizer = crate::normalizer::REGISTRY.get(source);
 
     for resource_spans in payload.resource_spans {
         let resource_attrs = resource_spans
             .resource
             .map(|resource| key_values_to_map(&resource.attributes))
             .unwrap_or_default();
+        let resolved_source = resolve_event_source(&resource_attrs, source, trust);
+        let normalizer = crate::normalizer::REGISTRY.get(resolved_source);
 
         for scope_spans in resource_spans.scope_spans {
             for span in scope_spans.spans {
-                let attrs = merge_attr_maps(&resource_attrs, &key_values_to_map(&span.attributes));
-                check_identity_mismatch(&attrs, source);
+                let attrs = merge_attr_maps(&key_values_to_map(&span.attributes), &resource_attrs);
+                check_identity_mismatch(&attrs, resolved_source);
 
                 let span_meta = crate::normalizer::SpanMeta {
                     trace_id: (!span.trace_id.is_empty()).then(|| hex::encode(&span.trace_id)),
@@ -660,9 +635,10 @@ pub(crate) fn extract_trace_events(
                         .or_else(|| extract_latency_ms(&attrs));
 
                 events.push(UsageEvent {
+                    dedup_key: None,
                     observed_at: nanos_to_datetime(observed_nanos),
                     signal_type: "trace".to_string(),
-                    source: Some(source.to_string()),
+                    source: Some(resolved_source.to_string()),
                     account_id: extract_string(&attrs, &ACCOUNT_KEYS),
                     project_id: extract_string(&attrs, &PROJECT_KEYS),
                     api_key_id: extract_string(&attrs, &API_KEY_KEYS),
@@ -691,21 +667,23 @@ pub(crate) fn extract_trace_events(
 pub(crate) fn extract_metric_events(
     payload: ExportMetricsServiceRequest,
     source: &str,
+    trust: SourceTrust,
 ) -> Vec<UsageEvent> {
     let mut events = Vec::new();
-    let normalizer = crate::normalizer::REGISTRY.get(source);
 
     for resource_metrics in payload.resource_metrics {
         let resource_attrs = resource_metrics
             .resource
             .map(|resource| key_values_to_map(&resource.attributes))
             .unwrap_or_default();
+        let resolved_source = resolve_event_source(&resource_attrs, source, trust);
+        let normalizer = crate::normalizer::REGISTRY.get(resolved_source);
 
         for scope_metrics in resource_metrics.scope_metrics {
             for metric in scope_metrics.metrics {
                 let metric_name = non_empty(Some(metric.name.clone()));
                 let metric_attrs =
-                    merge_attr_maps(&resource_attrs, &key_values_to_map(&metric.metadata));
+                    merge_attr_maps(&key_values_to_map(&metric.metadata), &resource_attrs);
 
                 if let Some(data) = metric.data {
                     match data {
@@ -715,7 +693,7 @@ pub(crate) fn extract_metric_events(
                                     &metric_attrs,
                                     metric_name.clone(),
                                     point,
-                                    source,
+                                    resolved_source,
                                     normalizer,
                                 ));
                             }
@@ -726,7 +704,7 @@ pub(crate) fn extract_metric_events(
                                     &metric_attrs,
                                     metric_name.clone(),
                                     point,
-                                    source,
+                                    resolved_source,
                                     normalizer,
                                 ));
                             }
@@ -737,7 +715,7 @@ pub(crate) fn extract_metric_events(
                                     &metric_attrs,
                                     metric_name.clone(),
                                     point,
-                                    source,
+                                    resolved_source,
                                     normalizer,
                                 ));
                             }
@@ -748,7 +726,7 @@ pub(crate) fn extract_metric_events(
                                     &metric_attrs,
                                     metric_name.clone(),
                                     point,
-                                    source,
+                                    resolved_source,
                                     normalizer,
                                 ));
                             }
@@ -759,7 +737,7 @@ pub(crate) fn extract_metric_events(
                                     &metric_attrs,
                                     metric_name.clone(),
                                     point,
-                                    source,
+                                    resolved_source,
                                     normalizer,
                                 ));
                             }
@@ -780,7 +758,7 @@ fn number_data_point_to_event(
     source: &str,
     normalizer: Option<crate::normalizer::NormalizerFn>,
 ) -> UsageEvent {
-    let attrs = merge_attr_maps(metric_attrs, &key_values_to_map(&point.attributes));
+    let attrs = merge_attr_maps(&key_values_to_map(&point.attributes), metric_attrs);
     check_identity_mismatch(&attrs, source);
 
     let value = match point.value {
@@ -799,6 +777,7 @@ fn number_data_point_to_event(
     let norm = apply_normalizer(normalizer, &attrs, &span_meta);
 
     UsageEvent {
+        dedup_key: None,
         observed_at: nanos_to_datetime(point.time_unix_nano),
         signal_type: "metric".to_string(),
         source: Some(source.to_string()),
@@ -832,7 +811,7 @@ fn histogram_data_point_to_event(
     source: &str,
     normalizer: Option<crate::normalizer::NormalizerFn>,
 ) -> UsageEvent {
-    let attrs = merge_attr_maps(metric_attrs, &key_values_to_map(&point.attributes));
+    let attrs = merge_attr_maps(&key_values_to_map(&point.attributes), metric_attrs);
     check_identity_mismatch(&attrs, source);
 
     let count = u64_to_i64(point.count);
@@ -848,6 +827,7 @@ fn histogram_data_point_to_event(
     let norm = apply_normalizer(normalizer, &attrs, &span_meta);
 
     UsageEvent {
+        dedup_key: None,
         observed_at: nanos_to_datetime(point.time_unix_nano),
         signal_type: "metric".to_string(),
         source: Some(source.to_string()),
@@ -878,7 +858,7 @@ fn exponential_histogram_data_point_to_event(
     source: &str,
     normalizer: Option<crate::normalizer::NormalizerFn>,
 ) -> UsageEvent {
-    let attrs = merge_attr_maps(metric_attrs, &key_values_to_map(&point.attributes));
+    let attrs = merge_attr_maps(&key_values_to_map(&point.attributes), metric_attrs);
     check_identity_mismatch(&attrs, source);
 
     let count = u64_to_i64(point.count);
@@ -894,6 +874,7 @@ fn exponential_histogram_data_point_to_event(
     let norm = apply_normalizer(normalizer, &attrs, &span_meta);
 
     UsageEvent {
+        dedup_key: None,
         observed_at: nanos_to_datetime(point.time_unix_nano),
         signal_type: "metric".to_string(),
         source: Some(source.to_string()),
@@ -924,7 +905,7 @@ fn summary_data_point_to_event(
     source: &str,
     normalizer: Option<crate::normalizer::NormalizerFn>,
 ) -> UsageEvent {
-    let attrs = merge_attr_maps(metric_attrs, &key_values_to_map(&point.attributes));
+    let attrs = merge_attr_maps(&key_values_to_map(&point.attributes), metric_attrs);
     check_identity_mismatch(&attrs, source);
 
     let count = u64_to_i64(point.count);
@@ -939,6 +920,7 @@ fn summary_data_point_to_event(
     let norm = apply_normalizer(normalizer, &attrs, &span_meta);
 
     UsageEvent {
+        dedup_key: None,
         observed_at: nanos_to_datetime(point.time_unix_nano),
         signal_type: "metric".to_string(),
         source: Some(source.to_string()),
@@ -1001,17 +983,6 @@ pub(crate) fn key_values_to_map(values: &[KeyValue]) -> HashMap<String, Value> {
         map.insert(kv.key.clone(), value);
     }
     map
-}
-
-pub(crate) fn merge_attr_maps(
-    base: &HashMap<String, Value>,
-    additional: &HashMap<String, Value>,
-) -> HashMap<String, Value> {
-    let mut merged = base.clone();
-    for (key, value) in additional {
-        merged.insert(key.clone(), value.clone());
-    }
-    merged
 }
 
 fn any_value_to_json(any: &AnyValue) -> Value {
@@ -1165,7 +1136,7 @@ mod tests {
         }))
         .expect("valid trace payload");
 
-        let events = extract_trace_events(payload, "eaig");
+        let events = extract_trace_events(payload, "eaig", SourceTrust::ResourceMayRefine);
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -1283,7 +1254,7 @@ mod tests {
             }],
         };
 
-        let events = extract_metric_events(payload, "eaig");
+        let events = extract_metric_events(payload, "eaig", SourceTrust::ResourceMayRefine);
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -1300,6 +1271,29 @@ mod tests {
         );
         assert_eq!(event.usage_value, 99.0);
         assert_eq!(event.request_count, 99);
+    }
+
+    #[test]
+    fn extract_log_events_should_wire_each_resource_through_resolve_event_source() {
+        // governance#358: a multi-source collector can carry a mix of resources in one payload;
+        // the decision matrix itself is unit-tested directly on `resolve_event_source`.
+        let record = || json!({"timeUnixNano": "1735689600000000000", "attributes": []});
+        let payload: ExportLogsServiceRequest = serde_json::from_value(json!({"resourceLogs": [
+            {"resource": {"attributes": [{"key": "governance.source", "value": {"stringValue": "codex"}}]},
+             "scopeLogs": [{"logRecords": [record()]}]},
+            {"resource": {"attributes": []}, "scopeLogs": [{"logRecords": [record()]}]}
+        ]}))
+        .expect("valid multi-resource log payload");
+
+        let events = extract_log_events(payload, "ai-cli", SourceTrust::ResourceMayRefine);
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].source.as_deref(), Some("codex"));
+        assert_eq!(
+            events[1].source.as_deref(),
+            Some("ai-cli"),
+            "a resource with no override must fall back to the collector-level default"
+        );
     }
 
     #[test]
@@ -1403,7 +1397,7 @@ mod tests {
             }],
         };
 
-        let events = extract_log_events(payload, "eaig");
+        let events = extract_log_events(payload, "eaig", SourceTrust::ResourceMayRefine);
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -1510,7 +1504,7 @@ mod tests {
             }],
         };
 
-        let events = extract_log_events(payload, "eaig");
+        let events = extract_log_events(payload, "eaig", SourceTrust::ResourceMayRefine);
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -1576,7 +1570,7 @@ mod tests {
             }],
         };
 
-        let events = extract_log_events(payload, "eaig");
+        let events = extract_log_events(payload, "eaig", SourceTrust::ResourceMayRefine);
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -1630,7 +1624,7 @@ mod tests {
         }))
         .expect("valid log payload");
 
-        let events = extract_log_events(payload, "eaig");
+        let events = extract_log_events(payload, "eaig", SourceTrust::ResourceMayRefine);
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -1679,7 +1673,7 @@ mod tests {
         request.encode(&mut encoded).expect("should encode");
 
         let decoded = ExportLogsServiceRequest::decode(encoded.as_slice()).expect("should decode");
-        let events = extract_log_events(decoded, "eaig");
+        let events = extract_log_events(decoded, "eaig", SourceTrust::ResourceMayRefine);
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -1861,7 +1855,7 @@ mod tests {
         }))
         .expect("valid log payload");
 
-        let events = extract_log_events(payload, "eaig");
+        let events = extract_log_events(payload, "eaig", SourceTrust::ResourceMayRefine);
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -1904,7 +1898,7 @@ mod tests {
         }))
         .expect("valid trace payload");
 
-        let trace_events = extract_trace_events(traces, "eaig");
+        let trace_events = extract_trace_events(traces, "eaig", SourceTrust::ResourceMayRefine);
         assert_eq!(trace_events.len(), 1);
         assert_eq!(trace_events[0].azp.as_deref(), Some("cli"));
         assert_eq!(trace_events[0].billing_plan.as_deref(), Some("free"));
@@ -1940,7 +1934,7 @@ mod tests {
         }))
         .expect("valid metric payload");
 
-        let metric_events = extract_metric_events(metrics, "eaig");
+        let metric_events = extract_metric_events(metrics, "eaig", SourceTrust::ResourceMayRefine);
         assert_eq!(metric_events.len(), 1);
         assert_eq!(metric_events[0].azp.as_deref(), Some("batch-job"));
         assert_eq!(metric_events[0].billing_plan.as_deref(), Some("enterprise"));
@@ -1949,6 +1943,7 @@ mod tests {
 
     fn base_usage_event() -> UsageEvent {
         UsageEvent {
+            dedup_key: None,
             observed_at: nanos_to_datetime(1_600_000_000_000_000_000),
             latency_ms: None,
             signal_type: "log".to_string(),
@@ -1993,7 +1988,7 @@ mod tests {
         }))
         .expect("valid trace payload");
 
-        let events = extract_trace_events(payload, "eaig");
+        let events = extract_trace_events(payload, "eaig", SourceTrust::ResourceMayRefine);
 
         assert_eq!(events.len(), 1);
         assert_eq!(
@@ -2025,7 +2020,7 @@ mod tests {
         }))
         .expect("valid log payload");
 
-        let events = extract_log_events(payload, "eaig");
+        let events = extract_log_events(payload, "eaig", SourceTrust::ResourceMayRefine);
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -2063,7 +2058,7 @@ mod tests {
             }],
         };
 
-        let events = extract_metric_events(payload, "eaig");
+        let events = extract_metric_events(payload, "eaig", SourceTrust::ResourceMayRefine);
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].usage_value, 3.5);
@@ -2100,7 +2095,7 @@ mod tests {
             }],
         };
 
-        let events = extract_metric_events(payload, "eaig");
+        let events = extract_metric_events(payload, "eaig", SourceTrust::ResourceMayRefine);
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -2138,7 +2133,7 @@ mod tests {
             }],
         };
 
-        let events = extract_metric_events(payload, "eaig");
+        let events = extract_metric_events(payload, "eaig", SourceTrust::ResourceMayRefine);
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -2173,7 +2168,7 @@ mod tests {
             }],
         };
 
-        let events = extract_metric_events(payload, "eaig");
+        let events = extract_metric_events(payload, "eaig", SourceTrust::ResourceMayRefine);
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -2199,7 +2194,7 @@ mod tests {
             }],
         };
 
-        let events = extract_metric_events(payload, "eaig");
+        let events = extract_metric_events(payload, "eaig", SourceTrust::ResourceMayRefine);
 
         assert!(events.is_empty());
     }
@@ -2754,7 +2749,7 @@ mod tests {
         }))
         .expect("valid trace payload");
 
-        let events = extract_trace_events(payload, "eaig");
+        let events = extract_trace_events(payload, "eaig", SourceTrust::ResourceMayRefine);
 
         assert_eq!(events[0].latency_ms, Some(412.0));
     }
@@ -2779,7 +2774,7 @@ mod tests {
         }))
         .expect("valid trace payload");
 
-        let events = extract_trace_events(payload, "eaig");
+        let events = extract_trace_events(payload, "eaig", SourceTrust::ResourceMayRefine);
 
         assert_eq!(events[0].latency_ms, Some(412.0));
     }
@@ -2803,7 +2798,7 @@ mod tests {
         }))
         .expect("valid trace payload");
 
-        let events = extract_trace_events(payload, "eaig");
+        let events = extract_trace_events(payload, "eaig", SourceTrust::ResourceMayRefine);
 
         assert_eq!(events[0].latency_ms, Some(51_042.0));
     }
@@ -2830,7 +2825,7 @@ mod tests {
             }],
         };
 
-        let events = extract_log_events(request, "eaig");
+        let events = extract_log_events(request, "eaig", SourceTrust::ResourceMayRefine);
 
         assert_eq!(events[0].latency_ms, Some(51_042.0));
     }
@@ -2854,7 +2849,7 @@ mod tests {
             }],
         };
 
-        let events = extract_log_events(request, "eaig");
+        let events = extract_log_events(request, "eaig", SourceTrust::ResourceMayRefine);
 
         assert_eq!(events[0].latency_ms, Some(50_011.0));
     }
@@ -2878,7 +2873,7 @@ mod tests {
             }],
         };
 
-        let events = extract_log_events(request, "eaig");
+        let events = extract_log_events(request, "eaig", SourceTrust::ResourceMayRefine);
 
         assert_eq!(events[0].latency_ms, None);
     }
