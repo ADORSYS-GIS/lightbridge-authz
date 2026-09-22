@@ -29,13 +29,13 @@ WITH deleted AS (
 ),
 rolled AS (
     INSERT INTO usage_events_daily (
-        bucket_start, account_id, project_id, api_key_id, user_id, user_name, model, metric_name,
+        bucket_start, source, account_id, project_id, api_key_id, user_id, user_name, model, metric_name,
         signal_type, azp, operation, billing_plan, requests, usage_value, prompt_tokens,
         completion_tokens, total_tokens, total_cost, latency_samples
     )
     SELECT
         date_trunc('day', observed_at) AS bucket_start,
-        account_id, project_id, api_key_id, user_id, user_name, model, metric_name, signal_type,
+        source, account_id, project_id, api_key_id, user_id, user_name, model, metric_name, signal_type,
         azp, operation, billing_plan,
         SUM(request_count)::bigint AS requests,
         SUM(usage_value)::double precision AS usage_value,
@@ -45,9 +45,9 @@ rolled AS (
         SUM(total_cost)::double precision AS total_cost,
         COUNT(latency_ms)::bigint AS latency_samples
     FROM deleted
-    GROUP BY bucket_start, account_id, project_id, api_key_id, user_id, user_name, model, metric_name,
+    GROUP BY bucket_start, source, account_id, project_id, api_key_id, user_id, user_name, model, metric_name,
              signal_type, azp, operation, billing_plan
-    ON CONFLICT (bucket_start, account_id, project_id, api_key_id, user_id, user_name, model, metric_name,
+    ON CONFLICT (bucket_start, source, account_id, project_id, api_key_id, user_id, user_name, model, metric_name,
                  signal_type, azp, operation, billing_plan)
     DO UPDATE SET
         requests = COALESCE(usage_events_daily.requests, 0) + COALESCE(EXCLUDED.requests, 0),

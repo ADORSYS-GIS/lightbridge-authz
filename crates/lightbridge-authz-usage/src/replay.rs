@@ -3,21 +3,18 @@
 //! The archive leg (#589) writes raw OTLP objects to S3 under `<source>/<yyyy>/<mm>/<dd>/…`
 //! (the exporter lives in the governance repo, on the edge collector). This module is the
 //! replay half: it takes archived OTLP objects and POSTs each one through the *real*
-//! authenticated ingest endpoint (`/v1/otel/{traces,metrics,logs}`), so a field promoted to a
+//! trusted internal ingest endpoint (`/v1/otel/{traces,metrics,logs}`), so a field promoted to a
 //! column gets a historical backfill for every source.
 //!
 //! It is deliberately source-agnostic — no per-vendor code. The only thing it knows about a
 //! source is which OTLP signal an object carries (which route to POST it to) and the object's
 //! original content type (proto vs OTLP-JSON), both of which the archive object itself carries.
 //!
-//! **Re-run safety is NOT provided by this module, and is not true of the ingest path today.**
-//! The ingest handlers persist to `usage_events` via a plain `INSERT` with no dedup key
-//! (`StoreRepo::insert_usage_events`, `repo.rs`), so re-running the job re-inserts every
-//! already-replayed object as a fresh row and double-counts usage and spend in every query and
-//! dashboard. Re-run safety requires the ingest path to absorb redelivery — grain tables with
-//! dedup keys, or an `ON CONFLICT (source, dedup_key)` on `usage_events` — which does not exist
-//! yet. Until it does, run each archive window exactly once; do not re-run after a partial
-//! failure and expect unchanged counts.
+//! **Re-run safety is conditional, not a property of this transport.** Request logs with a
+//! natural request ID and stable timestamp are deduplicated while the raw row is retained.
+//! Legacy/untimestamped/unkeyed signals and replay after raw retention are not covered. Never
+//! replay a mixed AI-CLI archive under an invented canonical source. See
+//! `docs/collector-request-retry.md` for the remaining blockers and schema-first rollout.
 //!
 //! This module's contract is narrow and strict: **fail loud, never silently drop.** A non-2xx
 //! ingest response, an unreachable ingest, or an unreadable archive object is an error that
@@ -27,10 +24,10 @@
 //! is returned; a partially-replayed batch is therefore possible (objects already accepted before
 //! the failure). With `concurrency = 1` the batch replays strictly in order.
 
-use lightbridge_authz_core::{Error, Result};
 use std::sync::Arc;
-use tokio::sync::Semaphore;
-use tokio::task::JoinSet;
+
+use lightbridge_authz_core::{Error, Result};
+use tokio::{sync::Semaphore, task::JoinSet};
 
 pub use crate::replay_types::{ArchiveObject, ReplaySummary, Signal};
 
@@ -48,6 +45,7 @@ pub async fn replay_object(
     ingest_base_url: &str,
     object: ArchiveObject,
 ) -> Result<()> {
+    object.validate_source()?;
     let url = format!(
         "{}{}",
         ingest_base_url.trim_end_matches('/'),
@@ -65,6 +63,7 @@ pub async fn replay_object(
     let response = client
         .post(&url)
         .header(reqwest::header::CONTENT_TYPE, &object.content_type)
+        .header("x-source", &object.source)
         .body(body)
         .send()
         .await
@@ -77,9 +76,8 @@ pub async fn replay_object(
 
     let status = response.status();
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
         return Err(Error::Server(format!(
-            "replay of {} failed: ingest rejected {url} ({status}): {body}",
+            "replay of {} failed: ingest rejected {url} ({status})",
             object.key
         )));
     }
@@ -92,15 +90,17 @@ pub async fn replay_object(
 /// `concurrency` bounds how many objects are in flight at once; `1` replays strictly in order.
 /// Fail-loud: the first error aborts the whole batch (in-flight tasks are cancelled) and is
 /// returned. A partially-replayed batch is therefore possible, which is why re-run safety
-/// matters — but see the module docs: the ingest path does not absorb redelivery today, so a
-/// re-run re-inserts already-replayed objects and double-counts. Run each archive window exactly
-/// once until the ingest path gains a dedup key.
+/// matters. See the module docs for the limited natural-key/raw-retention dedup contract;
+/// this transport alone never establishes that a replay window is safe.
 pub async fn replay_batch(
     client: &reqwest::Client,
     ingest_base_url: &str,
     objects: Vec<ArchiveObject>,
     concurrency: usize,
 ) -> Result<ReplaySummary> {
+    for object in &objects {
+        object.validate_source()?;
+    }
     let concurrency = concurrency.max(1);
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let mut summary = ReplaySummary::default();

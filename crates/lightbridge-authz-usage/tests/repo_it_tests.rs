@@ -3,20 +3,21 @@
 #[path = "support/mod.rs"]
 mod support;
 
-use axum::body::Body;
-use axum::http::{Request, StatusCode};
-use chrono::{Duration, Utc};
-use lightbridge_authz_core::db::DbPool;
-use lightbridge_authz_core::db::DbPoolTrait;
-use lightbridge_authz_usage_rest::UsageState;
-use lightbridge_authz_usage_rest::build_ingest_router;
-use lightbridge_authz_usage_rest::models::{
-    UsageGroupBy, UsageMetric, UsageQueryFilters, UsageQueryRequest, UsageScope,
+use std::sync::Arc;
+
+use axum::{
+    body::Body,
+    http::{Request, StatusCode},
 };
-use lightbridge_authz_usage_rest::repo::{StoreRepo, UsageEvent};
+use chrono::{Duration, Utc};
+use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
+use lightbridge_authz_usage_rest::{
+    UsageState, build_ingest_router,
+    models::{UsageGroupBy, UsageMetric, UsageQueryFilters, UsageQueryRequest, UsageScope},
+    repo::{StoreRepo, UsageEvent},
+};
 use serde_json::{Value, json};
 use sqlx::PgPool;
-use std::sync::Arc;
 use tower::ServiceExt;
 
 fn build_repo(pool: PgPool) -> StoreRepo {
@@ -25,6 +26,7 @@ fn build_repo(pool: PgPool) -> StoreRepo {
 
 fn sample_event(observed_at: chrono::DateTime<Utc>) -> UsageEvent {
     UsageEvent {
+        dedup_key: None,
         observed_at,
         signal_type: "trace".to_string(),
         source: Some("eaig".to_string()),
@@ -1347,10 +1349,15 @@ async fn truncation_should_keep_the_newest_whole_buckets(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations-usage")]
 async fn ingest_must_not_log_the_request_body_and_must_not_log_at_info(pool: PgPool) {
     use std::sync::Mutex;
-    use tracing::field::{Field, Visit};
-    use tracing::{Level, Subscriber};
-    use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
-    use tracing_subscriber::registry::LookupSpan;
+
+    use tracing::{
+        Level, Subscriber,
+        field::{Field, Visit},
+    };
+    use tracing_subscriber::{
+        layer::{Context, Layer, SubscriberExt},
+        registry::LookupSpan,
+    };
 
     #[derive(Default)]
     struct Captured {
@@ -1689,3 +1696,32 @@ WHERE e.id = src.id
   AND e.operation IS NULL
   AND (src.azp IS NOT NULL OR src.billing_plan IS NOT NULL OR src.operation IS NOT NULL)
 "#;
+
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn request_redelivery_does_not_inflate_rows_or_measures(pool: PgPool) {
+    let repo = build_repo(pool.clone());
+    let mut event = sample_event(Utc::now());
+    event.dedup_key = Some("[\"account-a\",\"user-a\",\"request-1\"]".to_owned());
+    event.signal_type = "log".to_owned();
+    assert_eq!(
+        repo.insert_usage_events(&[event.clone(), event.clone()])
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(repo.insert_usage_events(&[event.clone()]).await.unwrap(), 0);
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM usage_events")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+    let tokens: i64 = sqlx::query_scalar("SELECT sum(total_tokens)::bigint FROM usage_events")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(tokens, 10);
+    event.dedup_key = Some("[\"account-b\",\"user-a\",\"request-1\"]".to_owned());
+    assert_eq!(repo.insert_usage_events(&[event.clone()]).await.unwrap(), 1);
+    event.source = Some("claude-code".to_owned());
+    assert_eq!(repo.insert_usage_events(&[event]).await.unwrap(), 1);
+}
