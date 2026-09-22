@@ -18,6 +18,7 @@ use utoipa_swagger_ui::SwaggerUi;
 
 pub mod aggregate_refresh;
 pub mod aggregate_refresh_config;
+pub mod aggregate_refresh_lock;
 pub mod config;
 pub mod handlers;
 pub mod instrumentation;

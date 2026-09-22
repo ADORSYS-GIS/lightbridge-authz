@@ -18,9 +18,15 @@ use std::time::{Duration, Instant};
 /// probe.
 const AGGREGATE_CACHE_TTL: Duration = Duration::from_secs(60);
 
+/// Default staleness bound for the KPI aggregates: two hours. Matches the default refresh interval
+/// (3600s) with one interval of slack, so a refresh that is merely late does not bounce the query
+/// paths back to raw, but a disabled job (or a broken one) degrades to raw within two hours instead
+/// of serving a stale snapshot forever.
+const DEFAULT_AGGREGATE_STALENESS: Duration = Duration::from_secs(7200);
+
 /// TTL cache for the aggregate routing decision. Held behind a `Mutex` (never across an `.await`),
 /// shared by every query path via `StoreRepo`.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct AggregateCache {
     /// Per-view existence, TTL-cached: view name -> (exists, checked_at). Cached per view so the
     /// day-facts and seat grains degrade independently (the #587 review's P3).
@@ -28,15 +34,34 @@ pub(crate) struct AggregateCache {
     /// Global freshness of the aggregate set, TTL-cached: (fresh, checked_at). All aggregates are
     /// refreshed together, so freshness is one decision shared by every grain.
     fresh: Option<(bool, Instant)>,
+    /// How old `last_refreshed_at` may be before the aggregate set is treated as stale and the
+    /// query paths fall back to the raw grain table. Defaults to [`DEFAULT_AGGREGATE_STALENESS`];
+    /// the server builder overrides it from the `aggregate_refresh.interval_seconds` config so it
+    /// tracks the configured cadence (see `lib.rs`).
+    staleness: Duration,
 }
 
 impl AggregateCache {
     pub(crate) fn new() -> Self {
-        Self::default()
+        Self {
+            entries: HashMap::new(),
+            fresh: None,
+            staleness: DEFAULT_AGGREGATE_STALENESS,
+        }
     }
 }
 
 impl StoreRepo {
+    /// Sets the aggregate staleness bound (see [`AggregateCache::staleness`]). The server builder
+    /// calls this with a bound derived from the configured refresh interval; tests use the default.
+    pub fn with_aggregate_staleness(self, staleness: Duration) -> Self {
+        self.aggregate_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .staleness = staleness;
+        self
+    }
+
     /// Whether a named KPI aggregate materialized view exists (#587). The query endpoints route to
     /// the aggregates when present and fall back to the raw grain table when absent (e.g. before
     /// migration 20260918000001 has run) -- the "prove the aggregate is read, not assumed" rule
@@ -92,14 +117,14 @@ impl StoreRepo {
         Ok(exists)
     }
 
-    /// Whether the aggregate set is fresh: `last_refreshed_at` is within [`StoreRepo`]'s staleness
+    /// Whether the aggregate set is fresh: `last_refreshed_at` is within the cache's staleness
     /// bound. `NULL` (never refreshed) is stale. TTL-cached.
     ///
     /// This is what turns "the views exist" into "the views are worth reading": an aggregate that
     /// exists but has not been refreshed in a long time (e.g. the refresh job was disabled) would
     /// otherwise serve a stale snapshot forever, invisibly.
     async fn aggregate_is_fresh(&self) -> Result<bool> {
-        {
+        let staleness = {
             let cache = self
                 .aggregate_cache
                 .lock()
@@ -109,7 +134,8 @@ impl StoreRepo {
             {
                 return Ok(fresh);
             }
-        }
+            cache.staleness
+        };
 
         let last: Option<DateTime<Utc>> = sqlx::query_scalar(
             "SELECT last_refreshed_at FROM usage_aggregate_refresh_state WHERE id = TRUE",
@@ -120,11 +146,7 @@ impl StoreRepo {
         // A `last_refreshed_at` in the future (clock skew) is treated as fresh: `to_std()` errors
         // on a negative duration, and `map_or(true, ...)` routes that to "fresh" rather than
         // bouncing the query paths back to raw.
-        let fresh = last.is_some_and(|t| {
-            (Utc::now() - t)
-                .to_std()
-                .map_or(true, |d| d < self.aggregate_staleness)
-        });
+        let fresh = last.is_some_and(|t| (Utc::now() - t).to_std().map_or(true, |d| d < staleness));
 
         let mut cache = self
             .aggregate_cache
