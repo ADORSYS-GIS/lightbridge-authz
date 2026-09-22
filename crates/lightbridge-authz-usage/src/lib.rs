@@ -207,7 +207,15 @@ pub async fn start_usage_server(
     // likewise logs and retries if the views are not yet present. This is the documented graceful
     // degradation, not a silent stale-aggregate risk.
 
-    let repo: Arc<dyn UsageRepoTrait> = Arc::new(StoreRepo::new(pool.clone()));
+    let repo: Arc<dyn UsageRepoTrait> =
+        Arc::new(StoreRepo::new(pool.clone()).with_aggregate_staleness(
+            // The aggregate routing falls back to raw when the aggregate set is stale (older than
+            // this bound). Bound it to two refresh intervals so it tracks the configured cadence:
+            // a merely-late refresh does not bounce the query paths back to raw, but a disabled or
+            // broken refresh degrades to raw within two intervals instead of serving a stale
+            // snapshot forever (the #587 review's P2).
+            Duration::from_secs(aggregate_refresh.interval_seconds.saturating_mul(2).max(1)),
+        ));
     let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(
         BearerTokenService::new(oauth2.clone())
             .map_err(|e| Error::Server(format!("failed to build bearer JWKS client: {e}")))?,

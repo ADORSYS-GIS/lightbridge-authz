@@ -17,6 +17,7 @@ use lightbridge_authz_core::{Error, Result};
 use sqlx::{FromRow, PgPool, Postgres, QueryBuilder};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tracing::{debug, instrument};
 
 #[derive(Debug, Clone)]
@@ -64,11 +65,22 @@ pub struct UsageEvent {
 #[derive(Debug, Clone)]
 pub struct StoreRepo {
     pool: Arc<dyn DbPoolTrait>,
-    /// TTL cache for the KPI-aggregate existence probe (#587). The query endpoints route to the
-    /// aggregates when they exist and fall back to the raw grain table when absent; this cache
-    /// stops that `to_regclass` probe from running on every request (the #587 review's P2).
+    /// TTL cache for the KPI-aggregate existence/freshness probe (#587). The query endpoints route
+    /// to the aggregates when they exist and are fresh, and fall back to the raw grain table
+    /// otherwise; this cache stops that probe from running on every request (the #587 review's P2).
     aggregate_cache: Arc<Mutex<aggregate::AggregateCache>>,
+    /// How old `last_refreshed_at` may be before the aggregate set is treated as stale and the
+    /// query paths fall back to the raw grain table. Defaults to [`DEFAULT_AGGREGATE_STALENESS`];
+    /// the server builder sets it from the `aggregate_refresh.interval_seconds` config so it tracks
+    /// the configured cadence (see `lib.rs`).
+    aggregate_staleness: Duration,
 }
+
+/// Default staleness bound for the KPI aggregates: two hours. Matches the default refresh interval
+/// (3600s) with one interval of slack, so a refresh that is merely late does not bounce the query
+/// paths back to raw, but a disabled job (or a broken one) degrades to raw within two hours instead
+/// of serving a stale snapshot forever.
+const DEFAULT_AGGREGATE_STALENESS: Duration = Duration::from_secs(7200);
 
 #[derive(Debug, FromRow)]
 struct UsageQueryRow {
@@ -107,7 +119,16 @@ impl StoreRepo {
         Self {
             pool,
             aggregate_cache: Arc::new(Mutex::new(aggregate::AggregateCache::new())),
+            aggregate_staleness: DEFAULT_AGGREGATE_STALENESS,
         }
+    }
+
+    /// Sets the aggregate staleness bound (see [`StoreRepo::aggregate_staleness`]). The server
+    /// builder calls this with a bound derived from the configured refresh interval; tests use the
+    /// default.
+    pub fn with_aggregate_staleness(mut self, staleness: Duration) -> Self {
+        self.aggregate_staleness = staleness;
+        self
     }
 
     pub(crate) fn pool(&self) -> &PgPool {

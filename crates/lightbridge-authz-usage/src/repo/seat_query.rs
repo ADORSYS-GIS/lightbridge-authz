@@ -2,6 +2,7 @@
 //! time buckets, with bucket-scoped truncation (the #578 `dense_rank()` pattern) and the shared
 //! ownership gate's `scope=user`/`scope=all` filter.
 
+use crate::aggregate_refresh::SEAT_AGGREGATE_VIEWS;
 use crate::models::seat::{SeatGroupBy, SeatSnapshotQueryRequest, SeatSnapshotSeriesPoint};
 use crate::repo::StoreRepo;
 use chrono::{DateTime, Utc};
@@ -47,12 +48,13 @@ impl StoreRepo {
         // bucket would collapse every row into the midnight bucket -- degenerate and misleading.
         super::bucket::validate_day_grain_bucket(&input.bucket)?;
 
-        // #587: route to the KPI aggregate when it exists, else fall back to the raw grain table.
-        // The seat aggregate preserves every dimension the query can filter/group on and carries
-        // the three pre-computed counts, so the routing is semantically equivalent at any bucket
-        // granularity (seat data is daily; the aggregate is daily). The existence decision is
-        // TTL-cached (`aggregate_views_available`) so it does not probe the DB on every request.
-        let use_aggregate = self.aggregate_views_available().await?;
+        // #587: route to the KPI aggregate when it exists and is fresh, else fall back to the raw
+        // grain table. The seat aggregate preserves every dimension the query can filter/group on
+        // and carries the three pre-computed counts, so the routing is semantically equivalent at
+        // any bucket granularity (seat data is daily; the aggregate is daily). The
+        // existence/freshness decision is TTL-cached (`aggregate_views_available`) so it does not
+        // probe the DB on every request.
+        let use_aggregate = self.aggregate_views_available(SEAT_AGGREGATE_VIEWS).await?;
         let mut builder = build_seat_snapshot_query(input, use_aggregate);
         let rows: Vec<SeatSnapshotQueryRow> =
             builder.build_query_as().fetch_all(self.pool()).await?;

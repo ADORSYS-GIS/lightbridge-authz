@@ -13,11 +13,18 @@
 //! repo and is fully testable in CI on plain Postgres.
 
 use lightbridge_authz_core::{Error, Result};
-use sqlx::PgPool;
+use sqlx::pool::PoolConnection;
+use sqlx::postgres::PgConnection;
+use sqlx::{PgPool, Postgres};
 use std::sync::Arc;
 use tracing::{info, warn};
 
 use crate::aggregate_refresh_config::AggregateRefreshConfig;
+
+/// Advisory-lock key for the aggregate refresh job. A fixed, arbitrary constant: Postgres advisory
+/// locks are a flat `bigint` namespace shared cluster-wide, so the only requirement is that nothing
+/// else in this estate picks the same number.
+const REFRESH_ADVISORY_LOCK_KEY: i64 = 587_000_001;
 
 /// The named KPI aggregates, in dependency-free order (each is independent, built on one grain
 /// table). This list is the single source of truth for what the refresh job refreshes and what the
@@ -33,6 +40,19 @@ pub const AGGREGATE_VIEWS: &[&str] = &[
     "mv_day_facts_spend_daily",
     "mv_seat_snapshots_active_daily",
 ];
+
+/// The day-facts grain's aggregates, for the routing check. Kept separate from
+/// [`SEAT_AGGREGATE_VIEWS`] so the day-facts and seat query paths degrade independently: a partial
+/// migration or a manual `DROP` of one grain's views must not force the other grain off its own
+/// healthy aggregates (the #587 review's P3).
+pub const DAY_FACTS_AGGREGATE_VIEWS: &[&str] = &[
+    "mv_day_facts_active_users_daily",
+    "mv_day_facts_acceptances_daily",
+    "mv_day_facts_spend_daily",
+];
+
+/// The seat grain's aggregate, for the routing check. See [`DAY_FACTS_AGGREGATE_VIEWS`].
+pub const SEAT_AGGREGATE_VIEWS: &[&str] = &["mv_seat_snapshots_active_daily"];
 
 /// Runs the aggregate-refresh background loop forever: every `config.interval_seconds`, refreshes
 /// every named KPI aggregate with `REFRESH MATERIALIZED VIEW CONCURRENTLY`. A failed run is logged
@@ -91,9 +111,10 @@ pub async fn refresh_all_aggregates(pool: &PgPool) -> Result<bool> {
     // (`pg_try_advisory_lock`), not a transaction-scoped one (`pg_try_advisory_xact_lock`): each
     // `REFRESH` below runs in its own implicit transaction, so a transaction-scoped lock would be
     // released before the first refresh and would not serialize anything. The session lock is held
-    // on this connection until we explicitly release it below, and is released automatically if the
+    // on this connection until it is released, and is released automatically if the
     // connection/session ends.
-    let lock_acquired = sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock(587000001)")
+    let lock_acquired = sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
+        .bind(REFRESH_ADVISORY_LOCK_KEY)
         .fetch_one(&mut *conn)
         .await
         .map_err(|e| Error::Database(format!("usage aggregate refresh lock failed: {e}")))?;
@@ -105,6 +126,10 @@ pub async fn refresh_all_aggregates(pool: &PgPool) -> Result<bool> {
         return Ok(false);
     }
 
+    // From here the session lock is held. Hand it to a guard so it is released even if this future
+    // is cancelled or panics mid-refresh -- see [`RefreshLockGuard`].
+    let mut guard = RefreshLockGuard::new(conn, REFRESH_ADVISORY_LOCK_KEY);
+
     let result = async {
         for view in AGGREGATE_VIEWS {
             // `view` comes from the hardcoded static allowlist `AGGREGATE_VIEWS` (never user input),
@@ -112,7 +137,7 @@ pub async fn refresh_all_aggregates(pool: &PgPool) -> Result<bool> {
             // of the escape hatch -- the names are compile-time constants, not request data.
             let sql = format!("REFRESH MATERIALIZED VIEW CONCURRENTLY {view}");
             sqlx::query(sqlx::AssertSqlSafe(sql))
-                .execute(&mut *conn)
+                .execute(guard.conn_mut())
                 .await
                 .map_err(|e| {
                     Error::Database(format!("usage aggregate refresh of {view} failed: {e}"))
@@ -127,14 +152,97 @@ pub async fn refresh_all_aggregates(pool: &PgPool) -> Result<bool> {
     // held lock on a pooled connection would block future refreshes) but do NOT let it mask the
     // refresh result -- the refresh error, if any, is the more important signal (the #587 review's
     // P2: an unlock failure must not overwrite a refresh failure).
-    if let Err(e) = sqlx::query("SELECT pg_advisory_unlock(587000001)")
-        .execute(&mut *conn)
-        .await
-    {
-        warn!("usage aggregate refresh: failed to release advisory lock: {e}");
-    }
+    guard.release().await;
 
     result.map(|()| true)
+}
+
+/// Guards the session-scoped advisory lock for the aggregate refresh.
+///
+/// `REFRESH MATERIALIZED VIEW CONCURRENTLY` cannot run inside an explicit transaction, so the
+/// refresh lock must be session-scoped (`pg_try_advisory_lock`), not transaction-scoped like the
+/// budget refresher's (`pg_try_advisory_xact_lock`, which releases on rollback -- including the
+/// rollback `sqlx::Transaction`'s `Drop` issues on cancellation or panic). A session lock is
+/// released only by `pg_advisory_unlock` on the SAME session or by that session ending. If the
+/// refresh future were cancelled or panicked before the explicit unlock, the pooled connection
+/// would return to the pool with the lock still held on its session -- silently freezing every
+/// replica's refresh (the exact bug class `snapshot_refresher.rs` fixed with a transaction-scoped
+/// lock). This guard guarantees the unlock runs on drop, even on cancellation or panic.
+///
+/// The normal path calls [`RefreshLockGuard::release`], which runs the unlock and consumes the
+/// connection so `Drop` does nothing. The abnormal path (cancellation/panic) drops the guard with
+/// the connection still held, and `Drop` releases the lock on a dedicated thread with its own
+/// runtime -- robust even if the current runtime is shutting down.
+pub struct RefreshLockGuard {
+    conn: Option<PoolConnection<Postgres>>,
+    key: i64,
+}
+
+impl RefreshLockGuard {
+    pub fn new(conn: PoolConnection<Postgres>, key: i64) -> Self {
+        Self {
+            conn: Some(conn),
+            key,
+        }
+    }
+
+    /// The connection the refresh runs on. Always present until [`RefreshLockGuard::release`] or
+    /// `Drop` takes it.
+    fn conn_mut(&mut self) -> &mut PgConnection {
+        self.conn
+            .as_mut()
+            .expect("refresh lock guard connection present")
+    }
+
+    /// Releases the session lock on the normal path, consuming the connection so `Drop` does
+    /// nothing. Logs (does not propagate) an unlock failure -- a held lock on a pooled connection
+    /// would block future refreshes, but the refresh result is the more important signal.
+    async fn release(mut self) {
+        if let Some(mut conn) = self.conn.take()
+            && let Err(e) = sqlx::query("SELECT pg_advisory_unlock($1)")
+                .bind(self.key)
+                .execute(&mut *conn)
+                .await
+        {
+            warn!("usage aggregate refresh: failed to release advisory lock: {e}");
+        }
+    }
+}
+
+impl Drop for RefreshLockGuard {
+    fn drop(&mut self) {
+        // Abnormal path: the refresh future was cancelled or panicked before `release` ran. The
+        // connection is still here, so release the lock on a dedicated thread with its own runtime
+        // before the connection returns to the pool. This is robust even during runtime shutdown
+        // (the pool teardown would also close the session, but we do not rely on that).
+        if let Some(conn) = self.conn.take() {
+            let key = self.key;
+            std::thread::spawn(move || {
+                let rt = match tokio::runtime::Runtime::new() {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        warn!(
+                            "usage aggregate refresh: failed to build runtime to release advisory \
+                             lock on drop: {e}"
+                        );
+                        return;
+                    }
+                };
+                rt.block_on(async move {
+                    let mut conn = conn;
+                    if let Err(e) = sqlx::query("SELECT pg_advisory_unlock($1)")
+                        .bind(key)
+                        .execute(&mut *conn)
+                        .await
+                    {
+                        warn!(
+                            "usage aggregate refresh: failed to release advisory lock on drop: {e}"
+                        );
+                    }
+                });
+            });
+        }
+    }
 }
 
 /// Records the last successful refresh into `usage_aggregate_refresh_state`, so a test or operator

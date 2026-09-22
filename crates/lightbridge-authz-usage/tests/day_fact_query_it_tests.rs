@@ -15,6 +15,7 @@ use axum::http::{Request, StatusCode, header};
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 use lightbridge_authz_usage_rest::UsageState;
+use lightbridge_authz_usage_rest::aggregate_refresh::record_last_refresh;
 use lightbridge_authz_usage_rest::build_query_router;
 use lightbridge_authz_usage_rest::models::UsageScope;
 use lightbridge_authz_usage_rest::models::day_fact::{
@@ -76,7 +77,10 @@ async fn insert_day_fact(
     refresh_day_fact_aggregates(pool).await;
 }
 
-/// Refreshes the three day-facts KPI aggregates the query endpoint routes to (#587).
+/// Refreshes the three day-facts KPI aggregates the query endpoint routes to (#587), then records
+/// the refresh so the routing's freshness check (`aggregate_views_available`) treats the aggregate
+/// set as fresh and routes to it. Without the `record_last_refresh`, `last_refreshed_at` stays NULL
+/// and the query paths fall back to the raw table (the #587 review's P2).
 async fn refresh_day_fact_aggregates(pool: &PgPool) {
     for view in [
         "mv_day_facts_acceptances_daily",
@@ -91,6 +95,9 @@ async fn refresh_day_fact_aggregates(pool: &PgPool) {
             .await
             .expect("refresh day-facts aggregate");
     }
+    record_last_refresh(pool)
+        .await
+        .expect("record day-facts aggregate refresh");
 }
 
 fn repo(pool: &PgPool) -> StoreRepo {
@@ -441,7 +448,13 @@ async fn divergent_aggregate_views_do_not_drop_rows(pool: PgPool) {
             .await
             .expect("refresh aggregate");
     }
-    // mv_day_facts_spend_daily is deliberately NOT refreshed -> it lacks the row.
+    // mv_day_facts_spend_daily is deliberately NOT refreshed -> it lacks the row. Record the
+    // refresh anyway so the routing's freshness check routes to the aggregate (the divergent-views
+    // state this test exists to exercise); without it, routing would fall back to raw and the
+    // spend would read as 1000, not NULL.
+    record_last_refresh(&pool)
+        .await
+        .expect("record aggregate refresh");
 
     let (points, _) = repo(&pool)
         .query_day_facts(&request(

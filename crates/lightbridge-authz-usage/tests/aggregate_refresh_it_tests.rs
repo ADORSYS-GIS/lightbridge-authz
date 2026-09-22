@@ -17,7 +17,7 @@
 
 use chrono::{DateTime, NaiveDate, Utc};
 use lightbridge_authz_usage_rest::aggregate_refresh::{
-    AGGREGATE_VIEWS, record_last_refresh, refresh_all_aggregates,
+    AGGREGATE_VIEWS, RefreshLockGuard, record_last_refresh, refresh_all_aggregates,
 };
 use sqlx::PgPool;
 
@@ -67,6 +67,85 @@ async fn refresh_records_last_refresh(pool: PgPool) {
         "last_refreshed_at must be recorded after a refresh run -- the 'refresh has run' \
          acceptance criterion is unprovable without it"
     );
+}
+
+/// Dropping a [`RefreshLockGuard`] without calling `release` -- the cancellation/panic path -- must
+/// release the session advisory lock. The refresh lock is session-scoped (REFRESH cannot run in a
+/// transaction, so the transaction-scoped fix `snapshot_refresher.rs` uses is unavailable), and a
+/// session lock returned to the pool still held would silently stop every replica's refresh. This
+/// is the deterministic half of that guarantee: the guard's `Drop` is what releases it.
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn dropped_guard_releases_advisory_lock(pool: PgPool) {
+    let mut conn = pool.acquire().await.expect("acquire a connection");
+    let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+        .bind(587_000_001)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("acquiring the lock should succeed");
+    assert!(
+        acquired,
+        "the test must hold the lock before handing it to the guard"
+    );
+
+    // Hand the lock to a guard and drop it WITHOUT `release` -- the abnormal path a cancelled or
+    // panicked refresh takes.
+    let guard = RefreshLockGuard::new(conn, 587_000_001);
+    drop(guard);
+
+    assert!(
+        lock_becomes_free(&pool).await,
+        "dropping the guard must release the session advisory lock -- a session-scoped lock \
+         returned to the pool still held would silently stop every OTHER replica's refresh"
+    );
+}
+
+/// A completed refresh must leave the advisory lock free with no explicit unlock beyond the
+/// guard's own `release` -- the deterministic half that the normal path releases the lock.
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn completed_refresh_releases_advisory_lock(pool: PgPool) {
+    refresh_all_aggregates(&pool)
+        .await
+        .expect("refresh should succeed");
+    assert!(
+        lock_is_free(&pool).await,
+        "a completed refresh must leave the advisory lock free"
+    );
+}
+
+/// Polls [`lock_is_free`] for up to two seconds.
+///
+/// The wait is not slack in the property; it is what makes the property observable at all. The
+/// guard's `Drop` releases the lock on a dedicated thread, so between `drop()` returning and that
+/// thread's unlock actually executing there is a window, and a probe on a different pool connection
+/// can land inside it and see the lock still held.
+async fn lock_becomes_free(pool: &PgPool) -> bool {
+    for _ in 0..100 {
+        if lock_is_free(pool).await {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    false
+}
+
+/// `true` when nobody holds the aggregate-refresh advisory lock, read from `pg_locks`.
+///
+/// Reading `pg_locks` takes no lock and cannot perturb what it measures. A 64-bit advisory key is
+/// split across two columns: `classid` is the high 32 bits, `objid` the low 32. For key
+/// `587_000_001` (`0x22FC_E8C1`): `classid = 0x22FC = 8956`, `objid = 0xE8C1 = 59585`.
+async fn lock_is_free(pool: &PgPool) -> bool {
+    const LOCK_CLASSID: i32 = 8_956;
+    const LOCK_OBJID: i32 = 59_585;
+    let (held,): (i64,) = sqlx::query_as(
+        "SELECT count(*)::bigint FROM pg_locks \
+         WHERE locktype = 'advisory' AND classid = $1 AND objid = $2 AND granted",
+    )
+    .bind(LOCK_CLASSID)
+    .bind(LOCK_OBJID)
+    .fetch_one(pool)
+    .await
+    .expect("reading pg_locks must succeed");
+    held == 0
 }
 
 /// AC4: money discipline on the day-facts spend aggregate. A row with NULL cost must be counted in

@@ -1,35 +1,38 @@
-//! KPI aggregate existence checks (#587).
+//! KPI aggregate existence + freshness checks (#587).
 //!
 //! Split out of `repo.rs` by the LoC gate: the query endpoints route to the KPI aggregates when
-//! they exist and fall back to the raw grain table when absent. The routing decision is cached with
-//! a short TTL so the `to_regclass` probe does not run on every request (the #587 review's P2).
+//! they exist AND are fresh, and fall back to the raw grain table otherwise. The routing decision
+//! is cached with a short TTL so the `to_regclass` probe and the freshness read do not run on every
+//! request (the #587 review's P2).
 
-use crate::aggregate_refresh::AGGREGATE_VIEWS;
 use crate::repo::StoreRepo;
+use chrono::{DateTime, Utc};
 use lightbridge_authz_core::{Error, Result};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-/// How long a cached aggregate-existence decision is trusted before the DB is probed again. The
-/// views are created by one migration, so they either all exist or none do; a short TTL keeps the
-/// graceful degradation (a server started before the migration serves raw, then picks the
+/// How long a cached aggregate-existence/freshness decision is trusted before the DB is probed
+/// again. The views are created by one migration, so they either all exist or none do; a short TTL
+/// keeps the graceful degradation (a server started before the migration serves raw, then picks the
 /// aggregates up within a minute once the migration has run) while eliminating the per-request
 /// probe.
 const AGGREGATE_CACHE_TTL: Duration = Duration::from_secs(60);
 
-/// TTL cache for the aggregate-existence routing decision. Held behind a `Mutex` (never across an
-/// `.await`), shared by every query path via `StoreRepo`.
-#[derive(Debug)]
+/// TTL cache for the aggregate routing decision. Held behind a `Mutex` (never across an `.await`),
+/// shared by every query path via `StoreRepo`.
+#[derive(Debug, Default)]
 pub(crate) struct AggregateCache {
-    available: Option<bool>,
-    checked_at: Option<Instant>,
+    /// Per-view existence, TTL-cached: view name -> (exists, checked_at). Cached per view so the
+    /// day-facts and seat grains degrade independently (the #587 review's P3).
+    entries: HashMap<String, (bool, Instant)>,
+    /// Global freshness of the aggregate set, TTL-cached: (fresh, checked_at). All aggregates are
+    /// refreshed together, so freshness is one decision shared by every grain.
+    fresh: Option<(bool, Instant)>,
 }
 
 impl AggregateCache {
     pub(crate) fn new() -> Self {
-        Self {
-            available: None,
-            checked_at: None,
-        }
+        Self::default()
     }
 }
 
@@ -47,44 +50,87 @@ impl StoreRepo {
         Ok(exists.unwrap_or(false))
     }
 
-    /// Whether ALL of the named KPI aggregate materialized views exist (#587). The day-facts query
-    /// routes to the aggregates only when every view it joins exists -- checking a single one would
-    /// route to a join that references a missing view and fail with a hard 500 instead of degrading
-    /// to the raw table.
-    pub(crate) async fn aggregates_exist(&self, views: &[&str]) -> Result<bool> {
+    /// Whether the named KPI aggregate materialized views are available for routing, cached with a
+    /// short TTL so the decision does not probe the DB on every request. `views` is the grain's own
+    /// list (day-facts or seat), so each grain degrades independently (the #587 review's P3).
+    ///
+    /// Returns `true` only when EVERY named view exists AND the aggregate set is fresh (see
+    /// [`StoreRepo::aggregate_is_fresh`]). The freshness half is what makes a disabled refresh
+    /// degrade to the raw table instead of silently serving a one-time snapshot forever (the #587
+    /// review's P2).
+    pub(crate) async fn aggregate_views_available(&self, views: &[&str]) -> Result<bool> {
         for view in views {
-            if !self.aggregate_exists(view).await? {
+            if !self.aggregate_exists_cached(view).await? {
                 return Ok(false);
             }
         }
-        Ok(true)
+        self.aggregate_is_fresh().await
     }
 
-    /// Whether the KPI aggregate materialized views are available for routing, cached with a short
-    /// TTL so the decision does not run a `to_regclass` probe on every request. The views are
-    /// created by one migration, so they either all exist or none do -- a single cached boolean
-    /// covers both the day-facts and seat routing paths.
-    pub(crate) async fn aggregate_views_available(&self) -> Result<bool> {
+    /// Per-view existence, TTL-cached.
+    async fn aggregate_exists_cached(&self, view: &str) -> Result<bool> {
         {
             let cache = self
                 .aggregate_cache
                 .lock()
-                .expect("aggregate cache lock poisoned");
-            if let Some(checked_at) = cache.checked_at
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some((exists, checked_at)) = cache.entries.get(view)
                 && checked_at.elapsed() < AGGREGATE_CACHE_TTL
             {
-                return Ok(cache.available.unwrap_or(false));
+                return Ok(*exists);
             }
         }
 
-        // Cache miss or stale: probe the DB, then refresh the cache.
-        let available = self.aggregates_exist(AGGREGATE_VIEWS).await?;
+        let exists = self.aggregate_exists(view).await?;
         let mut cache = self
             .aggregate_cache
             .lock()
-            .expect("aggregate cache lock poisoned");
-        cache.available = Some(available);
-        cache.checked_at = Some(Instant::now());
-        Ok(available)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache
+            .entries
+            .insert(view.to_string(), (exists, Instant::now()));
+        Ok(exists)
+    }
+
+    /// Whether the aggregate set is fresh: `last_refreshed_at` is within [`StoreRepo`]'s staleness
+    /// bound. `NULL` (never refreshed) is stale. TTL-cached.
+    ///
+    /// This is what turns "the views exist" into "the views are worth reading": an aggregate that
+    /// exists but has not been refreshed in a long time (e.g. the refresh job was disabled) would
+    /// otherwise serve a stale snapshot forever, invisibly.
+    async fn aggregate_is_fresh(&self) -> Result<bool> {
+        {
+            let cache = self
+                .aggregate_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some((fresh, checked_at)) = cache.fresh
+                && checked_at.elapsed() < AGGREGATE_CACHE_TTL
+            {
+                return Ok(fresh);
+            }
+        }
+
+        let last: Option<DateTime<Utc>> = sqlx::query_scalar(
+            "SELECT last_refreshed_at FROM usage_aggregate_refresh_state WHERE id = TRUE",
+        )
+        .fetch_optional(self.pool())
+        .await
+        .map_err(|e| Error::Database(format!("aggregate freshness check failed: {e}")))?;
+        // A `last_refreshed_at` in the future (clock skew) is treated as fresh: `to_std()` errors
+        // on a negative duration, and `map_or(true, ...)` routes that to "fresh" rather than
+        // bouncing the query paths back to raw.
+        let fresh = last.is_some_and(|t| {
+            (Utc::now() - t)
+                .to_std()
+                .map_or(true, |d| d < self.aggregate_staleness)
+        });
+
+        let mut cache = self
+            .aggregate_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.fresh = Some((fresh, Instant::now()));
+        Ok(fresh)
     }
 }

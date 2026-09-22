@@ -466,10 +466,10 @@ weight (the #587 review's P2).
   column; a query finer than the view's granularity is not representable from the aggregate and
   must read the raw grain table.
 - **Routing:** the day-facts (`/usage/v1/usage/facts/query`) and seat (`/usage/v1/usage/seats/query`)
-  endpoints read from these aggregates when they exist, falling back to the raw grain table when
-  absent (e.g. before the migration has run). The execution endpoint (`/usage/v1/usage/executions/
-  query`) spans grains (executions + model_calls + tool_calls), so per the "no aggregate spans
-  grains" rule it is not aggregate-backed and reads raw.
+  endpoints read from these aggregates when they exist **and are fresh**, falling back to the raw
+  grain table otherwise (absent before the migration has run, or stale — see **Refresh** below). The
+  execution endpoint (`/usage/v1/usage/executions/query`) spans grains (executions + model_calls +
+  tool_calls), so per the "no aggregate spans grains" rule it is not aggregate-backed and reads raw.
 - **Day/seat grain constraints:** the day and seat grains are daily, so their endpoints reject
   sub-day buckets (`400`) — a sub-day bucket would collapse every row into the midnight bucket.
   Both endpoints (and the legacy/execution endpoints) cap `limit` at `MAX_LIMIT` (10 000) to bound
@@ -481,3 +481,9 @@ weight (the #587 review's P2).
 - **Refresh:** the `aggregate_refresh` config block is optional with safe defaults
   (`enabled: true`, `interval_seconds: 3600`). Unlike retention, refreshing a materialized view is
   non-destructive and idempotent, so it defaults ON — a stale aggregate silently serves stale KPIs.
+  **These two endpoints are therefore eventually consistent with the refresh cadence (hourly by
+  default):** a row ingested via the day-grain/seat OTLP path is invisible to the aggregate-backed
+  query until the next refresh, up to `interval_seconds` (3600s by default) later. The routing
+  falls back to the raw grain table when the aggregate set is stale — older than two refresh
+  intervals (`2 × interval_seconds`) — so disabling the refresh job (or it breaking) degrades these
+  endpoints to live raw reads within that window instead of serving a one-time snapshot forever.

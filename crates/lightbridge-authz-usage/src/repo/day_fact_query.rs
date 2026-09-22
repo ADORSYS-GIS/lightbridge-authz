@@ -2,6 +2,7 @@
 //! time buckets, with bucket-scoped truncation (the #578 `dense_rank()` pattern) and the shared
 //! ownership gate's `scope=user`/`scope=all` filter.
 
+use crate::aggregate_refresh::DAY_FACTS_AGGREGATE_VIEWS;
 use crate::models::day_fact::{DayFactQueryRequest, DayFactSeriesPoint};
 use crate::repo::StoreRepo;
 use chrono::{DateTime, Utc};
@@ -51,13 +52,16 @@ impl StoreRepo {
         // collapse every row into the midnight bucket -- degenerate and misleading.
         super::bucket::validate_day_grain_bucket(&input.bucket)?;
 
-        // #587: route to the KPI aggregates when they ALL exist, else fall back to the raw grain
-        // table. The day-facts aggregates carry the full dimension set and pre-computed measures,
-        // so the routing is semantically equivalent (see `build_day_fact_query`). ALL THREE must
-        // exist: the aggregate path joins them, so a missing one would be a hard 500, not a
-        // graceful degradation to the raw table. The existence decision is TTL-cached
-        // (`aggregate_views_available`) so it does not probe the DB on every request.
-        let use_aggregate = self.aggregate_views_available().await?;
+        // #587: route to the KPI aggregates when they ALL exist and are fresh, else fall back to
+        // the raw grain table. The day-facts aggregates carry the full dimension set and
+        // pre-computed measures, so the routing is semantically equivalent (see
+        // `build_day_fact_query`). ALL THREE must exist: the aggregate path joins them, so a
+        // missing one would be a hard 500, not a graceful degradation to the raw table. The
+        // existence/freshness decision is TTL-cached (`aggregate_views_available`) so it does not
+        // probe the DB on every request.
+        let use_aggregate = self
+            .aggregate_views_available(DAY_FACTS_AGGREGATE_VIEWS)
+            .await?;
         let mut builder = build_day_fact_query(input, use_aggregate);
         let rows: Vec<DayFactQueryRow> = builder.build_query_as().fetch_all(self.pool()).await?;
 
