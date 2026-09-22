@@ -25,7 +25,7 @@
 //!   "ingest_base_url": "http://usage:3000",
 //!   "objects": [
 //!     { "key": "claude_code/2026/09/07/traces-1",
-//!       "signal": "traces",
+//!       "source": "claude-code", "signal": "traces",
 //!       "content_type": "application/x-protobuf",
 //!       "body_path": "/archive/claude_code/2026/09/07/traces-1" }
 //!   ]
@@ -34,12 +34,12 @@
 //! `signal` is one of `traces` | `metrics` | `logs`. `content_type` is preserved so the ingest
 //! handler's OTLP-JSON branch sees what the exporter originally sent.
 
+use std::{path::PathBuf, time::Duration};
+
 use clap::Parser;
 use lightbridge_authz_core::Result;
 use lightbridge_authz_usage_rest::replay::{ArchiveObject, Signal, replay_batch};
 use serde::Deserialize;
-use std::path::PathBuf;
-use std::time::Duration;
 
 #[derive(Parser)]
 #[command(
@@ -74,6 +74,7 @@ struct Manifest {
 #[derive(Deserialize)]
 struct ManifestObject {
     key: String,
+    source: String,
     signal: String,
     content_type: String,
     body_path: PathBuf,
@@ -113,6 +114,7 @@ async fn main() -> Result<()> {
     for entry in manifest.objects {
         objects.push(ArchiveObject {
             key: entry.key,
+            source: entry.source,
             signal: parse_signal(&entry.signal)?,
             content_type: entry.content_type,
             body_path: entry.body_path,

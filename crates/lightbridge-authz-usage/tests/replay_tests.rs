@@ -11,15 +11,15 @@
 //!   * a batch replays and reports per-signal counts, both sequentially and concurrently;
 //!   * a batch aborts on the first failure, even under concurrency;
 //!   * an unreadable archive object is an error, never silently dropped (fail loud);
-//!   * a re-run re-sends every object — the module does NOT dedup, and the ingest path writes
-//!     `usage_events` via a plain INSERT with no dedup key, so re-run safety must come from the
-//!     ingest path absorbing redelivery, which does not exist today (see `src/replay.rs`).
+//!   * a re-run re-sends every object — dedup belongs to the receiver, within the
+//!     natural-key/raw-retention limits documented in `src/replay.rs`.
+
+use std::path::PathBuf;
 
 use httpmock::prelude::*;
 use lightbridge_authz_usage_rest::replay::{
     ArchiveObject, ReplaySummary, Signal, replay_batch, replay_object,
 };
-use std::path::PathBuf;
 use tempfile::TempDir;
 
 /// Writes `body` to a file under `dir` and returns an `ArchiveObject` pointing at it.
@@ -35,6 +35,7 @@ fn object(
     std::fs::write(&body_path, body).expect("write archive body");
     ArchiveObject {
         key: key.to_string(),
+        source: "claude-code".to_owned(),
         signal,
         content_type: content_type.to_string(),
         body_path,
@@ -55,6 +56,7 @@ async fn replay_object_posts_to_the_signal_route_with_original_content_type() {
         when.method(POST)
             .path("/v1/otel/traces")
             .header("content-type", "application/x-protobuf")
+            .header("x-source", "claude-code")
             .body("raw-trace-bytes");
         then.status(200);
     });
@@ -164,6 +166,7 @@ async fn replay_object_fails_loud_on_unreadable_archive_object() {
     let client = reqwest::Client::new();
     let obj = ArchiveObject {
         key: "s1/2026/09/07/traces-1".to_string(),
+        source: "claude-code".to_owned(),
         signal: Signal::Traces,
         content_type: "application/x-protobuf".to_string(),
         body_path: PathBuf::from("/nonexistent/archive/object"),
@@ -446,4 +449,92 @@ async fn replay_batch_resends_every_object_on_rerun() {
     assert_eq!(second.objects, 1);
     // The module re-sends the object on every run — it does not dedup.
     traces.assert_calls(2);
+}
+
+#[tokio::test]
+async fn replay_refuses_fleet_source_before_network_io() {
+    let server = MockServer::start();
+    let mock = server.mock(|when, then| {
+        when.method(POST);
+        then.status(200);
+    });
+    let dir = TempDir::new().unwrap();
+    for source in ["ai-cli", "", "claude_code", "forged\r\nX-Source: eaig"] {
+        let mut obj = object(
+            &dir,
+            "logs",
+            "ai-cli/window/logs",
+            Signal::Logs,
+            "application/json",
+            br#"{"resourceLogs":[]}"#,
+        );
+        obj.source = source.to_owned();
+        assert!(
+            replay_object(&reqwest::Client::new(), &server.base_url(), obj)
+                .await
+                .is_err()
+        );
+    }
+    mock.assert_calls(0);
+}
+
+#[tokio::test]
+async fn replay_error_does_not_echo_response_body() {
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(POST);
+        then.status(400).body("SECRET_RESPONSE_BODY");
+    });
+    let dir = TempDir::new().unwrap();
+    let obj = object(
+        &dir,
+        "logs",
+        "window/logs",
+        Signal::Logs,
+        "application/json",
+        br#"{"resourceLogs":[]}"#,
+    );
+    let error = replay_object(&reqwest::Client::new(), &server.base_url(), obj)
+        .await
+        .unwrap_err();
+    assert!(!error.to_string().contains("SECRET_RESPONSE_BODY"));
+    assert!(error.to_string().contains("400"));
+}
+
+#[tokio::test]
+async fn invalid_source_in_later_object_refuses_the_whole_batch_before_sending() {
+    let server = MockServer::start();
+    let mock = server.mock(|when, then| {
+        when.method(POST);
+        then.status(200);
+    });
+    let dir = TempDir::new().unwrap();
+    let valid = object(
+        &dir,
+        "one",
+        "window/one",
+        Signal::Logs,
+        "application/json",
+        b"{}",
+    );
+    let mut invalid = object(
+        &dir,
+        "two",
+        "window/two",
+        Signal::Logs,
+        "application/json",
+        b"{}",
+    );
+    invalid.source = "ai-cli".to_owned();
+    assert!(
+        replay_batch(
+            &reqwest::Client::new(),
+            &server.base_url(),
+            vec![valid, invalid],
+            2
+        )
+        .await
+        .is_err()
+    );
+    mock.assert_calls(0);
 }

@@ -24,8 +24,9 @@
 //! payload's own assertion still exists. Splitting it out of `handlers/ingest.rs` (which is at
 //! its grandfathered LoC-gate ceiling) keeps that file from growing for this.
 
-use serde_json::Value;
 use std::collections::HashMap;
+
+use serde_json::Value;
 use tracing::warn;
 
 /// Payload attribute names that carry a self-asserted source identity.

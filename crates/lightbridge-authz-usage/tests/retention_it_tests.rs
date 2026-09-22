@@ -11,12 +11,15 @@
 //!     decisions must not shift because data aged" -- for both the current (raw) period and a
 //!     period that has aged into the rollup.
 
+use std::sync::Arc;
+
 use chrono::{Duration, Utc};
 use lightbridge_authz_core::db::DbPool;
-use lightbridge_authz_usage_rest::repo::{StoreRepo, UsageEvent};
-use lightbridge_authz_usage_rest::retention::{record_last_purge_cutoff, rollup_and_purge};
+use lightbridge_authz_usage_rest::{
+    repo::{StoreRepo, UsageEvent},
+    retention::{record_last_purge_cutoff, rollup_and_purge},
+};
 use sqlx::PgPool;
-use std::sync::Arc;
 
 fn build_repo(pool: PgPool) -> StoreRepo {
     StoreRepo::new(Arc::new(DbPool::from_pool(pool)))
@@ -28,6 +31,7 @@ fn event_with_cost(
     total_cost: f64,
 ) -> UsageEvent {
     UsageEvent {
+        dedup_key: None,
         observed_at,
         signal_type: "trace".to_string(),
         source: None,
@@ -61,6 +65,7 @@ fn event_with_tokens(
     total: i64,
 ) -> UsageEvent {
     UsageEvent {
+        dedup_key: None,
         observed_at,
         signal_type: "trace".to_string(),
         source: None,
@@ -200,6 +205,67 @@ async fn rollup_and_purge_moves_old_rows_and_spend_is_unchanged(pool: PgPool) {
         s_recent_after, s_recent_before,
         "spend for the current period must not shift after rollup"
     );
+}
+
+/// governance#358 / ADR-0028 D8: two sources on the same account/day/model must roll up into TWO
+/// separate `usage_events_daily` rows, never merged into one. Before `source` joined the rollup's
+/// natural key, this would have folded a Claude Code request's cost into the same row as an EAIG
+/// gateway call for the same model, permanently losing the ability to exclude it from spend once
+/// the day aged past the raw retention window.
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn rollup_and_purge_keeps_distinct_sources_in_separate_rows(pool: PgPool) {
+    let repo = build_repo(pool.clone());
+    let now = Utc::now();
+    let raw_days = 90;
+
+    let old_day = (now - Duration::days(raw_days + 10))
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .expect("valid time")
+        .and_utc();
+
+    let mut eaig_event = event_with_cost("acct_1", old_day, 10.0);
+    eaig_event.source = Some("eaig".to_string());
+    let mut claude_code_event = event_with_cost("acct_1", old_day + Duration::hours(1), 100.0);
+    claude_code_event.source = Some("claude-code".to_string());
+
+    repo.insert_usage_events(&[eaig_event, claude_code_event])
+        .await
+        .expect("insert old events from two sources");
+
+    rollup_and_purge(&pool, raw_days, 365)
+        .await
+        .expect("rollup should run");
+
+    let period_start = old_day;
+    let period_end = old_day + Duration::days(1);
+
+    let rows: Vec<(Option<String>, Option<f64>)> = sqlx::query_as(
+        "SELECT source, total_cost FROM usage_events_daily \
+         WHERE account_id = $1 AND bucket_start >= $2 AND bucket_start < $3 ORDER BY source",
+    )
+    .bind("acct_1")
+    .bind(period_start)
+    .bind(period_end)
+    .fetch_all(&pool)
+    .await
+    .expect("query rollup rows by source");
+
+    assert_eq!(
+        rows,
+        vec![
+            (Some("claude-code".to_string()), Some(100.0)),
+            (Some("eaig".to_string()), Some(10.0)),
+        ],
+        "each source must land in its own rollup row, not merged together"
+    );
+
+    // Spend correctly excludes the claude-code row from the rolled-up period.
+    let spend = repo
+        .spend_for_account("acct_1", period_start, period_end)
+        .await
+        .expect("spend for the rolled-up period");
+    assert_eq!(spend, Some(10.0));
 }
 
 /// A second run of the retention job is a no-op: the old rows are already gone, so nothing is
