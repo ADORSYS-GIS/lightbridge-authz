@@ -140,9 +140,9 @@ mod tests {
     use axum::http::StatusCode;
     use lightbridge_authz_api_key::repo::StoreRepo;
     use lightbridge_authz_bearer::{BearerTokenServiceTrait, TokenInfo};
-    use lightbridge_authz_core::async_trait;
-    use lightbridge_authz_core::config::{
-        Oauth2, Oauth2TokenExchange, Oauth2Type, OauthClient, OauthClientType,
+    use lightbridge_authz_core::{
+        async_trait,
+        config::{Oauth2, Oauth2TokenExchange, Oauth2Type, OauthClient, OauthClientType},
     };
     use serde_json::Value;
     use sqlx::postgres::PgPoolOptions;
