@@ -11,7 +11,7 @@ mod seat_filters;
 pub mod seat_query;
 mod usage_event;
 
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, sync::{Arc, Mutex}};
 
 use chrono::{DateTime, Utc};
 use lightbridge_authz_core::{Error, Result, db::DbPoolTrait};

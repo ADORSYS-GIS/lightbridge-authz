@@ -25,11 +25,17 @@ use tracing::warn;
 ///
 /// The normal path calls [`RefreshLockGuard::release`], which runs the unlock and consumes the
 /// connection so `Drop` does nothing. The abnormal path (cancellation/panic) drops the guard with
-/// the connection still held, and `Drop` releases the lock on a dedicated thread with its own
-/// runtime -- robust even if the current runtime is shutting down.
+/// the connection still held, and `Drop` schedules the unlock on the runtime that owns the
+/// connection's I/O registration (captured at construction) -- never on an unrelated runtime, which
+/// could not reliably drive a pool-owned connection's socket.
 pub struct RefreshLockGuard {
     conn: Option<PoolConnection<Postgres>>,
     key: i64,
+    /// The runtime the connection's I/O is registered with. Captured at construction (while still
+    /// inside the owning task) so `Drop` can schedule the unlock on the SAME runtime -- a
+    /// `PoolConnection`'s socket is bound to the runtime that created it, and driving it through a
+    /// different runtime is unsupported and unreliable.
+    handle: tokio::runtime::Handle,
 }
 
 impl RefreshLockGuard {
@@ -37,6 +43,7 @@ impl RefreshLockGuard {
         Self {
             conn: Some(conn),
             key,
+            handle: tokio::runtime::Handle::current(),
         }
     }
 
@@ -66,35 +73,25 @@ impl RefreshLockGuard {
 impl Drop for RefreshLockGuard {
     fn drop(&mut self) {
         // Abnormal path: the refresh future was cancelled or panicked before `release` ran. The
-        // connection is still here, so release the lock on a dedicated thread with its own runtime
-        // before the connection returns to the pool. This is robust even during runtime shutdown
-        // (the pool teardown would also close the session, but we do not rely on that).
+        // connection is still here, so schedule the unlock on the runtime that owns its I/O
+        // registration (captured at construction). If that runtime is already shutting down, the
+        // spawn fails and the pool teardown closes the connection -- ending the session and
+        // releasing the lock -- so the lock is still not leaked.
         if let Some(conn) = self.conn.take() {
             let key = self.key;
-            std::thread::spawn(move || {
-                let rt = match tokio::runtime::Runtime::new() {
-                    Ok(rt) => rt,
-                    Err(e) => {
-                        warn!(
-                            "usage aggregate refresh: failed to build runtime to release advisory \
-                             lock on drop: {e}"
-                        );
-                        return;
-                    }
-                };
-                rt.block_on(async move {
-                    let mut conn = conn;
-                    if let Err(e) = sqlx::query("SELECT pg_advisory_unlock($1)")
-                        .bind(key)
-                        .execute(&mut *conn)
-                        .await
-                    {
-                        warn!(
-                            "usage aggregate refresh: failed to release advisory lock on drop: {e}"
-                        );
-                    }
-                });
-            });
+            let handle = self.handle.clone();
+            drop(handle.spawn(async move {
+                let mut conn = conn;
+                if let Err(e) = sqlx::query("SELECT pg_advisory_unlock($1)")
+                    .bind(key)
+                    .execute(&mut *conn)
+                    .await
+                {
+                    warn!(
+                        "usage aggregate refresh: failed to release advisory lock on drop: {e}"
+                    );
+                }
+            }));
         }
     }
 }
