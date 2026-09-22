@@ -6,8 +6,9 @@
 //! `lightbridge_authz_usage_rest::replay::{Signal, ArchiveObject, ReplaySummary}` path still
 //! resolves. The pairing with `replay_object`/`replay_batch` is unchanged.
 
-use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
 
 /// Which OTLP signal an archived object carries, and therefore which ingest route it replays
 /// into. The archive object's key encodes this (the governance-side exporter writes one object
@@ -40,6 +41,8 @@ pub struct ArchiveObject {
     /// The object's S3 key (e.g. `claude_code/2026/09/07/…`). Used only for error messages and
     /// the summary; never parsed for routing.
     pub key: String,
+    /// Canonical source selected by the operator, never inferred from a fleet/archive prefix.
+    pub source: String,
     pub signal: Signal,
     pub content_type: String,
     /// Path to the archived object's body on disk. Read lazily just before the POST so memory is
@@ -54,4 +57,16 @@ pub struct ReplaySummary {
     pub traces: usize,
     pub metrics: usize,
     pub logs: usize,
+}
+
+impl ArchiveObject {
+    /// Validate before any I/O; a fleet prefix such as ai-cli is not a usage source.
+    pub fn validate_source(&self) -> lightbridge_authz_core::Result<()> {
+        if !crate::normalizer::KNOWN_SOURCES.contains(&self.source.as_str()) {
+            return Err(lightbridge_authz_core::Error::BadRequest(
+                "archive object requires a canonical source".to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
