@@ -87,9 +87,7 @@ impl Drop for RefreshLockGuard {
                     .execute(&mut *conn)
                     .await
                 {
-                    warn!(
-                        "usage aggregate refresh: failed to release advisory lock on drop: {e}"
-                    );
+                    warn!("usage aggregate refresh: failed to release advisory lock on drop: {e}");
                 }
             }));
         }
