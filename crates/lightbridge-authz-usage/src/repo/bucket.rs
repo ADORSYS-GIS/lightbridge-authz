@@ -22,7 +22,12 @@ pub(super) fn validate_bucket_interval(bucket: &str) -> Result<()> {
     // fails server-side with a Postgres error, so a zero bucket would 500 instead of 400. Reject it
     // here, the shared format gate every query path calls first (execution, day-facts, seat, and
     // the legacy `query_usage`), so `0 days`/`0 seconds`/... never reach `date_bin`.
-    let count: u64 = caps[1].parse().expect("regex guarantees a digit string");
+    // The regex guarantees a digit string, but not a `u64`-sized one: an oversized bucket (e.g. a
+    // 29-digit count) passes the format gate yet overflows on parse. That must be a 400, never a
+    // panic reachable from one authenticated request.
+    let count: u64 = caps[1]
+        .parse()
+        .map_err(|_| Error::BadRequest("bucket count is too large".to_string()))?;
     if count == 0 {
         return Err(Error::BadRequest(
             "bucket must be a positive interval (e.g. `5 minutes`, `1 hour`, `1 day`)".to_string(),
@@ -79,6 +84,15 @@ mod tests {
         assert!(validate_bucket_interval("0 seconds").is_err());
         assert!(validate_bucket_interval("0 hours").is_err());
         assert!(validate_bucket_interval("0 minutes").is_err());
+    }
+
+    #[test]
+    fn validate_bucket_interval_rejects_oversized_count() {
+        // A 29-digit count passes the format regex but overflows `u64` on parse. It must be a 400
+        // (BadRequest), never a panic reachable from one authenticated request.
+        let oversized = format!("{} days", "9".repeat(29));
+        let err = validate_bucket_interval(&oversized).unwrap_err();
+        assert!(matches!(err, Error::BadRequest(_)));
     }
 
     #[test]

@@ -29,6 +29,16 @@
 -- to 0) AND a separate `unknown_cost_count` of the rows whose cost was NULL, so unknown-cost rows
 -- are counted separately and never silently folded in as free.
 --
+-- REFRESH CONCURRENTLY safety (reviewed, no finding): each view's GROUP BY key is byte-for-byte the
+-- same column list as its UNIQUE index key, so the index is a true uniqueness proof over the view's
+-- rows -- a duplicate would require two rows equal on every group column, which GROUP BY collapses
+-- into one. This holds even though several key columns are nullable: Postgres treats NULLs as
+-- distinct in a plain index, but GROUP BY groups all NULLs together, so the distinct-NULL
+-- combinations collapse and no duplicate key can arise. The index therefore stays a valid
+-- `REFRESH MATERIALIZED VIEW CONCURRENTLY` uniqueness proof. Do not "fix" the index to add
+-- `NULLS NOT DISTINCT` or to drop a nullable key column -- either would break the byte-for-byte
+-- match with the GROUP BY key that makes the proof sound.
+--
 -- No `EXCEPTION WHEN OTHERS` (authz-migration skill Rule 5): a genuine failure aborts loudly. These
 -- are plain-Postgres objects (no Timescale gating needed — unlike the hypertable blocks in the
 -- day/seat migrations, which are gated because `create_hypertable` does not exist on vanilla
