@@ -1,3 +1,7 @@
+//! **Legitimately exceeds the 200-LoC gate**: this file is one domain slice of the verbatim
+//! `repo.rs` -> `repo/` split (#521), with its load-bearing comments restored move-intact
+//! under the #760 review. Deeper burn-down is tracked separately, not silently re-factored
+//! here (see `docs/code-size-baseline.md`'s rule for honestly-oversized modules).
 use chrono::Utc;
 use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::error::{Error, Result};
@@ -149,6 +153,7 @@ impl StoreRepo {
     /// own bootstrap branch does. `projects.is_default` is likewise left for
     /// `projects_set_is_default`'s `BEFORE INSERT` trigger to compute -- `true` here, since this is
     /// the account's first (and, until a caller adds more via `model.Project.create`, only) project.
+    #[instrument(skip(self))]
     pub async fn provision_account(
         &self,
         subject: &AccountId,
@@ -321,6 +326,7 @@ impl StoreRepo {
     /// default-*account* feature were dropped outright (ADR-0006 decision 2); only
     /// `projects.is_default` (default-*project*) survives, and it is enforced on `Project`, not
     /// here.
+    #[instrument(skip(self))]
     pub async fn delete_account(
         &self,
         acting_account_id: &AccountId,

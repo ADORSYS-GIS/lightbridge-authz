@@ -89,7 +89,14 @@ impl Billing {
 
 /// Deserializes an optional field to its `Default` when the YAML value is null (rather than
 /// erroring). Lets `billing:` with no value fall back to an empty catalogue.
-pub fn deserialize_null_default<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
+///
+/// `pub(super)` rather than `pub`: this is a serde plumbing helper, not a public API surface --
+/// every consumer is inside this `config` module (`mod.rs`'s `Config` fields and `loader.rs`), so
+/// making it crate-visible would turn any future signature tweak into a breaking change for
+/// nothing.
+pub(super) fn deserialize_null_default<'de, D, T>(
+    deserializer: D,
+) -> std::result::Result<T, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: Deserialize<'de> + Default,

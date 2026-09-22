@@ -1,3 +1,7 @@
+//! **Legitimately exceeds the 200-LoC gate**: this file is one domain slice of the verbatim
+//! `repo.rs` -> `repo/` split (#521), with its load-bearing comments restored move-intact
+//! under the #760 review. Deeper burn-down is tracked separately, not silently re-factored
+//! here (see `docs/code-size-baseline.md`'s rule for honestly-oversized modules).
 use lightbridge_authz_core::error::{Error, Result};
 use lightbridge_authz_core::identity::AccountId;
 use lightbridge_authz_core::{Project, ProjectMember};
@@ -86,6 +90,7 @@ impl StoreRepo {
     /// `authorize_project_lead`. Idempotent like the deleted `add_account_member`: re-adding an
     /// existing member is a no-op that leaves their current role untouched -- use
     /// `set_project_member_role` to change it.
+    #[instrument(skip(self))]
     pub async fn add_project_member(
         &self,
         account_id: &AccountId,
@@ -161,6 +166,7 @@ impl StoreRepo {
     /// exists only because cratestack requires exactly one scalar `@id` -- so this is the one
     /// place that has to invent it, and it must stay stable for a given row because clients use
     /// it as a list key.
+    #[instrument(skip(self))]
     pub async fn list_project_roster(
         &self,
         account_id: &AccountId,
@@ -267,6 +273,7 @@ impl StoreRepo {
     /// that holds the loaded `Config`) calls `QuotaTiers::is_allowed` before ever reaching this
     /// method -- see that call site for the enforcement itself and
     /// `crates/lightbridge-authz-rest/tests/quota_tier_it_tests.rs` for live-DB coverage.
+    #[instrument(skip(self))]
     pub async fn set_project_member_quota_tier(
         &self,
         account_id: &AccountId,

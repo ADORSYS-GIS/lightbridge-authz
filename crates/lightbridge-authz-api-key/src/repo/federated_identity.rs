@@ -1,3 +1,7 @@
+//! **Legitimately exceeds the 200-LoC gate**: this file is one domain slice of the verbatim
+//! `repo.rs` -> `repo/` split (#521), with its load-bearing comments restored move-intact
+//! under the #760 review. Deeper burn-down is tracked separately, not silently re-factored
+//! here (see `docs/code-size-baseline.md`'s rule for honestly-oversized modules).
 use lightbridge_authz_core::cuid::cuid2;
 use lightbridge_authz_core::error::{Error, Result};
 use tracing::instrument;
@@ -112,6 +116,7 @@ impl StoreRepo {
     /// `Error::Forbidden` message no caller can distinguish, so this repo remains exactly as much
     /// of an account-existence non-oracle as it always was. Do not add a second caller without
     /// re-reading that ADR section first.
+    #[instrument(skip(self, subject, grandfather_issuer))]
     pub async fn resolve_account_for_federated_subject_detailed(
         &self,
         issuer: &str,
@@ -212,6 +217,7 @@ impl StoreRepo {
     /// across any future second issuer, contradicting the resolver's own issuer-pinned rule. The
     /// existing-row UPDATE branch below stays un-pinned: the row itself already proves which issuer
     /// legitimately owns this `(issuer, subject)` pair, so there is nothing left to check.
+    #[instrument(skip(self, input))]
     pub async fn upsert_federated_identity(
         &self,
         input: UpsertFederatedIdentity,

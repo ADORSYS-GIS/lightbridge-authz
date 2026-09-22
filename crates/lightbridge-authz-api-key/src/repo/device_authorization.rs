@@ -1,3 +1,7 @@
+//! **Legitimately exceeds the 200-LoC gate**: this file is one domain slice of the verbatim
+//! `repo.rs` -> `repo/` split (#521), with its load-bearing comments restored move-intact
+//! under the #760 review. Deeper burn-down is tracked separately, not silently re-factored
+//! here (see `docs/code-size-baseline.md`'s rule for honestly-oversized modules).
 use chrono::{DateTime, Utc};
 use lightbridge_authz_core::error::{Error, Result};
 use lightbridge_authz_core::identity::AccountId;

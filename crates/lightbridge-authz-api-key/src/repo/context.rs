@@ -13,6 +13,7 @@ impl StoreRepo {
     /// `@@allow("read", ...)`). Deliberately a single query with one `NotFound` branch: "unknown
     /// project" and "known project the caller can't see" must resolve identically so this endpoint
     /// never leaks project existence to a non-member -- do not split these cases.
+    #[instrument(skip(self, account_id))]
     pub async fn resolve_context(
         &self,
         account_id: &AccountId,

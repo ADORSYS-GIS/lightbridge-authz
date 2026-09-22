@@ -1,3 +1,7 @@
+//! **Legitimately exceeds the 200-LoC gate**: this file is one domain slice of the verbatim
+//! `repo.rs` -> `repo/` split (#521), with its load-bearing comments restored move-intact
+//! under the #760 review. Deeper burn-down is tracked separately, not silently re-factored
+//! here (see `docs/code-size-baseline.md`'s rule for honestly-oversized modules).
 use chrono::{DateTime, Utc};
 use lightbridge_authz_core::error::{Error, Result};
 use lightbridge_authz_core::identity::AccountId;
@@ -16,6 +20,7 @@ impl StoreRepo {
     /// project-scoped read/update rule most of this file's other api-key methods use, any plain
     /// member may NOT create keys. Once authorized, the plain `INSERT` needs no further
     /// project-existence guard (`authorize_project_lead` already confirmed the project exists).
+    #[instrument(skip(self))]
     pub async fn create_api_key(
         &self,
         account_id: &AccountId,
@@ -202,6 +207,7 @@ impl StoreRepo {
 
     /// Project-scoped rule (not lead-gated, unlike `create_api_key`) -- this backs both direct
     /// revoke/reactivate and the "revoke the old key" half of `rotate_api_key_transaction` below.
+    #[instrument(skip(self))]
     pub async fn set_api_key_status(
         &self,
         account_id: &AccountId,
@@ -249,6 +255,7 @@ impl StoreRepo {
     /// Project-scoped rule for both halves (not lead-gated, unlike `create_api_key`): revoking the
     /// presented key and minting its successor both require `account_id` to own the project's
     /// account or hold ANY `project_members` row on it.
+    #[instrument(skip(self))]
     pub async fn rotate_api_key_transaction(
         &self,
         account_id: &AccountId,

@@ -1,3 +1,7 @@
+//! **Legitimately exceeds the 200-LoC gate**: this file is one domain slice of the verbatim
+//! `repo.rs` -> `repo/` split (#521), with its load-bearing comments restored move-intact
+//! under the #760 review. Deeper burn-down is tracked separately, not silently re-factored
+//! here (see `docs/code-size-baseline.md`'s rule for honestly-oversized modules).
 use chrono::Utc;
 use lightbridge_authz_core::error::{Error, Result};
 use lightbridge_authz_core::identity::AccountId;
@@ -527,6 +531,7 @@ impl StoreRepo {
     /// racing this one cannot slip an empty list past the guard between the check and the write --
     /// same transactional-invariant shape as `set_default_project` below, just guarding a business
     /// rule instead of the "at most one default project" structural invariant.
+    #[instrument(skip(self))]
     pub async fn set_project_model_policy(
         &self,
         account_id: &AccountId,
