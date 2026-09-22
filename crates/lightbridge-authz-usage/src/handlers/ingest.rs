@@ -23,7 +23,11 @@ use prost::Message;
 use serde_json::{Map, Value, json};
 use tracing::{debug, instrument, warn};
 
-use super::identity_keys::{ACCOUNT_KEYS, API_KEY_KEYS, PROJECT_KEYS, USER_KEYS, USER_NAME_KEYS};
+use super::{
+    attribute_merge::merge_attr_maps,
+    identity_keys::{ACCOUNT_KEYS, API_KEY_KEYS, PROJECT_KEYS, USER_KEYS, USER_NAME_KEYS},
+    source_resolution::{SourceTrust, resolve_event_source},
+};
 use crate::{
     UsageState,
     handlers::payload_identity::check_identity_mismatch,
@@ -152,13 +156,6 @@ const AZP_KEYS: [&str; 4] = ["azp", "x-oidc-azp", "oauth.azp", "client_id"];
 /// value travels under at the gateway, kept for emitters that pass the header through verbatim.
 const BILLING_PLAN_KEYS: [&str; 2] = ["billing_plan", "x-billing-plan"];
 
-/// The resource attribute a multi-source collector's own trusted forwarder can stamp with a more
-/// specific source than the collector-wide `X-Source` header carries -- see
-/// [`resolve_event_source`]'s doc. Same key `payload_identity::IDENTITY_ATTRIBUTE_KEYS` checks for
-/// a mismatch against the trusted source; that check is unaffected by this (it already runs
-/// against whichever source this function resolves).
-const RESOURCE_SOURCE_ATTRIBUTE: &str = "governance.source";
-
 /// Attribute names carrying the request path, from which `operation` is derived (#648).
 ///
 /// `x-envoy-origin-path` leads because it is what the gateway actually emits
@@ -227,7 +224,7 @@ pub async fn ingest_traces(
     }
     let payload =
         decode_otlp_request_async::<ExportTraceServiceRequest>(headers, body, "trace").await?;
-    let events = extract_trace_events(payload, source);
+    let events = extract_trace_events(payload, source, SourceTrust::ResourceMayRefine);
     let accepted_events = persist_events(&state, "trace", &events).await?;
 
     debug!("accepted {} trace events", accepted_events);
@@ -257,7 +254,7 @@ pub async fn ingest_metrics(
     let source = crate::normalizer::resolve_source(&headers)?;
     let payload =
         decode_otlp_request_async::<ExportMetricsServiceRequest>(headers, body, "metrics").await?;
-    let events = extract_metric_events(payload, source);
+    let events = extract_metric_events(payload, source, SourceTrust::ResourceMayRefine);
     let accepted_events = persist_events(&state, "metric", &events).await?;
 
     debug!("accepted {} metric events", accepted_events);
@@ -296,7 +293,7 @@ pub async fn ingest_logs(
     }
     let payload =
         decode_otlp_request_async::<ExportLogsServiceRequest>(headers, body, "logs").await?;
-    let events = extract_log_events(payload, source);
+    let events = extract_log_events(payload, source, SourceTrust::ResourceMayRefine);
     let accepted_events = persist_events(&state, "log", &events).await?;
 
     debug!("accepted {} log events", accepted_events);
@@ -511,6 +508,7 @@ pub fn apply_normalizer(
 pub(crate) fn extract_log_events(
     payload: ExportLogsServiceRequest,
     source: &str,
+    trust: SourceTrust,
 ) -> Vec<UsageEvent> {
     let mut events = Vec::new();
 
@@ -519,17 +517,11 @@ pub(crate) fn extract_log_events(
             .resource
             .map(|resource| key_values_to_map(&resource.attributes))
             .unwrap_or_default();
-        // See `resolve_event_source`'s doc: a collector that carries more than one
-        // client's traffic behind one credential (governance#358) can stamp a
-        // trustworthy per-resource source that this must prefer over the
-        // collector-wide default.
-        let resolved_source = resolve_event_source(&resource_attrs, source);
+        let resolved_source = resolve_event_source(&resource_attrs, source, trust);
         let normalizer = crate::normalizer::REGISTRY.get(resolved_source);
 
         for scope_logs in resource_logs.scope_logs {
             for log_record in scope_logs.log_records {
-                // Verified resource identity must survive a record that tries to override it --
-                // see `merge_attr_maps`'s doc comment.
                 let attrs =
                     merge_attr_maps(&key_values_to_map(&log_record.attributes), &resource_attrs);
                 check_identity_mismatch(&attrs, resolved_source);
@@ -601,6 +593,7 @@ fn is_json_content(headers: &HeaderMap) -> bool {
 pub(crate) fn extract_trace_events(
     payload: ExportTraceServiceRequest,
     source: &str,
+    trust: SourceTrust,
 ) -> Vec<UsageEvent> {
     let mut events = Vec::new();
 
@@ -609,12 +602,11 @@ pub(crate) fn extract_trace_events(
             .resource
             .map(|resource| key_values_to_map(&resource.attributes))
             .unwrap_or_default();
-        let resolved_source = resolve_event_source(&resource_attrs, source);
+        let resolved_source = resolve_event_source(&resource_attrs, source, trust);
         let normalizer = crate::normalizer::REGISTRY.get(resolved_source);
 
         for scope_spans in resource_spans.scope_spans {
             for span in scope_spans.spans {
-                // See `merge_attr_maps`'s doc comment: verified resource identity must win.
                 let attrs = merge_attr_maps(&key_values_to_map(&span.attributes), &resource_attrs);
                 check_identity_mismatch(&attrs, resolved_source);
 
@@ -675,6 +667,7 @@ pub(crate) fn extract_trace_events(
 pub(crate) fn extract_metric_events(
     payload: ExportMetricsServiceRequest,
     source: &str,
+    trust: SourceTrust,
 ) -> Vec<UsageEvent> {
     let mut events = Vec::new();
 
@@ -683,13 +676,12 @@ pub(crate) fn extract_metric_events(
             .resource
             .map(|resource| key_values_to_map(&resource.attributes))
             .unwrap_or_default();
-        let resolved_source = resolve_event_source(&resource_attrs, source);
+        let resolved_source = resolve_event_source(&resource_attrs, source, trust);
         let normalizer = crate::normalizer::REGISTRY.get(resolved_source);
 
         for scope_metrics in resource_metrics.scope_metrics {
             for metric in scope_metrics.metrics {
                 let metric_name = non_empty(Some(metric.name.clone()));
-                // See `merge_attr_maps`'s doc comment: verified resource identity must win.
                 let metric_attrs =
                     merge_attr_maps(&key_values_to_map(&metric.metadata), &resource_attrs);
 
@@ -766,7 +758,6 @@ fn number_data_point_to_event(
     source: &str,
     normalizer: Option<crate::normalizer::NormalizerFn>,
 ) -> UsageEvent {
-    // See `merge_attr_maps`'s doc comment: verified resource identity must win.
     let attrs = merge_attr_maps(&key_values_to_map(&point.attributes), metric_attrs);
     check_identity_mismatch(&attrs, source);
 
@@ -820,7 +811,6 @@ fn histogram_data_point_to_event(
     source: &str,
     normalizer: Option<crate::normalizer::NormalizerFn>,
 ) -> UsageEvent {
-    // See `merge_attr_maps`'s doc comment: verified resource identity must win.
     let attrs = merge_attr_maps(&key_values_to_map(&point.attributes), metric_attrs);
     check_identity_mismatch(&attrs, source);
 
@@ -868,7 +858,6 @@ fn exponential_histogram_data_point_to_event(
     source: &str,
     normalizer: Option<crate::normalizer::NormalizerFn>,
 ) -> UsageEvent {
-    // See `merge_attr_maps`'s doc comment: verified resource identity must win.
     let attrs = merge_attr_maps(&key_values_to_map(&point.attributes), metric_attrs);
     check_identity_mismatch(&attrs, source);
 
@@ -916,7 +905,6 @@ fn summary_data_point_to_event(
     source: &str,
     normalizer: Option<crate::normalizer::NormalizerFn>,
 ) -> UsageEvent {
-    // See `merge_attr_maps`'s doc comment: verified resource identity must win.
     let attrs = merge_attr_maps(&key_values_to_map(&point.attributes), metric_attrs);
     check_identity_mismatch(&attrs, source);
 
@@ -995,66 +983,6 @@ pub(crate) fn key_values_to_map(values: &[KeyValue]) -> HashMap<String, Value> {
         map.insert(kv.key.clone(), value);
     }
     map
-}
-
-/// Resolves the trusted source for ONE resource group: its own [`RESOURCE_SOURCE_ATTRIBUTE`] when
-/// present and recognized, otherwise `default_source` (the collector-level `X-Source` header,
-/// resolved once per request by `resolve_source`).
-///
-/// governance#358: a single collector can carry more than one client's traffic behind one shared
-/// credential once `governance-auth`'s local collector daemon (ADR-0016) is involved -- the daemon
-/// derives a trustworthy per-resource `governance.source` from each resource's own `event.name`
-/// before forwarding (`otel_daemon/source_stamp.rs` in that repo), which the governed collector's
-/// own `resource` processor no longer overwrites (`action: insert`, not `upsert`, in
-/// `charts/lightbridge-governance`). The per-request `X-Source` header stays correct as the
-/// DEFAULT for a single-source collector (OpenCode's) and for any traffic that reaches a collector
-/// without ever passing through that daemon -- both cases simply have no resource-level override
-/// to read, and fall through to it unchanged.
-///
-/// A resource attribute outside [`crate::normalizer::KNOWN_SOURCES`] is never trusted, same rule
-/// `resolve_source` already applies to the header itself: an unrecognised claim falls back to the
-/// header value rather than inventing a new source. This is a resource-level REFINEMENT of the
-/// already-authenticated channel's source, never an escape from it -- nothing here accepts a
-/// source `resolve_source` would have rejected for the request as a whole.
-fn resolve_event_source<'a>(
-    resource_attrs: &HashMap<String, Value>,
-    default_source: &'a str,
-) -> &'a str {
-    let Some(Value::String(claimed)) = resource_attrs.get(RESOURCE_SOURCE_ATTRIBUTE) else {
-        return default_source;
-    };
-    crate::normalizer::KNOWN_SOURCES
-        .iter()
-        .find(|&&known| known == claimed)
-        .map_or(default_source, |&known| known)
-}
-
-/// Merges two OTLP attribute maps. On a key collision, **`additional` wins** -- it is applied
-/// last, over a clone of `base`.
-///
-/// Every call site in this file passes the identity-carrying side (resource attributes, or a
-/// less-granular signal level already resource-prioritized) as `additional`, and the more
-/// attacker-reachable side (log-record / span / per-point attributes, straight from the request
-/// body) as `base`. That is deliberate, not incidental (governance#358): resource attributes on
-/// the public IDE collectors carry `user.id`/`user.email`/`account_id` derived from the claims of
-/// the bearer token the collector's OIDC extension already verified
-/// (`governance-auth`'s `identity_attributes()`), while per-record attributes are fully
-/// caller-controlled JSON with no verification at all. Before this ordering, a single forged
-/// `user_id` in one log record's attributes silently overrode the verified identity for that
-/// record -- an impersonation path, not a hypothetical one, since nothing about the OTLP wire
-/// format stops a client from setting arbitrary per-record attributes. Putting the verified side
-/// last means a record without its own value still falls back to whatever the merge produced
-/// (unchanged for every non-identity field, since resource attributes essentially never carry
-/// model/cost/token keys), but a record that tries to assert its own identity can no longer win.
-pub(crate) fn merge_attr_maps(
-    base: &HashMap<String, Value>,
-    additional: &HashMap<String, Value>,
-) -> HashMap<String, Value> {
-    let mut merged = base.clone();
-    for (key, value) in additional {
-        merged.insert(key.clone(), value.clone());
-    }
-    merged
 }
 
 fn any_value_to_json(any: &AnyValue) -> Value {
@@ -1208,7 +1136,7 @@ mod tests {
         }))
         .expect("valid trace payload");
 
-        let events = extract_trace_events(payload, "eaig");
+        let events = extract_trace_events(payload, "eaig", SourceTrust::ResourceMayRefine);
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -1223,86 +1151,6 @@ mod tests {
         assert_eq!(event.total_tokens, Some(15));
         assert_eq!(event.usage_value, 15.0);
         assert_eq!(event.request_count, 1);
-    }
-
-    #[test]
-    fn extract_trace_events_should_refuse_record_level_identity_spoofing() {
-        // governance#358: resource attributes carry the identity `governance-auth` derived from
-        // the collector's own verified bearer token; span attributes are the request BODY, fully
-        // caller-controlled. A span asserting a different account/user than the verified resource
-        // must never win -- see `merge_attr_maps`'s doc comment.
-        let payload: ExportTraceServiceRequest = serde_json::from_value(json!({
-            "resourceSpans": [
-                {
-                    "resource": {
-                        "attributes": [
-                            {"key": "account_id", "value": {"stringValue": "trusted-account"}},
-                            {"key": "lc_user_id", "value": {"stringValue": "trusted-user"}}
-                        ]
-                    },
-                    "scopeSpans": [
-                        {
-                            "spans": [
-                                {
-                                    "traceId": "00000000000000000000000000000001",
-                                    "spanId": "0000000000000001",
-                                    "name": "chat.completion",
-                                    "startTimeUnixNano": "1735689600000000000",
-                                    "endTimeUnixNano": "1735689601000000000",
-                                    "attributes": [
-                                        {"key": "account_id", "value": {"stringValue": "attacker-account"}},
-                                        {"key": "lc_user_id", "value": {"stringValue": "attacker-user"}},
-                                        {"key": "model", "value": {"stringValue": "gpt-4.1"}}
-                                    ]
-                                }
-                            ]
-                        }
-                    ]
-                }
-            ]
-        }))
-        .expect("valid trace payload");
-
-        let events = extract_trace_events(payload, "claude-code");
-
-        assert_eq!(events.len(), 1);
-        let event = &events[0];
-        assert_eq!(event.account_id.as_deref(), Some("trusted-account"));
-        assert_eq!(event.user_id.as_deref(), Some("trusted-user"));
-        // Non-colliding payload fields are unaffected by the precedence change.
-        assert_eq!(event.model.as_deref(), Some("gpt-4.1"));
-    }
-
-    #[test]
-    fn extract_log_events_should_fall_back_to_record_identity_when_resource_has_none() {
-        // The precedence fix must not regress internal/legacy senders that carry no resource-level
-        // identity at all (e.g. EAIG's access-log export) -- a record's own value is still used
-        // when the resource genuinely has nothing to say about identity.
-        let payload: ExportLogsServiceRequest = serde_json::from_value(json!({
-            "resourceLogs": [
-                {
-                    "resource": {"attributes": []},
-                    "scopeLogs": [
-                        {
-                            "logRecords": [
-                                {
-                                    "timeUnixNano": "1735689600000000000",
-                                    "attributes": [
-                                        {"key": "account_id", "value": {"stringValue": "acct_only_on_record"}}
-                                    ]
-                                }
-                            ]
-                        }
-                    ]
-                }
-            ]
-        }))
-        .expect("valid log payload");
-
-        let events = extract_log_events(payload, "eaig");
-
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].account_id.as_deref(), Some("acct_only_on_record"));
     }
 
     #[test]
@@ -1406,7 +1254,7 @@ mod tests {
             }],
         };
 
-        let events = extract_metric_events(payload, "eaig");
+        let events = extract_metric_events(payload, "eaig", SourceTrust::ResourceMayRefine);
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -1426,73 +1274,25 @@ mod tests {
     }
 
     #[test]
-    fn extract_log_events_should_prefer_each_resource_s_own_trusted_source_over_the_header_default()
-    {
-        // governance#358: a collector fronted by governance-auth's local collector daemon
-        // (ADR-0016) can carry both Claude Code's and Codex's telemetry behind ONE credential --
-        // the daemon stamps a trustworthy per-resource `governance.source` before forwarding
-        // (otel_daemon/source_stamp.rs), so a batch reaching this handler can legitimately mix
-        // sources under one coarse collector-level default (here, "ai-cli", never a real
-        // registry entry -- exactly the collector-wide fleet label this must not fall back to
-        // when a resource has its own trustworthy value).
-        let payload: ExportLogsServiceRequest = serde_json::from_value(json!({
-            "resourceLogs": [
-                {
-                    "resource": {"attributes": [
-                        {"key": "governance.source", "value": {"stringValue": "codex"}},
-                        {"key": "account_id", "value": {"stringValue": "acct_codex"}}
-                    ]},
-                    "scopeLogs": [{"logRecords": [{
-                        "timeUnixNano": "1735689600000000000",
-                        "attributes": [{"key": "event.name", "value": {"stringValue": "codex.api_request"}}]
-                    }]}]
-                },
-                {
-                    "resource": {"attributes": [
-                        {"key": "governance.source", "value": {"stringValue": "claude-code"}},
-                        {"key": "account_id", "value": {"stringValue": "acct_claude"}}
-                    ]},
-                    "scopeLogs": [{"logRecords": [{
-                        "timeUnixNano": "1735689600000000000",
-                        "attributes": [{"key": "event.name", "value": {"stringValue": "api_request"}}]
-                    }]}]
-                },
-                {
-                    // No resource-level override at all -- e.g. `manual`-profile traffic, or any
-                    // sender that never passed through the daemon. Must fall back to the header.
-                    "resource": {"attributes": [
-                        {"key": "account_id", "value": {"stringValue": "acct_no_override"}}
-                    ]},
-                    "scopeLogs": [{"logRecords": [{"timeUnixNano": "1735689600000000000", "attributes": []}]}]
-                },
-                {
-                    // A value outside the closed registry must never be trusted -- falls back to
-                    // the header default, exactly like `resolve_source` refuses an unknown header.
-                    "resource": {"attributes": [
-                        {"key": "governance.source", "value": {"stringValue": "not-a-real-source"}},
-                        {"key": "account_id", "value": {"stringValue": "acct_forged"}}
-                    ]},
-                    "scopeLogs": [{"logRecords": [{"timeUnixNano": "1735689600000000000", "attributes": []}]}]
-                }
-            ]
-        }))
+    fn extract_log_events_should_wire_each_resource_through_resolve_event_source() {
+        // governance#358: a multi-source collector can carry a mix of resources in one payload;
+        // the decision matrix itself is unit-tested directly on `resolve_event_source`.
+        let record = || json!({"timeUnixNano": "1735689600000000000", "attributes": []});
+        let payload: ExportLogsServiceRequest = serde_json::from_value(json!({"resourceLogs": [
+            {"resource": {"attributes": [{"key": "governance.source", "value": {"stringValue": "codex"}}]},
+             "scopeLogs": [{"logRecords": [record()]}]},
+            {"resource": {"attributes": []}, "scopeLogs": [{"logRecords": [record()]}]}
+        ]}))
         .expect("valid multi-resource log payload");
 
-        let events = extract_log_events(payload, "ai-cli");
+        let events = extract_log_events(payload, "ai-cli", SourceTrust::ResourceMayRefine);
 
-        assert_eq!(events.len(), 4);
+        assert_eq!(events.len(), 2);
         assert_eq!(events[0].source.as_deref(), Some("codex"));
-        assert_eq!(events[1].source.as_deref(), Some("claude-code"));
         assert_eq!(
-            events[2].source.as_deref(),
+            events[1].source.as_deref(),
             Some("ai-cli"),
             "a resource with no override must fall back to the collector-level default"
-        );
-        assert_eq!(
-            events[3].source.as_deref(),
-            Some("ai-cli"),
-            "an unrecognised resource-level source must never be trusted, even set to \
-             something registry-shaped"
         );
     }
 
@@ -1597,7 +1397,7 @@ mod tests {
             }],
         };
 
-        let events = extract_log_events(payload, "eaig");
+        let events = extract_log_events(payload, "eaig", SourceTrust::ResourceMayRefine);
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -1704,7 +1504,7 @@ mod tests {
             }],
         };
 
-        let events = extract_log_events(payload, "eaig");
+        let events = extract_log_events(payload, "eaig", SourceTrust::ResourceMayRefine);
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -1770,7 +1570,7 @@ mod tests {
             }],
         };
 
-        let events = extract_log_events(payload, "eaig");
+        let events = extract_log_events(payload, "eaig", SourceTrust::ResourceMayRefine);
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -1824,7 +1624,7 @@ mod tests {
         }))
         .expect("valid log payload");
 
-        let events = extract_log_events(payload, "eaig");
+        let events = extract_log_events(payload, "eaig", SourceTrust::ResourceMayRefine);
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -1873,7 +1673,7 @@ mod tests {
         request.encode(&mut encoded).expect("should encode");
 
         let decoded = ExportLogsServiceRequest::decode(encoded.as_slice()).expect("should decode");
-        let events = extract_log_events(decoded, "eaig");
+        let events = extract_log_events(decoded, "eaig", SourceTrust::ResourceMayRefine);
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -2055,7 +1855,7 @@ mod tests {
         }))
         .expect("valid log payload");
 
-        let events = extract_log_events(payload, "eaig");
+        let events = extract_log_events(payload, "eaig", SourceTrust::ResourceMayRefine);
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -2098,7 +1898,7 @@ mod tests {
         }))
         .expect("valid trace payload");
 
-        let trace_events = extract_trace_events(traces, "eaig");
+        let trace_events = extract_trace_events(traces, "eaig", SourceTrust::ResourceMayRefine);
         assert_eq!(trace_events.len(), 1);
         assert_eq!(trace_events[0].azp.as_deref(), Some("cli"));
         assert_eq!(trace_events[0].billing_plan.as_deref(), Some("free"));
@@ -2134,7 +1934,7 @@ mod tests {
         }))
         .expect("valid metric payload");
 
-        let metric_events = extract_metric_events(metrics, "eaig");
+        let metric_events = extract_metric_events(metrics, "eaig", SourceTrust::ResourceMayRefine);
         assert_eq!(metric_events.len(), 1);
         assert_eq!(metric_events[0].azp.as_deref(), Some("batch-job"));
         assert_eq!(metric_events[0].billing_plan.as_deref(), Some("enterprise"));
@@ -2188,7 +1988,7 @@ mod tests {
         }))
         .expect("valid trace payload");
 
-        let events = extract_trace_events(payload, "eaig");
+        let events = extract_trace_events(payload, "eaig", SourceTrust::ResourceMayRefine);
 
         assert_eq!(events.len(), 1);
         assert_eq!(
@@ -2220,7 +2020,7 @@ mod tests {
         }))
         .expect("valid log payload");
 
-        let events = extract_log_events(payload, "eaig");
+        let events = extract_log_events(payload, "eaig", SourceTrust::ResourceMayRefine);
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -2258,7 +2058,7 @@ mod tests {
             }],
         };
 
-        let events = extract_metric_events(payload, "eaig");
+        let events = extract_metric_events(payload, "eaig", SourceTrust::ResourceMayRefine);
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].usage_value, 3.5);
@@ -2295,7 +2095,7 @@ mod tests {
             }],
         };
 
-        let events = extract_metric_events(payload, "eaig");
+        let events = extract_metric_events(payload, "eaig", SourceTrust::ResourceMayRefine);
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -2333,7 +2133,7 @@ mod tests {
             }],
         };
 
-        let events = extract_metric_events(payload, "eaig");
+        let events = extract_metric_events(payload, "eaig", SourceTrust::ResourceMayRefine);
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -2368,7 +2168,7 @@ mod tests {
             }],
         };
 
-        let events = extract_metric_events(payload, "eaig");
+        let events = extract_metric_events(payload, "eaig", SourceTrust::ResourceMayRefine);
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -2394,7 +2194,7 @@ mod tests {
             }],
         };
 
-        let events = extract_metric_events(payload, "eaig");
+        let events = extract_metric_events(payload, "eaig", SourceTrust::ResourceMayRefine);
 
         assert!(events.is_empty());
     }
@@ -2949,7 +2749,7 @@ mod tests {
         }))
         .expect("valid trace payload");
 
-        let events = extract_trace_events(payload, "eaig");
+        let events = extract_trace_events(payload, "eaig", SourceTrust::ResourceMayRefine);
 
         assert_eq!(events[0].latency_ms, Some(412.0));
     }
@@ -2974,7 +2774,7 @@ mod tests {
         }))
         .expect("valid trace payload");
 
-        let events = extract_trace_events(payload, "eaig");
+        let events = extract_trace_events(payload, "eaig", SourceTrust::ResourceMayRefine);
 
         assert_eq!(events[0].latency_ms, Some(412.0));
     }
@@ -2998,7 +2798,7 @@ mod tests {
         }))
         .expect("valid trace payload");
 
-        let events = extract_trace_events(payload, "eaig");
+        let events = extract_trace_events(payload, "eaig", SourceTrust::ResourceMayRefine);
 
         assert_eq!(events[0].latency_ms, Some(51_042.0));
     }
@@ -3025,7 +2825,7 @@ mod tests {
             }],
         };
 
-        let events = extract_log_events(request, "eaig");
+        let events = extract_log_events(request, "eaig", SourceTrust::ResourceMayRefine);
 
         assert_eq!(events[0].latency_ms, Some(51_042.0));
     }
@@ -3049,7 +2849,7 @@ mod tests {
             }],
         };
 
-        let events = extract_log_events(request, "eaig");
+        let events = extract_log_events(request, "eaig", SourceTrust::ResourceMayRefine);
 
         assert_eq!(events[0].latency_ms, Some(50_011.0));
     }
@@ -3073,7 +2873,7 @@ mod tests {
             }],
         };
 
-        let events = extract_log_events(request, "eaig");
+        let events = extract_log_events(request, "eaig", SourceTrust::ResourceMayRefine);
 
         assert_eq!(events[0].latency_ms, None);
     }

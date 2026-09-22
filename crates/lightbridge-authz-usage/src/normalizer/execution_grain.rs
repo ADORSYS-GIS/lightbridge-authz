@@ -8,11 +8,13 @@ use chrono::{DateTime, Utc};
 use lightbridge_authz_core::{Error, Result};
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 
-use crate::handlers::payload_identity::check_identity_mismatch;
-use crate::models::execution_ingest::{
-    ExecutionGrainBatch, ExecutionRecord, ModelCallRecord, ToolCallRecord, execution_id,
+use crate::{
+    handlers::payload_identity::check_identity_mismatch,
+    models::execution_ingest::{
+        ExecutionGrainBatch, ExecutionRecord, ModelCallRecord, ToolCallRecord, execution_id,
+    },
+    normalizer::{REGISTRY, SpanMeta, extract_string},
 };
-use crate::normalizer::{REGISTRY, SpanMeta, extract_string};
 /// The sources whose OTLP traces are execution-grain (ADR-0027): the agent tools. The gateway
 /// (`eaig`) stays request-grain; `github-copilot` is day-grain (RFC-0001).
 pub const EXECUTION_GRAIN_SOURCES: [&str; 4] =
@@ -57,9 +59,11 @@ pub fn parse_execution_grain(
             .unwrap_or_default();
         for scope_spans in resource_spans.scope_spans {
             for span in scope_spans.spans {
-                let attrs = crate::handlers::ingest::merge_attr_maps(
-                    &resource_attrs,
+                // Verified resource identity must survive a record that tries to override it --
+                // see `merge_attr_maps`'s doc comment (governance#358).
+                let attrs = crate::handlers::attribute_merge::merge_attr_maps(
                     &crate::handlers::ingest::key_values_to_map(&span.attributes),
+                    &resource_attrs,
                 );
                 check_identity_mismatch(&attrs, source);
                 let trace_id = hex::encode(&span.trace_id);
