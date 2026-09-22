@@ -1,6 +1,8 @@
+mod aggregate;
 mod bucket;
 mod day_fact_filters;
 pub mod day_fact_query;
+mod day_fact_query_builder;
 pub mod day_grain;
 pub mod execution;
 mod execution_filters;
@@ -9,7 +11,10 @@ mod seat_filters;
 pub mod seat_query;
 mod usage_event;
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::HashSet,
+    sync::{Arc, Mutex},
+};
 
 use chrono::{DateTime, Utc};
 use lightbridge_authz_core::{Error, Result, db::DbPoolTrait};
@@ -22,6 +27,10 @@ use crate::models::{UsageGroupBy, UsageQueryRequest, UsageScope, UsageSeriesPoin
 #[derive(Debug, Clone)]
 pub struct StoreRepo {
     pool: Arc<dyn DbPoolTrait>,
+    /// TTL cache for the KPI-aggregate existence/freshness probe (#587). The query endpoints route
+    /// to the aggregates when they exist and are fresh, and fall back to the raw grain table
+    /// otherwise; this cache stops that probe from running on every request (the #587 review's P2).
+    aggregate_cache: Arc<Mutex<aggregate::AggregateCache>>,
 }
 
 #[derive(Debug, FromRow)]
@@ -58,12 +67,16 @@ struct UsageQueryRow {
 
 impl StoreRepo {
     pub fn new(pool: Arc<dyn DbPoolTrait>) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            aggregate_cache: Arc::new(Mutex::new(aggregate::AggregateCache::new())),
+        }
     }
 
     pub(crate) fn pool(&self) -> &PgPool {
         self.pool.pool()
     }
+
     // `skip_all` + an explicit count, for the same reason `handlers::ingest`'s handlers do it
     // (owner report, 2026-09-03): `#[instrument(skip(self))]` recorded the `events` ARGUMENT into
     // the span, and a `UsageEvent`'s `Debug` used to include its whole `attributes` blob -- so

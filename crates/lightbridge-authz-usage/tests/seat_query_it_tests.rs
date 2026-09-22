@@ -15,6 +15,7 @@ use axum::http::{Request, StatusCode, header};
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 use lightbridge_authz_usage_rest::UsageState;
+use lightbridge_authz_usage_rest::aggregate_refresh::record_last_refresh;
 use lightbridge_authz_usage_rest::build_query_router;
 use lightbridge_authz_usage_rest::models::UsageScope;
 use lightbridge_authz_usage_rest::models::day_seat::SubjectKind;
@@ -71,6 +72,20 @@ async fn insert_seat(
     .execute(pool)
     .await
     .expect("insert seat snapshot");
+
+    // #587: the query endpoint routes to the KPI aggregate `mv_seat_snapshots_active_daily` when it
+    // exists (it does, the migration applied), so refresh it after seeding or the query would see
+    // an empty aggregate. Refreshing per insert is wasteful in prod but cheap and robust in tests.
+    // `record_last_refresh` is needed so the routing's freshness check treats the aggregate as
+    // fresh and routes to it; without it, `last_refreshed_at` stays NULL and the query falls back
+    // to the raw table (the #587 review's P2).
+    sqlx::query("REFRESH MATERIALIZED VIEW CONCURRENTLY mv_seat_snapshots_active_daily")
+        .execute(pool)
+        .await
+        .expect("refresh seat aggregate");
+    record_last_refresh(pool)
+        .await
+        .expect("record seat aggregate refresh");
 }
 
 fn repo(pool: &PgPool) -> StoreRepo {

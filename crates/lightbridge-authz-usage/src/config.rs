@@ -4,8 +4,10 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use tracing::debug;
 
-// `RetentionConfig` lives in `retention_config` (split out by the LoC gate); re-export it here so
-// every existing `use config::RetentionConfig` path still resolves.
+// `RetentionConfig` lives in `retention_config` and `AggregateRefreshConfig` in
+// `aggregate_refresh_config` (both split out by the LoC gate); re-export them here so every
+// existing `use config::{RetentionConfig, AggregateRefreshConfig}` path still resolves.
+pub use crate::aggregate_refresh_config::AggregateRefreshConfig;
 pub use crate::retention_config::RetentionConfig;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -33,6 +35,11 @@ pub struct UsageConfig {
     /// hourly. See [`RetentionConfig`].
     #[serde(default)]
     pub retention: RetentionConfig,
+    /// KPI aggregate refresh (#587). Optional with safe defaults: the background job is ON by
+    /// default (refreshing a materialized view is non-destructive and idempotent, unlike
+    /// retention), and refreshes the named KPI aggregates hourly. See [`AggregateRefreshConfig`].
+    #[serde(default)]
+    pub aggregate_refresh: AggregateRefreshConfig,
     /// #585: authenticated ingest configuration. Optional -- when absent, the authenticated
     /// `/auth/v1/otel/*` routes are simply not mounted, and the existing unauthenticated
     /// `/v1/otel/*` surface (the gateway exception, AC5) continues to serve as the only ingest
@@ -158,6 +165,19 @@ pub fn load_from_path<P: AsRef<std::path::Path>>(path: P) -> Result<UsageConfig>
         return Err(lightbridge_authz_core::Error::Server(format!(
             "retention.rollup_days must be > retention.raw_days (got rollup_days={}, raw_days={})",
             config.retention.rollup_days, config.retention.raw_days
+        )));
+    }
+
+    // Fail-loud on a degenerate aggregate-refresh cadence, the same class as the retention bounds
+    // above. The loop coerces `interval_seconds.max(1)`, so a `0` would silently become a 1s
+    // cadence -- running expensive `REFRESH MATERIALIZED VIEW CONCURRENTLY` statements effectively
+    // continuously, hammering the DB. A unit-mix typo (e.g. `60` meaning minutes) is caught here at
+    // startup, not in prod. Gated on `enabled`: a disabled job never reads `interval_seconds`, so a
+    // short interval on a disabled job is runtime-harmless and must not refuse to boot.
+    if config.aggregate_refresh.enabled && config.aggregate_refresh.interval_seconds < 60 {
+        return Err(lightbridge_authz_core::Error::Server(format!(
+            "aggregate_refresh.interval_seconds must be >= 60 (got {})",
+            config.aggregate_refresh.interval_seconds
         )));
     }
 
