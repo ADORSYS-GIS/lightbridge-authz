@@ -90,6 +90,26 @@ path = "tests/execution_query_it_tests.rs"
 required-features = ["it-tests"]
 
 [[test]]
+name = "cutover_verify_it_tests"
+path = "tests/cutover_verify_it_tests.rs"
+required-features = ["it-tests"]
+
+[[test]]
+name = "day_grain_ingest_it_tests"
+path = "tests/day_grain_ingest_it_tests.rs"
+required-features = ["it-tests"]
+
+[[test]]
+name = "execution_grain_ingest_it_tests"
+path = "tests/execution_grain_ingest_it_tests.rs"
+required-features = ["it-tests"]
+
+[[test]]
+name = "seat_query_it_tests"
+path = "tests/seat_query_it_tests.rs"
+required-features = ["it-tests"]
+
+[[test]]
 name = "day_fact_query_it_tests"
 path = "tests/day_fact_query_it_tests.rs"
 required-features = ["it-tests"]

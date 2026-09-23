@@ -1,3 +1,7 @@
+//! **Legitimately exceeds the 200-LoC gate**: this file is one domain slice of the verbatim
+//! `repo.rs` -> `repo/` split (#521), with its load-bearing comments restored move-intact
+//! under the #760 review. Deeper burn-down is tracked separately, not silently re-factored
+//! here (see `docs/code-size-baseline.md`'s rule for honestly-oversized modules).
 use chrono::{DateTime, Utc};
 use lightbridge_authz_core::error::{Error, Result};
 use lightbridge_authz_core::identity::AccountId;
@@ -10,6 +14,12 @@ use crate::entities::new_api_key_row::NewApiKeyRow;
 use crate::repo::StoreRepo;
 
 impl StoreRepo {
+    /// Lead-gated (handoff recommendation #3, ADR-0006): minting a new key requires `subject` to be
+    /// either the project's account owner or hold a `project_members` row with `role = 'lead'` on
+    /// `input.project_id`, checked via `authorize_project_lead` before the insert -- unlike the
+    /// project-scoped read/update rule most of this file's other api-key methods use, any plain
+    /// member may NOT create keys. Once authorized, the plain `INSERT` needs no further
+    /// project-existence guard (`authorize_project_lead` already confirmed the project exists).
     #[instrument(skip(self))]
     pub async fn create_api_key(
         &self,
@@ -42,12 +52,15 @@ impl StoreRepo {
         .bind(input.last_ip)
         .bind(input.revoked_at)
         .bind(input.billing_plan)
+        // The acting account, not the project's owning account: a lead who is not the owner may
+        // mint keys, and it is THEIR per-member ceiling that should bound the key.
         .bind(account_id.as_str())
         .fetch_one(self.pool())
         .await?;
         Ok(Self::to_api_key(row))
     }
 
+    /// Project-scoped rule -- any member (not just leads) may list keys, unlike `create_api_key`.
     #[instrument(skip(self))]
     pub async fn list_api_keys(
         &self,
@@ -192,6 +205,8 @@ impl StoreRepo {
         Ok(Self::to_api_key(row))
     }
 
+    /// Project-scoped rule (not lead-gated, unlike `create_api_key`) -- this backs both direct
+    /// revoke/reactivate and the "revoke the old key" half of `rotate_api_key_transaction` below.
     #[instrument(skip(self))]
     pub async fn set_api_key_status(
         &self,
@@ -237,6 +252,9 @@ impl StoreRepo {
         Ok(Self::to_api_key(row))
     }
 
+    /// Project-scoped rule for both halves (not lead-gated, unlike `create_api_key`): revoking the
+    /// presented key and minting its successor both require `account_id` to own the project's
+    /// account or hold ANY `project_members` row on it.
     #[instrument(skip(self))]
     pub async fn rotate_api_key_transaction(
         &self,
@@ -302,6 +320,9 @@ impl StoreRepo {
               id, project_id, name, key_prefix, key_hash, created_at, expires_at, status,
               last_used_at, last_ip, revoked_at, billing_plan, owner_account_id
             )
+            -- `$2` is the rotating subject, reused as the new key's owner: rotation re-mints for
+            -- whoever performs it, so the per-member ceiling follows the rotator rather than being
+            -- inherited from the key being replaced.
             SELECT $3, project_auth.project_id, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $2
             FROM project_auth
             RETURNING
@@ -329,6 +350,21 @@ impl StoreRepo {
         Ok(Self::to_api_key(row))
     }
 
+    // `delete_api_key` (a hand-written hard `DELETE FROM api_keys`) was removed here (PR #429
+    // follow-up): it had no production caller -- `delete-api-key`'s MCP tool and the RPC
+    // `model.ApiKey.delete` verb both go through cratestack's generated soft-delete
+    // (`deleted_at`), per `migrations/20260721000001_cratestack_soft_delete_audit_defaults.sql`
+    // -- and its semantics were actively unsafe alongside self-issued-token introspection
+    // (`handlers::exchange_token`): a hard delete leaves NO `api_keys` row behind, and
+    // `verify_self_issued_token`'s `azp` check is what keeps a hard-deleted key's
+    // still-cryptographically-valid JWT from being reinterpreted as an active exchange session,
+    // not the row's mere absence (see that function's doc comment). A dead method whose only
+    // effect, if ever wired up again, is to reopen a revocation bypass is worse than no method;
+    // do not reintroduce a hand-written hard delete for `api_keys` without re-reading that
+    // function's doc comment first.
+
+    /// Read the effective validity of an API key from the `api_key_validation` view (one indexed
+    /// lookup by `key_hash`), with the account -> project -> key status cascade resolved by the DB.
     #[instrument(skip(self, key_hash))]
     pub async fn find_api_key_validation_by_hash(
         &self,

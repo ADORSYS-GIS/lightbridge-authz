@@ -8,12 +8,17 @@ use lightbridge_authz_core::{
     server::{dev_cors_enabled, serve_tls},
 };
 use serde::{Deserialize, Serialize};
+use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
+use std::time::Duration;
 use tower_http::cors::CorsLayer;
 use tracing::{info, warn};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
+pub mod aggregate_refresh;
+pub mod aggregate_refresh_config;
+pub mod aggregate_refresh_lock;
 pub mod config;
 pub mod handlers;
 pub mod instrumentation;
@@ -30,8 +35,12 @@ pub mod routers;
 pub mod scope_authority;
 pub mod spend;
 pub mod state;
+pub mod verify;
 
-pub use config::{RetentionConfig, ScopeAuthorityConfig, UsageConfig, UsageServer, load_from_path};
+pub use config::{
+    AggregateRefreshConfig, RetentionConfig, ScopeAuthorityConfig, UsageConfig, UsageServer,
+    load_from_path,
+};
 use repo::StoreRepo;
 use scope_authority::{RemoteScopeAuthority, ScopeAuthority};
 
@@ -158,6 +167,13 @@ pub fn build_query_router(
 /// `/usage/v1/spend/query`) -- see `UsageServerGroup`'s doc comment for why these are two ports,
 /// not one. Either listener failing to bind/serve fails this function; `tokio::try_join!` runs
 /// them concurrently rather than sequentially so one listener's lifetime never blocks the other's.
+// `expect`: the function already carried 7 config args (the clippy ceiling) before #587 added the
+// `aggregate_refresh` config, and each arg is a distinct, cohesive config slice the caller already
+// holds -- grouping them into a struct would be a churnier refactor than the 8th arg is worth.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one config slice per background job; 8th arg is the #587 aggregate_refresh block"
+)]
 pub async fn start_usage_server(
     usage: &UsageServer,
     query: &UsageServer,
@@ -166,6 +182,7 @@ pub async fn start_usage_server(
     scope_authority: &ScopeAuthorityConfig,
     ingest_auth: Option<&config::IngestAuthConfig>,
     retention: &RetentionConfig,
+    aggregate_refresh: &AggregateRefreshConfig,
 ) -> Result<()> {
     let pool: Arc<dyn DbPoolTrait> = Arc::new(DbPool::new(database).await?);
 
@@ -184,7 +201,22 @@ pub async fn start_usage_server(
             ))
         })?;
 
-    let repo: Arc<dyn UsageRepoTrait> = Arc::new(StoreRepo::new(pool.clone()));
+    // The KPI aggregate schema (migration 20260918000001) is NOT a startup precondition: the query
+    // endpoints route to the aggregates when they exist and fall back to the raw grain table when
+    // absent (see `repo::day_fact_query` / `repo::seat_query`), so a server started before the
+    // migration serves correct raw data rather than failing to boot. The aggregate-refresh loop
+    // likewise logs and retries if the views are not yet present. This is the documented graceful
+    // degradation, not a silent stale-aggregate risk.
+
+    let repo: Arc<dyn UsageRepoTrait> =
+        Arc::new(StoreRepo::new(pool.clone()).with_aggregate_staleness(
+            // The aggregate routing falls back to raw when the aggregate set is stale (older than
+            // this bound). Bound it to two refresh intervals so it tracks the configured cadence:
+            // a merely-late refresh does not bounce the query paths back to raw, but a disabled or
+            // broken refresh degrades to raw within two intervals instead of serving a stale
+            // snapshot forever (the #587 review's P2).
+            Duration::from_secs(aggregate_refresh.interval_seconds.saturating_mul(2).max(1)),
+        ));
     let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(
         BearerTokenService::new(oauth2.clone())
             .map_err(|e| Error::Server(format!("failed to build bearer JWKS client: {e}")))?,
@@ -199,12 +231,23 @@ pub async fn start_usage_server(
         raw_days: retention.enabled.then_some(retention.raw_days),
     });
 
-    // #549 AC2: the retention/rollup background job. It owns its own `PgPool` clone (the shared
-    // pool is behind a `dyn DbPoolTrait`), and runs independently of both listeners -- a retention
-    // failure is logged and retried, never fatal.
+    // #549 AC2: the retention/rollup background job. It runs on its OWN small dedicated pool, NOT
+    // a shallow clone of the shared request pool: the rollup holds a connection for the whole run
+    // (a `DELETE ... RETURNING` feeding an `INSERT ... SELECT ... ON CONFLICT`), so sharing the
+    // request pool would let a long rollup starve the mTLS query listener's requests for
+    // connections. A failure is logged and retried, never fatal.
     tokio::spawn(retention::run_retention_loop(
-        Arc::new(pool.pool().clone()),
+        Arc::new(build_background_pool(database)?),
         retention.clone(),
+    ));
+
+    // #587: the KPI aggregate-refresh background job. Same shape as the retention loop -- its own
+    // small dedicated pool (see `build_background_pool`), independent of both listeners, a failure
+    // logged and retried, never fatal. Refreshing a materialized view is non-destructive, so this
+    // defaults ON (see `AggregateRefreshConfig`).
+    tokio::spawn(aggregate_refresh::run_aggregate_refresh_loop(
+        Arc::new(build_background_pool(database)?),
+        aggregate_refresh.clone(),
     ));
 
     let dev_cors = dev_cors_enabled();
@@ -243,6 +286,24 @@ pub async fn start_usage_server(
     Ok(())
 }
 
+/// Builds a small, dedicated connection pool for a background job (retention, aggregate-refresh).
+///
+/// This is deliberately NOT a shallow clone of the shared request pool: a background job holds a
+/// connection for the whole run (a rollup, or up to four `REFRESH MATERIALIZED VIEW CONCURRENTLY`
+/// statements that can take minutes on the day/seat matviews at scale), so sharing the request
+/// pool would let a long job starve the mTLS query listener's requests for connections. A pool of
+/// 2 keeps the job from contending with request traffic while still being small. `connect_lazy`
+/// defers the actual dial until first use -- the shared pool has already verified connectivity at
+/// startup, so a lazy background pool adds no startup ordering dependency.
+fn build_background_pool(database: &Database) -> Result<sqlx::PgPool> {
+    PgPoolOptions::new()
+        .max_connections(2)
+        .min_connections(1)
+        .acquire_timeout(Duration::from_secs(30))
+        .connect_lazy(&database.url)
+        .map_err(|e| Error::Server(format!("failed to build background job pool: {e}")))
+}
+
 async fn root_handler() -> (StatusCode, Json<RootResponse>) {
     (
         StatusCode::OK,
@@ -278,6 +339,7 @@ async fn readiness_handler(pool: Arc<dyn DbPoolTrait>) -> StatusCode {
         crate::handlers::ingest::ingest_logs,
         crate::handlers::query::query_usage,
         crate::handlers::execution::query_executions,
+        crate::handlers::seat::query_seat_snapshots,
         crate::handlers::day_fact::query_day_facts,
         crate::handlers::spend::query_spend
     ),
@@ -297,6 +359,11 @@ async fn readiness_handler(pool: Arc<dyn DbPoolTrait>) -> StatusCode {
             crate::models::execution::ExecutionQueryFilters,
             crate::models::execution::ExecutionSeriesPoint,
             crate::models::execution::ExecutionGroupBy,
+            crate::models::seat::SeatSnapshotQueryRequest,
+            crate::models::seat::SeatSnapshotQueryResponse,
+            crate::models::seat::SeatSnapshotQueryFilters,
+            crate::models::seat::SeatSnapshotSeriesPoint,
+            crate::models::seat::SeatGroupBy,
             crate::models::day_fact::DayFactQueryRequest,
             crate::models::day_fact::DayFactQueryResponse,
             crate::models::day_fact::DayFactQueryFilters,

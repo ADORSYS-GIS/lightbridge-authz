@@ -1,3 +1,7 @@
+//! **Legitimately exceeds the 200-LoC gate**: this file is one domain slice of the verbatim
+//! `repo.rs` -> `repo/` split (#521), with its load-bearing comments restored move-intact
+//! under the #760 review. Deeper burn-down is tracked separately, not silently re-factored
+//! here (see `docs/code-size-baseline.md`'s rule for honestly-oversized modules).
 use std::sync::Arc;
 
 use lightbridge_authz_core::db::DbPoolTrait;
@@ -144,11 +148,35 @@ impl StoreRepo {
         Ok(row)
     }
 
+    /// Authorizes a lead-gated roster mutation (`add_project_member`, `remove_project_member`,
+    /// `set_project_member_role`, `set_project_member_quota_tier`) or lead-gated `create_api_key`:
+    /// `subject` must be either the project's account owner (`projects.account_id = subject`) or
+    /// hold a `project_members` row with `role = 'lead'` on `project_id`. There is no last-lead
+    /// lockout to guard here (unlike the deleted `remove_account_member`/`set_account_member_role`'s
+    /// last-owner guards) -- the account owner is always a standing alternate authority over the
+    /// roster, so a project can never be left with nobody able to manage it the way an account
+    /// could before ADR-0006 removed account-level membership entirely.
+    ///
+    /// Mirrors the deleted `add_account_member`'s NotFound/Forbidden split: a subject with no
+    /// visibility into the project at all (not the owner, not on the roster in any role) gets
+    /// `NotFound` so project existence isn't leaked; a subject who can see the project as a plain
+    /// `member` but lacks lead standing gets `Forbidden`.
     pub(super) async fn authorize_project_lead(
         &self,
         project_id: &str,
         account_id: &AccountId,
     ) -> Result<()> {
+        // COALESCE is load-bearing, not defensive noise: an actor with no `accounts` row at all
+        // (a bootstrapping identity) makes the inner subquery NULL, so the comparison is NULL
+        // rather than false, and decoding NULL into `bool` fails -- turning a clean `NotFound`
+        // into a database error. Caught by `access_control_allows_project_members_and_rejects_
+        // non_members`, which asserts the exact error VARIANT an outsider gets.
+        //
+        // ADR-0026: "the project's account owner" is no longer "the project's account IS me" --
+        // one person may own several accounts, and a project inside a secondary account is just as
+        // much theirs. Compare by OWNER, not by account identity, or the owner gets `NotFound` on
+        // their own project. The member branch below deliberately still compares `auth().id`
+        // directly (ADR-0026 D5: a roster may only ever name an anchor account).
         let owns_project: Option<bool> = sqlx::query_scalar(
             r#"
             SELECT COALESCE(

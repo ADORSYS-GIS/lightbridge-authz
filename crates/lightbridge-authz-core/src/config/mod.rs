@@ -11,9 +11,11 @@ pub mod model_catalog;
 pub mod oauth2;
 pub mod quota_tiers;
 pub mod server;
+mod unknown_keys;
+mod unknown_keys_data;
 
 pub use api_key_expiry::ApiKeyExpiry;
-pub use billing::{Billing, BillingLimits, BillingPlan, deserialize_null_default};
+pub use billing::{Billing, BillingLimits, BillingPlan};
 pub use budget_internal::BudgetInternalServer;
 pub use budget_server::BudgetServer;
 pub use claim_mapper::{ClaimMapper, ClaimSource};
@@ -26,6 +28,10 @@ pub use oauth2::{
 };
 pub use quota_tiers::{QuotaTier, QuotaTiers};
 pub use server::{ApiServer, BasicAuth, IdpServer, OpaServer, Server, Tls};
+// In-scope for `Config`'s `deserialize_with = "deserialize_null_default"` string paths below. Not
+// re-exported: it is a serde plumbing helper on the crate's public API for nothing (see
+// `billing.rs`, which scopes it `pub(super)` instead of `pub` per the #760 review).
+use billing::deserialize_null_default;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {

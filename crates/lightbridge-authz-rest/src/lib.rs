@@ -64,12 +64,9 @@ use cratestack::ratelimit::StoreErrorPolicy;
 
 pub use opa_repo::{OpaRepoTrait, OpaState, SessionStatusRow};
 pub use procedures::Procedures;
-pub use server_api::{build_api_router, normalize_rpc_base_path, start_api_server};
+pub use server_api::{build_api_router, start_api_server};
 pub use server_budget::{build_budget_router, start_budget_server};
-pub use server_idp::{
-    build_bearer_service, build_idp_router, build_token_exchange_state, require_federation,
-    start_idp_server,
-};
+pub use server_idp::{build_idp_router, start_idp_server};
 pub use server_opa::{build_opa_router, start_opa_server};
 
 pub(crate) use crate::error_convert::to_cratestack_error;
@@ -133,6 +130,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::convert::{
+        DEFAULT_EXPIRING_SOON_WINDOW_DAYS, MAX_EXPIRING_SOON_WINDOW_DAYS,
+        clamp_expiring_soon_window_days,
+    };
+    use crate::opa_doc::OpaDoc;
+    use crate::server_api::normalize_rpc_base_path;
+    use crate::server_idp::build_token_exchange_state;
     use axum::http::StatusCode;
     use lightbridge_authz_api_key::repo::StoreRepo;
     use lightbridge_authz_bearer::{BearerTokenServiceTrait, TokenInfo};
@@ -143,11 +147,6 @@ mod tests {
     use serde_json::Value;
     use sqlx::postgres::PgPoolOptions;
     use utoipa::OpenApi;
-    use crate::convert::{
-        DEFAULT_EXPIRING_SOON_WINDOW_DAYS, MAX_EXPIRING_SOON_WINDOW_DAYS,
-        clamp_expiring_soon_window_days,
-    };
-    use crate::opa_doc::OpaDoc;
 
     struct NoopBearer;
 

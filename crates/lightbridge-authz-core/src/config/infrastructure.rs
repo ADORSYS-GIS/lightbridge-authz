@@ -60,7 +60,7 @@ pub struct UsageServiceClient {
     /// Path to a PEM-encoded CA bundle used to verify the usage service's certificate, e.g.
     /// `/etc/lightbridge/tls/ca.crt` (the `ca.crt` cert-manager writes into the same `authz-tls`
     /// Secret this service already mounts for its own server certificate — see
-    /// `crates/lightbridge-authz-core/src/config/mod.rs`'s `Tls` type). This is the production
+    /// `crates/lightbridge-authz-core/src/config::server`'s `Tls` type). This is the production
     /// mechanism: it verifies the usage service's certificate is signed by the cluster's own CA,
     /// rather than skipping verification entirely. Optional — when unset, verification falls
     /// back to the platform's default trust store (or, if `insecure_skip_verify` is `true`, to no

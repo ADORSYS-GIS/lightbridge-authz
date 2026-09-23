@@ -48,11 +48,17 @@ use tower::ServiceExt;
 const AUDIENCE: &str = "lightbridge-usage-ingest";
 
 /// The source the tests' one configured principal is allowed to assert.
-const TRUSTED_SOURCE: &str = "github-copilot";
+///
+/// Deliberately a request-grain source (`eaig`), not `github-copilot` or `claude-code`: since
+/// #588, `github-copilot` logs are routed to the day-grain receiver and `claude-code` traces are
+/// routed to the execution-grain receiver, so neither can stand in for the generic request-grain
+/// authenticated path these tests exercise. `eaig` (the AI gateway) is request-grain for every
+/// signal.
+const TRUSTED_SOURCE: &str = "eaig";
 /// A different, equally-valid source, used to prove the credential -- not the caller -- decides.
 const OTHER_SOURCE: &str = "codex";
 /// The `sub` of the tests' one configured principal.
-const PRINCIPAL: &str = "svc:collector-github-copilot";
+const PRINCIPAL: &str = "svc:collector-eaig";
 
 // ---------------------------------------------------------------------------------------------
 // Test doubles
@@ -84,6 +90,27 @@ impl UsageRepoTrait for MockUsageRepo {
         Ok(count)
     }
 
+    async fn upsert_day_facts(
+        &self,
+        _facts: &[lightbridge_authz_usage_rest::models::day_seat::DayFact],
+    ) -> lightbridge_authz_core::Result<usize> {
+        Ok(0)
+    }
+
+    async fn upsert_seat_snapshots(
+        &self,
+        _snapshots: &[lightbridge_authz_usage_rest::models::day_seat::SeatSnapshot],
+    ) -> lightbridge_authz_core::Result<usize> {
+        Ok(0)
+    }
+
+    async fn upsert_execution_grain(
+        &self,
+        _batch: &lightbridge_authz_usage_rest::models::execution_ingest::ExecutionGrainBatch,
+    ) -> lightbridge_authz_core::Result<usize> {
+        Ok(0)
+    }
+
     async fn query_usage(
         &self,
         _input: &UsageQueryRequest,
@@ -95,6 +122,16 @@ impl UsageRepoTrait for MockUsageRepo {
         &self,
         _input: &ExecutionQueryRequest,
     ) -> lightbridge_authz_core::Result<(Vec<ExecutionSeriesPoint>, bool)> {
+        Ok((vec![], false))
+    }
+
+    async fn query_seat_snapshots(
+        &self,
+        _input: &lightbridge_authz_usage_rest::models::seat::SeatSnapshotQueryRequest,
+    ) -> lightbridge_authz_core::Result<(
+        Vec<lightbridge_authz_usage_rest::models::seat::SeatSnapshotSeriesPoint>,
+        bool,
+    )> {
         Ok((vec![], false))
     }
 

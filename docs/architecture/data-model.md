@@ -331,6 +331,21 @@ actually live versus merely implemented — is in [`budget.md`](./budget.md).
 
 ## The usage side: a separate database
 
+The proposed `20260922000001_usage_request_dedup.sql` adds nullable `dedup_key` to the legacy
+request table and uniqueness over `(observed_at, source, dedup_key)`. Historical rows stay NULL;
+no payload-content hash or fabricated historical identifier is introduced. Deploy this additive
+schema in a release before any writer that requires it (ADR-0031). The raw-row index cannot
+deduplicate replays after retention deletes the original row. This migration has not been
+applied in production.
+
+Its sibling, `20260922000002_usage_events_daily_source.sql` (governance#358), adds the same
+nullable `source` column to the daily rollup table and replaces its unique index to include it,
+so `spend_for_account` can exclude non-EAIG (IDE-collector) rows from an account's spend without
+merging them into an EAIG row once a day ages into the rollup. Same discipline: additive column,
+no backfill (a pre-existing rollup row predates source-tracking and stays `NULL`, which
+`spend_for_account` treats as EAIG rather than excluding — every such row is, in substance, 100%
+EAIG traffic). Not applied in production.
+
 `usage_events` (`migrations-usage/`) is **not** in the schema above — it lives in its own
 Postgres database (`lightbridge-authz-usage`'s own `DATABASE_URL`, provisioned
 independently from the authz Postgres instance; plain Postgres in production, no Timescale

@@ -23,10 +23,12 @@ use lightbridge_authz_usage_rest::{
     models::{
         UsageGroupBy, UsageQueryFilters, UsageQueryRequest, UsageQueryResponse, UsageScope,
         UsageSeriesPoint,
+        day_seat::{DayFact, SeatSnapshot},
         execution::{
             ExecutionQueryFilters, ExecutionQueryRequest, ExecutionQueryResponse,
             ExecutionSeriesPoint,
         },
+        execution_ingest::ExecutionGrainBatch,
     },
     repo::{StoreRepo, UsageEvent},
 };
@@ -64,6 +66,18 @@ impl UsageRepoTrait for MockUsageRepo {
         Ok(self.inserted_events)
     }
 
+    async fn upsert_day_facts(&self, _facts: &[DayFact]) -> Result<usize> {
+        Ok(0)
+    }
+
+    async fn upsert_seat_snapshots(&self, _snapshots: &[SeatSnapshot]) -> Result<usize> {
+        Ok(0)
+    }
+
+    async fn upsert_execution_grain(&self, _batch: &ExecutionGrainBatch) -> Result<usize> {
+        Ok(0)
+    }
+
     async fn query_usage(
         &self,
         _input: &UsageQueryRequest,
@@ -76,6 +90,16 @@ impl UsageRepoTrait for MockUsageRepo {
         _input: &ExecutionQueryRequest,
     ) -> Result<(Vec<ExecutionSeriesPoint>, bool)> {
         Ok((self.execution_points.clone(), self.execution_truncated))
+    }
+
+    async fn query_seat_snapshots(
+        &self,
+        _input: &lightbridge_authz_usage_rest::models::seat::SeatSnapshotQueryRequest,
+    ) -> Result<(
+        Vec<lightbridge_authz_usage_rest::models::seat::SeatSnapshotSeriesPoint>,
+        bool,
+    )> {
+        Ok((vec![], false))
     }
 
     async fn query_day_facts(

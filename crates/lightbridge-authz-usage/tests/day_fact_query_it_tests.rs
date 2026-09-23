@@ -15,6 +15,7 @@ use axum::http::{Request, StatusCode, header};
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 use lightbridge_authz_usage_rest::UsageState;
+use lightbridge_authz_usage_rest::aggregate_refresh::record_last_refresh;
 use lightbridge_authz_usage_rest::build_query_router;
 use lightbridge_authz_usage_rest::models::UsageScope;
 use lightbridge_authz_usage_rest::models::day_fact::{
@@ -69,6 +70,34 @@ async fn insert_day_fact(
     .execute(pool)
     .await
     .expect("insert day fact");
+
+    // #587: the query endpoint routes to the KPI aggregates when they exist (they do, the migration
+    // applied), so refresh them after seeding or the query would see empty aggregates. Refreshing
+    // per insert is wasteful in prod but cheap and robust in tests.
+    refresh_day_fact_aggregates(pool).await;
+}
+
+/// Refreshes the three day-facts KPI aggregates the query endpoint routes to (#587), then records
+/// the refresh so the routing's freshness check (`aggregate_views_available`) treats the aggregate
+/// set as fresh and routes to it. Without the `record_last_refresh`, `last_refreshed_at` stays NULL
+/// and the query paths fall back to the raw table (the #587 review's P2).
+async fn refresh_day_fact_aggregates(pool: &PgPool) {
+    for view in [
+        "mv_day_facts_acceptances_daily",
+        "mv_day_facts_active_users_daily",
+        "mv_day_facts_spend_daily",
+    ] {
+        // `view` is a hardcoded static allowlist entry (never user input), so AssertSqlSafe is the
+        // documented safe use of the escape hatch.
+        let sql = format!("REFRESH MATERIALIZED VIEW CONCURRENTLY {view}");
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .execute(pool)
+            .await
+            .expect("refresh day-facts aggregate");
+    }
+    record_last_refresh(pool)
+        .await
+        .expect("record day-facts aggregate refresh");
 }
 
 fn repo(pool: &PgPool) -> StoreRepo {
@@ -295,6 +324,7 @@ async fn org_and_repo_aggregate_only_rows_are_not_summed_together(pool: PgPool) 
         .await
         .expect("insert aggregate-only fact");
     }
+    refresh_day_fact_aggregates(&pool).await;
 
     let (points, _) = repo(&pool)
         .query_day_facts(&request(
@@ -350,6 +380,7 @@ async fn total_active_users_is_peak_not_sum_across_days(pool: PgPool) {
         .await
         .expect("insert aggregate-only org fact");
     }
+    refresh_day_fact_aggregates(&pool).await;
 
     let mut input = request(
         UsageScope::All,
@@ -377,6 +408,99 @@ async fn total_active_users_is_peak_not_sum_across_days(pool: PgPool) {
         points[0].total_active_users,
         Some(12),
         "peak daily active users (MAX), not the sum (20)"
+    );
+}
+
+/// P1 regression (#727 review): the three day-facts aggregates are refreshed independently, so at
+/// any instant one can be missing a row the others have. An INNER JOIN would silently drop that
+/// row (losing its suggestions/acceptances/lines/cost); the FULL OUTER JOIN must keep it. Here the
+/// spend aggregate is deliberately NOT refreshed, so it lacks the seeded row -- the query must
+/// still return the row's suggestions with cost NULL, never drop it.
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn divergent_aggregate_views_do_not_drop_rows(pool: PgPool) {
+    // Seed a row directly (no refresh), then refresh only the acceptances and active_users views,
+    // leaving the spend view stale (missing this row) -- the divergent-views state the INNER JOIN
+    // bug dropped.
+    sqlx::query(
+        "INSERT INTO usage_day_facts \
+         (source, day, subject_kind, subject_id, provider_user_id, total_suggestions_count, total_acceptances_count, cost_micro_usd) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+    )
+    .bind(SOURCE)
+    .bind(day(2026, 8, 15))
+    .bind("user")
+    .bind("user-1")
+    .bind(Some("sub-a"))
+    .bind(100_i64)
+    .bind(80_i64)
+    .bind(1_000_i64)
+    .execute(&pool)
+    .await
+    .expect("insert day fact");
+
+    for view in [
+        "mv_day_facts_acceptances_daily",
+        "mv_day_facts_active_users_daily",
+    ] {
+        let sql = format!("REFRESH MATERIALIZED VIEW CONCURRENTLY {view}");
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .execute(&pool)
+            .await
+            .expect("refresh aggregate");
+    }
+    // mv_day_facts_spend_daily is deliberately NOT refreshed -> it lacks the row. Record the
+    // refresh anyway so the routing's freshness check routes to the aggregate (the divergent-views
+    // state this test exists to exercise); without it, routing would fall back to raw and the
+    // spend would read as 1000, not NULL.
+    record_last_refresh(&pool)
+        .await
+        .expect("record aggregate refresh");
+
+    let (points, _) = repo(&pool)
+        .query_day_facts(&request(
+            UsageScope::All,
+            "",
+            ts(2026, 8, 1),
+            ts(2026, 9, 1),
+            vec![],
+            100,
+        ))
+        .await
+        .expect("query must succeed");
+
+    assert_eq!(
+        points.len(),
+        1,
+        "the row must not be dropped by a stale spend view"
+    );
+    assert_eq!(points[0].total_suggestions, Some(100));
+    assert_eq!(points[0].total_acceptances, Some(80));
+    assert_eq!(
+        points[0].cost_micro_usd, None,
+        "cost is unknown when the spend view lacks the row"
+    );
+}
+
+/// A sub-day bucket on the daily day grain is rejected (it would collapse every row into the
+/// midnight bucket -- degenerate and misleading).
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn sub_day_bucket_is_rejected(pool: PgPool) {
+    let mut input = request(
+        UsageScope::All,
+        "",
+        ts(2026, 8, 1),
+        ts(2026, 9, 1),
+        vec![],
+        100,
+    );
+    input.bucket = "1 hour".to_string();
+    let err = repo(&pool)
+        .query_day_facts(&input)
+        .await
+        .expect_err("sub-day bucket must be rejected");
+    assert!(
+        err.to_string().contains("at least 1 day"),
+        "unexpected error: {err}"
     );
 }
 

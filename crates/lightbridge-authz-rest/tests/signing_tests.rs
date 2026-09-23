@@ -13,7 +13,7 @@ use lightbridge_authz_rest::signing::{
     generate_rs256_key,
 };
 use serde::{Deserialize, Serialize};
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use std::sync::Arc;
 
 const ISSUER: &str = "https://authz.example.test";
@@ -841,8 +841,22 @@ mod db {
     /// would produce.
     #[sqlx::test(migrations = "../../migrations")]
     async fn concurrent_bootstraps_from_multiple_services_produce_exactly_one_active_key(
-        pool: PgPool,
+        pool_opts: PgPoolOptions,
+        connect_opts: PgConnectOptions,
     ) {
+        // This test races three bootstraps concurrently, and each one holds a pool connection
+        // while it waits on the shared `pg_advisory_xact_lock`. `#[sqlx::test]` pools all draw
+        // from a single 20-connection master pool shared by every concurrently-running test in
+        // this binary, so under parallel it-test load the default 30s acquire timeout can be
+        // exceeded and the race aborts with `PoolTimedOut` before it even reaches the lock.
+        // Give this one connection-hungry test a longer acquire timeout so it tolerates that
+        // contention instead of flaking; the test's own pool cap (5) and the shared master pool
+        // are unchanged.
+        let pool = pool_opts
+            .acquire_timeout(std::time::Duration::from_secs(120))
+            .connect_with(connect_opts)
+            .await
+            .expect("pool");
         let repo = repo(pool);
         let cfg = signing_cfg(3600);
         assert!(repo.get_active_signing_key().await.unwrap().is_none());

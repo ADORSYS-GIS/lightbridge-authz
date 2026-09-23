@@ -8,7 +8,7 @@ use tracing::warn;
 
 /// Validates the common query-request invariants shared across all grains:
 /// - `scope_id` is present for non-`All` scopes
-/// - `limit > 0`
+/// - `0 < limit <= MAX_LIMIT`
 ///
 /// Returns `Error::BadRequest` for any violation. Call this AFTER authentication but BEFORE
 /// scope authorization, matching the existing `query_usage` convention (body validation runs
@@ -36,8 +36,21 @@ pub fn validate_common_request(
         ));
     }
 
+    if limit > MAX_LIMIT {
+        warn!("invalid limit for usage query: limit={limit} exceeds max {MAX_LIMIT}");
+        return Err(Error::BadRequest(format!(
+            "limit must be at most {MAX_LIMIT}"
+        )));
+    }
+
     Ok(())
 }
+
+/// Upper bound on `limit` across all grains. Bounds how many buckets a single query can
+/// materialize (each bucket can carry many dimension rows), so an authorized caller cannot request
+/// `u32::MAX` buckets over a huge time range with a fine bucket and exhaust the query listener's
+/// memory. The default limit is 1_000; 10_000 is a generous ceiling for legitimate large reads.
+pub const MAX_LIMIT: u32 = 10_000;
 
 #[cfg(test)]
 mod tests {
@@ -59,5 +72,17 @@ mod tests {
     fn validate_common_request_rejects_zero_limit() {
         let result = validate_common_request(&UsageScope::Account, "acct-1", 0);
         assert!(matches!(result, Err(Error::BadRequest(_))));
+    }
+
+    #[test]
+    fn validate_common_request_rejects_limit_above_max() {
+        let result = validate_common_request(&UsageScope::Account, "acct-1", MAX_LIMIT + 1);
+        assert!(matches!(result, Err(Error::BadRequest(_))));
+    }
+
+    #[test]
+    fn validate_common_request_accepts_limit_at_max() {
+        let result = validate_common_request(&UsageScope::Account, "acct-1", MAX_LIMIT);
+        assert!(result.is_ok());
     }
 }

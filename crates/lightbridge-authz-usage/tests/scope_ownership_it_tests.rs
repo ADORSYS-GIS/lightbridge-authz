@@ -8,23 +8,28 @@
 #[path = "support/mod.rs"]
 mod support;
 
-use axum::body::{Body, to_bytes};
-use axum::http::{Request, StatusCode, header};
+use std::sync::Arc;
+
+use axum::{
+    body::{Body, to_bytes},
+    http::{Request, StatusCode, header},
+};
 use chrono::{DateTime, Utc};
-use httpmock::Method::POST;
-use httpmock::MockServer;
-use lightbridge_authz_core::Permission;
-use lightbridge_authz_core::authz::PermissionSet;
-use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
-use lightbridge_authz_usage_rest::UsageState;
-use lightbridge_authz_usage_rest::build_query_router;
-use lightbridge_authz_usage_rest::config::ScopeAuthorityConfig;
-use lightbridge_authz_usage_rest::models::{UsageQueryResponse, UsageScope};
-use lightbridge_authz_usage_rest::repo::{StoreRepo, UsageEvent};
-use lightbridge_authz_usage_rest::scope_authority::RemoteScopeAuthority;
+use httpmock::{Method::POST, MockServer};
+use lightbridge_authz_core::{
+    Permission,
+    authz::PermissionSet,
+    db::{DbPool, DbPoolTrait},
+};
+use lightbridge_authz_usage_rest::{
+    UsageState, build_query_router,
+    config::ScopeAuthorityConfig,
+    models::{UsageQueryResponse, UsageScope},
+    repo::{StoreRepo, UsageEvent},
+    scope_authority::RemoteScopeAuthority,
+};
 use serde_json::json;
 use sqlx::PgPool;
-use std::sync::Arc;
 use tower::ServiceExt;
 
 const ISSUER: &str = "https://issuer.test";
@@ -50,6 +55,7 @@ fn parse_timestamp(value: &str) -> DateTime<Utc> {
 
 fn sample_event(account_id: &str, project_id: &str, observed_at: DateTime<Utc>) -> UsageEvent {
     UsageEvent {
+        dedup_key: None,
         observed_at,
         signal_type: "trace".to_string(),
         source: Some("eaig".to_string()),
@@ -443,6 +449,7 @@ async fn spend_endpoint_refuses_bearer_carrying_requests(pool: PgPool) {
 /// "the caller's own subject" is what unlocks `scope=user`, not any fixed string.
 fn sample_event_for_user(user_id: &str, observed_at: DateTime<Utc>) -> UsageEvent {
     UsageEvent {
+        dedup_key: None,
         observed_at,
         signal_type: "trace".to_string(),
         source: Some("eaig".to_string()),
