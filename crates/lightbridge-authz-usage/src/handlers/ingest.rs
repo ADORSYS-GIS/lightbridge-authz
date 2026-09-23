@@ -796,7 +796,18 @@ fn number_data_point_to_event(
             .or_else(|| duration_metric_value_to_ms(metric_name.as_deref(), value)),
         metric_name,
         usage_value: value,
-        request_count: request_count_from_metric_value(value),
+        // One data point observed = one request, same convention the
+        // histogram/summary/exponential-histogram paths below already use
+        // (`count.max(1)`, the number of underlying SAMPLES). Deriving this
+        // from the metric's raw VALUE instead meant any Gauge/Sum whose value
+        // is a magnitude rather than an occurrence count -- token totals,
+        // queue depths, cumulative counters -- got silently reinterpreted as
+        // "that many requests happened," which is how a single
+        // `claude_code.token.usage` export inflated the Console's Unassigned
+        // channel to 31.9 BILLION "requests" (lightbridge-authz#358 follow-up,
+        // found live 2026-09-23). Absence of a genuine per-point count is the
+        // honest answer here, not a guess from whatever number is in `value`.
+        request_count: 1,
         prompt_tokens: norm.prompt_tokens,
         completion_tokens: norm.completion_tokens,
         total_tokens: norm.total_tokens,
@@ -941,19 +952,6 @@ fn summary_data_point_to_event(
         prompt_tokens: norm.prompt_tokens,
         completion_tokens: norm.completion_tokens,
         total_tokens: norm.total_tokens,
-    }
-}
-
-fn request_count_from_metric_value(value: f64) -> i64 {
-    if value.is_finite() && value >= 1.0 {
-        let rounded = value.round();
-        if rounded > i64::MAX as f64 {
-            i64::MAX
-        } else {
-            rounded as i64
-        }
-    } else {
-        1
     }
 }
 
@@ -1270,7 +1268,9 @@ mod tests {
             Some("gen_ai.usage.total_tokens")
         );
         assert_eq!(event.usage_value, 99.0);
-        assert_eq!(event.request_count, 99);
+        // NOT 99 -- `usage_value` carries the metric's own magnitude (here, a
+        // token total); `request_count` counts data points, never the value.
+        assert_eq!(event.request_count, 1);
     }
 
     #[test]
@@ -2063,7 +2063,9 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].usage_value, 3.5);
         assert_eq!(events[0].metric_name.as_deref(), Some("queue.depth"));
-        assert_eq!(events[0].request_count, 4);
+        // NOT 4 (round(3.5)) -- a gauge's value is a magnitude, not a count
+        // of requests; one data point is always exactly one request.
+        assert_eq!(events[0].request_count, 1);
     }
 
     #[test]
@@ -2285,19 +2287,6 @@ mod tests {
         );
         assert_eq!(non_empty(Some("   ".to_string())), None);
         assert_eq!(non_empty(None), None);
-    }
-
-    #[test]
-    fn request_count_from_metric_value_should_default_to_one_for_small_or_non_finite_values() {
-        assert_eq!(request_count_from_metric_value(0.4), 1);
-        assert_eq!(request_count_from_metric_value(-5.0), 1);
-        assert_eq!(request_count_from_metric_value(f64::NAN), 1);
-    }
-
-    #[test]
-    fn request_count_from_metric_value_should_cap_at_i64_max_for_huge_values() {
-        assert_eq!(request_count_from_metric_value(f64::MAX), i64::MAX);
-        assert_eq!(request_count_from_metric_value(5.0), 5);
     }
 
     #[test]
