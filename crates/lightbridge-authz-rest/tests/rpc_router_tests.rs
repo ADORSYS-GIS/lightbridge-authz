@@ -35,7 +35,7 @@ use std::sync::Arc;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use common::{MapBearer, Wire, admin_perms, as_json, rpc_call, token_info, viewer_perms};
+use common::{MapBearer, Wire, admin_perms, as_json, rpc_call, rpc_call_at, token_info, viewer_perms};
 use cratestack::SqlxIdempotencyStore;
 use cratestack::ratelimit::RateLimitStore;
 use lightbridge_authz_api::schema;
@@ -45,6 +45,8 @@ use lightbridge_authz_core::config::{Billing, ModelCatalog};
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 use lightbridge_authz_rest::handlers::AuthzStoreImpl;
 use lightbridge_authz_rest::ratelimit_redis::build_redis_rate_limit_store;
+use lightbridge_authz_rest::rpc_authorize::is_budget_op_id;
+use lightbridge_authz_rest::rpc_permission_map::MAPPED_OP_ID_PERMISSIONS;
 use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
 use tower::ServiceExt;
@@ -1249,6 +1251,84 @@ async fn viewer_and_editor_roles_are_granted_account_create_by_shipped_config() 
         assert!(
             status != StatusCode::UNAUTHORIZED && status != StatusCode::FORBIDDEN,
             "{role} must be granted procedure.createAccount by the RBAC gate, got {status}: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+}
+
+/// Like [`build_router`] but assembles `build_budget_router` (the `authz-budget` server,
+/// `RpcScope::Budget`) instead of `build_api_router` (`authz-api`, `RpcScope::Crud`).
+///
+/// Budget op-ids return 404 on the API router because `RpcScope::Budget` is what refuses them
+/// there — not a permission denial. Verifying that the RBAC gate rejects them with 403 when
+/// the caller lacks the required permission requires testing against the budget router instead.
+fn build_budget_router_for_test(bearer: Arc<dyn BearerTokenServiceTrait>) -> Router {
+    let core = lazy_core_pool();
+    let issuer = Arc::new(AuthzStoreImpl::with_pool(core.clone()));
+    let policy_store = lazy_policy_store(core.clone());
+    let (refill_service, review_service, budget_repo, reset_scheduler) =
+        lazy_refill_and_review_services(core.clone(), &policy_store);
+    lightbridge_authz_rest::build_budget_router(
+        issuer,
+        policy_store,
+        refill_service,
+        review_service,
+        budget_repo,
+        reset_scheduler,
+        std::sync::Arc::new(lightbridge_authz_core::platform_role::known_platform_roles(
+            &lightbridge_authz_core::authz::Rbac::default(),
+        )),
+        lazy_cratestack_db(),
+        core,
+        bearer,
+        common::test_resolver(),
+        lazy_idempotency(),
+        lazy_rate_limit(),
+        false,
+    )
+}
+
+/// **The systemic closure of the pattern that #177 exposed (#265).**
+///
+/// Every op-id in `MAPPED_OP_ID_PERMISSIONS` must be refused by the RBAC gate when the caller
+/// holds every permission EXCEPT the one that op-id requires. This is a mutation-style test:
+/// removing a permission mapping from the table, or forgetting to wire the gate for a new op-id,
+/// causes the request to reach dispatch instead of returning 403, hitting the dead Postgres and
+/// returning something that is NOT 403 — the test fails with the op-id and the actual status.
+///
+/// The op-id list is derived mechanically from `MAPPED_OP_ID_PERMISSIONS` (no hand-typed list
+/// that can silently drift from the real map). Budget op-ids are tested against
+/// `build_budget_router_for_test` (the scope that accepts them); CRUD op-ids are tested against
+/// `build_router` (the scope that accepts them). Mixing routers would make op-ids appear correct
+/// when they returned 404 instead of 403.
+///
+/// This covers all 57 currently-mapped op-ids, complementing:
+/// - `rbac_gate_denies_viewer_on_every_mutating_op` (viewer blocked even with some permissions),
+/// - `rbac_gate_denies_unmapped_and_locked_ops_even_for_admin` (fail-closed for unknown ops),
+/// - `budget_gated_op_ids_are_unreachable_on_authz_api_regardless_of_permission` (scope cutover).
+#[tokio::test]
+async fn every_mapped_op_id_is_refused_without_its_required_permission() {
+    for (op_id, permission) in MAPPED_OP_ID_PERMISSIONS {
+        let all_minus_one: PermissionSet = Permission::ALL
+            .iter()
+            .filter(|&&p| p != *permission)
+            .copied()
+            .collect();
+        let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(
+            MapBearer::new().with("caller", token_info("caller-subject", all_minus_one)),
+        );
+        let (status, body) = if is_budget_op_id(op_id) {
+            let router = build_budget_router_for_test(bearer);
+            rpc_call_at(router, "/budget", op_id, Wire::Cbor, &json!({}), Some("caller")).await
+        } else {
+            let router = build_router(bearer, false);
+            rpc_call(router, op_id, Wire::Cbor, &json!({}), Some("caller")).await
+        };
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "op-id `{op_id}` (requires {permission:?}): caller without that permission must get \
+             403 from the RBAC gate, not {status} — the gate is unwired or the map is wrong: {}",
             String::from_utf8_lossy(&body)
         );
     }

@@ -30,7 +30,7 @@
   "crates/lightbridge-authz-rest/src/end_session.rs": 297,
   "crates/lightbridge-authz-rest/src/handlers/exchange_token.rs": 358,
   "crates/lightbridge-authz-rest/src/handlers/mod.rs": 1700,
-  "crates/lightbridge-authz-rest/src/lib.rs": 961,
+  "crates/lightbridge-authz-rest/src/lib.rs": 969,
   "crates/lightbridge-authz-rest/src/middleware/mod.rs": 335,
   "crates/lightbridge-authz-rest/src/oauth2_op/device_store.rs": 487,
   "crates/lightbridge-authz-rest/src/oauth2_op/refresh_store.rs": 242,

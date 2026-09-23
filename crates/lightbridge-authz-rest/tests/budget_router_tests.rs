@@ -37,10 +37,12 @@ use cratestack::SqlxIdempotencyStore;
 use cratestack::ratelimit::RateLimitStore;
 use lightbridge_authz_api::schema;
 use lightbridge_authz_bearer::BearerTokenServiceTrait;
-use lightbridge_authz_core::authz::Permission;
+use lightbridge_authz_core::authz::{Permission, PermissionSet};
 use lightbridge_authz_core::db::{DbPool, DbPoolTrait};
 use lightbridge_authz_rest::handlers::AuthzStoreImpl;
 use lightbridge_authz_rest::ratelimit_redis::build_redis_rate_limit_store;
+use lightbridge_authz_rest::rpc_authorize::is_budget_op_id;
+use lightbridge_authz_rest::rpc_permission_map::MAPPED_OP_ID_PERMISSIONS;
 use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
 use tower::ServiceExt;
@@ -635,4 +637,41 @@ async fn the_effective_schedule_read_rides_budget_read() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// The budget-surface half of the exhaustive gate test from `rpc_router_tests.rs`
+/// (`every_mapped_op_id_is_refused_without_its_required_permission`, #265).
+///
+/// Iterates every budget op-id in `MAPPED_OP_ID_PERMISSIONS` and asserts that a caller holding
+/// every permission EXCEPT the one required gets 403 from the RBAC gate. If the gate is
+/// unwired for a budget op (or a mapping is missing), the request reaches dispatch and returns
+/// something other than 403 -- the test fails with the op-id and the actual status.
+///
+/// The op-id list is derived mechanically from `MAPPED_OP_ID_PERMISSIONS` filtered through
+/// `is_budget_op_id`, so there is no hand-typed list that can silently drift.
+#[tokio::test]
+async fn rbac_gate_refuses_every_budget_op_without_its_permission() {
+    for (op_id, permission) in MAPPED_OP_ID_PERMISSIONS
+        .iter()
+        .filter(|(op_id, _)| is_budget_op_id(op_id))
+    {
+        let all_minus_one: PermissionSet = Permission::ALL
+            .iter()
+            .filter(|&&p| p != *permission)
+            .copied()
+            .collect();
+        let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(
+            MapBearer::new().with("caller", token_info("caller-subject", all_minus_one)),
+        );
+        let router = build_router(bearer);
+        let (status, body) = rpc_call(router, op_id, &json!({}), Some("caller")).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "budget op-id `{op_id}` (requires {permission:?}): caller without that permission \
+             must get 403 from the RBAC gate, not {status} -- the gate is unwired or the map \
+             is wrong: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
 }

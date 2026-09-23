@@ -28,6 +28,23 @@ impl QuotaTiers {
     /// `ProjectMember.quotaTier`. `None` (the field left unset) is always allowed. Otherwise: an
     /// empty catalogue accepts any value uncritically (the deliberate default -- see the type-level
     /// doc comment); a non-empty catalogue accepts only a configured tier `id`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lightbridge_authz_core::config::{QuotaTier, QuotaTiers};
+    ///
+    /// let tiers = QuotaTiers {
+    ///     tiers: vec![QuotaTier { id: "bronze".into(), name: "Bronze".into() }],
+    /// };
+    ///
+    /// assert!(tiers.is_allowed(None), "unset tier is always allowed");
+    /// assert!(tiers.is_allowed(Some("bronze")), "configured tier is allowed");
+    /// assert!(!tiers.is_allowed(Some("gold")), "unconfigured tier is rejected");
+    ///
+    /// let empty = QuotaTiers::default();
+    /// assert!(empty.is_allowed(Some("anything")), "empty catalogue accepts any value");
+    /// ```
     pub fn is_allowed(&self, tier: Option<&str>) -> bool {
         let Some(tier) = tier else {
             return true;
