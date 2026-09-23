@@ -660,9 +660,8 @@ async fn rbac_gate_refuses_every_budget_op_without_its_permission() {
             .filter(|&&p| p != *permission)
             .copied()
             .collect();
-        let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(
-            MapBearer::new().with("caller", token_info("caller-subject", all_minus_one)),
-        );
+        let bearer: Arc<dyn BearerTokenServiceTrait> =
+            Arc::new(MapBearer::new().with("caller", token_info("caller-subject", all_minus_one)));
         let router = build_router(bearer);
         let (status, body) = rpc_call(router, op_id, &json!({}), Some("caller")).await;
         assert_eq!(

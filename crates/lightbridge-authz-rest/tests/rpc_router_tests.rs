@@ -35,7 +35,9 @@ use std::sync::Arc;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use common::{MapBearer, Wire, admin_perms, as_json, rpc_call, rpc_call_at, token_info, viewer_perms};
+use common::{
+    MapBearer, Wire, admin_perms, as_json, rpc_call, rpc_call_at, token_info, viewer_perms,
+};
 use cratestack::SqlxIdempotencyStore;
 use cratestack::ratelimit::RateLimitStore;
 use lightbridge_authz_api::schema;
@@ -1314,12 +1316,19 @@ async fn every_mapped_op_id_is_refused_without_its_required_permission() {
             .filter(|&&p| p != *permission)
             .copied()
             .collect();
-        let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(
-            MapBearer::new().with("caller", token_info("caller-subject", all_minus_one)),
-        );
+        let bearer: Arc<dyn BearerTokenServiceTrait> =
+            Arc::new(MapBearer::new().with("caller", token_info("caller-subject", all_minus_one)));
         let (status, body) = if is_budget_op_id(op_id) {
             let router = build_budget_router_for_test(bearer);
-            rpc_call_at(router, "/budget", op_id, Wire::Cbor, &json!({}), Some("caller")).await
+            rpc_call_at(
+                router,
+                "/budget",
+                op_id,
+                Wire::Cbor,
+                &json!({}),
+                Some("caller"),
+            )
+            .await
         } else {
             let router = build_router(bearer, false);
             rpc_call(router, op_id, Wire::Cbor, &json!({}), Some("caller")).await
