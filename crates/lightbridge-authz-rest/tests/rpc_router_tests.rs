@@ -1304,10 +1304,24 @@ fn build_budget_router_for_test(bearer: Arc<dyn BearerTokenServiceTrait>) -> Rou
 /// `build_router` (the scope that accepts them). Mixing routers would make op-ids appear correct
 /// when they returned 404 instead of 403.
 ///
-/// This covers all 57 currently-mapped op-ids, complementing:
+/// This covers every op-id in `MAPPED_OP_ID_PERMISSIONS` (the list is derived, so its length is
+/// not restated here and cannot drift), complementing:
 /// - `rbac_gate_denies_viewer_on_every_mutating_op` (viewer blocked even with some permissions),
 /// - `rbac_gate_denies_unmapped_and_locked_ops_even_for_admin` (fail-closed for unknown ops),
 /// - `budget_gated_op_ids_are_unreachable_on_authz_api_regardless_of_permission` (scope cutover).
+///
+/// Budget op-ids are deliberately covered twice: here (routed to
+/// `build_budget_router_for_test` mid-sweep) and again by
+/// `rbac_gate_refuses_every_budget_op_without_its_permission` (`budget_router_tests.rs`) against
+/// that file's own budget-router assembly. The two sweep different assembly paths; a regression
+/// in either assembly is caught by the other.
+///
+/// Each iteration is two-sided: the same op-id is also called with the FULL permission set and
+/// asserted NOT to be refused (`assert_ne`), so a gate that denies unconditionally — a middleware
+/// ordering flip, a scope misconfiguration, `required_permission` returning `Some` for
+/// everything — cannot keep the refusal half green. With the full set the request is expected to
+/// get past the RBAC gate and fail deeper (dispatch against the dead Postgres), so any non-403
+/// confirms the 403 above was attributable to the missing permission.
 #[tokio::test]
 async fn every_mapped_op_id_is_refused_without_its_required_permission() {
     for (op_id, permission) in MAPPED_OP_ID_PERMISSIONS {
@@ -1316,22 +1330,50 @@ async fn every_mapped_op_id_is_refused_without_its_required_permission() {
             .filter(|&&p| p != *permission)
             .copied()
             .collect();
-        let bearer: Arc<dyn BearerTokenServiceTrait> =
+        let bearer_refused: Arc<dyn BearerTokenServiceTrait> =
             Arc::new(MapBearer::new().with("caller", token_info("caller-subject", all_minus_one)));
-        let (status, body) = if is_budget_op_id(op_id) {
-            let router = build_budget_router_for_test(bearer);
-            rpc_call_at(
-                router,
+        let bearer_permitted: Arc<dyn BearerTokenServiceTrait> = Arc::new(MapBearer::new().with(
+            "caller",
+            token_info("caller-subject", Permission::ALL.iter().copied().collect()),
+        ));
+        let ((status, body), (control_status, control_body)) = if is_budget_op_id(op_id) {
+            let refused = rpc_call_at(
+                build_budget_router_for_test(bearer_refused),
                 "/budget",
                 op_id,
                 Wire::Cbor,
                 &json!({}),
                 Some("caller"),
             )
-            .await
+            .await;
+            let permitted = rpc_call_at(
+                build_budget_router_for_test(bearer_permitted),
+                "/budget",
+                op_id,
+                Wire::Cbor,
+                &json!({}),
+                Some("caller"),
+            )
+            .await;
+            (refused, permitted)
         } else {
-            let router = build_router(bearer, false);
-            rpc_call(router, op_id, Wire::Cbor, &json!({}), Some("caller")).await
+            let refused = rpc_call(
+                build_router(bearer_refused, false),
+                op_id,
+                Wire::Cbor,
+                &json!({}),
+                Some("caller"),
+            )
+            .await;
+            let permitted = rpc_call(
+                build_router(bearer_permitted, false),
+                op_id,
+                Wire::Cbor,
+                &json!({}),
+                Some("caller"),
+            )
+            .await;
+            (refused, permitted)
         };
         assert_eq!(
             status,
@@ -1339,6 +1381,14 @@ async fn every_mapped_op_id_is_refused_without_its_required_permission() {
             "op-id `{op_id}` (requires {permission:?}): caller without that permission must get \
              403 from the RBAC gate, not {status} — the gate is unwired or the map is wrong: {}",
             String::from_utf8_lossy(&body)
+        );
+        assert_ne!(
+            control_status,
+            StatusCode::FORBIDDEN,
+            "op-id `{op_id}` (requires {permission:?}): a caller holding EVERY permission must \
+             not be refused by the RBAC gate, but got {control_status} — the refusal half's 403 \
+             is not attributable to the missing permission: {}",
+            String::from_utf8_lossy(&control_body)
         );
     }
 }

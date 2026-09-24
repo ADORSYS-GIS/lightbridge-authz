@@ -648,7 +648,15 @@ async fn the_effective_schedule_read_rides_budget_read() {
 /// something other than 403 -- the test fails with the op-id and the actual status.
 ///
 /// The op-id list is derived mechanically from `MAPPED_OP_ID_PERMISSIONS` filtered through
-/// `is_budget_op_id`, so there is no hand-typed list that can silently drift.
+/// `is_budget_op_id`, so there is no hand-typed list that can silently drift. Budget op-ids are
+/// deliberately covered twice: here, against THIS file's own `build_router` assembly, and again
+/// by the `rpc_router_tests.rs` sweep, which routes budget op-ids through its own
+/// `build_budget_router_for_test`. A regression in either assembly is caught by the other.
+///
+/// Each iteration is two-sided, mirroring `rpc_router_tests.rs`: the same op-id is also called
+/// with the FULL permission set and asserted NOT to be refused, so a gate that denies
+/// unconditionally cannot keep the refusal half green. With the full set the request is expected
+/// to get past the RBAC gate and fail deeper (dispatch against the dead Postgres).
 #[tokio::test]
 async fn rbac_gate_refuses_every_budget_op_without_its_permission() {
     for (op_id, permission) in MAPPED_OP_ID_PERMISSIONS
@@ -660,10 +668,15 @@ async fn rbac_gate_refuses_every_budget_op_without_its_permission() {
             .filter(|&&p| p != *permission)
             .copied()
             .collect();
-        let bearer: Arc<dyn BearerTokenServiceTrait> =
+        let bearer_refused: Arc<dyn BearerTokenServiceTrait> =
             Arc::new(MapBearer::new().with("caller", token_info("caller-subject", all_minus_one)));
-        let router = build_router(bearer);
-        let (status, body) = rpc_call(router, op_id, &json!({}), Some("caller")).await;
+        let bearer_permitted: Arc<dyn BearerTokenServiceTrait> = Arc::new(MapBearer::new().with(
+            "caller",
+            token_info("caller-subject", Permission::ALL.iter().copied().collect()),
+        ));
+        let router_refused = build_router(bearer_refused);
+        let router_permitted = build_router(bearer_permitted);
+        let (status, body) = rpc_call(router_refused, op_id, &json!({}), Some("caller")).await;
         assert_eq!(
             status,
             StatusCode::FORBIDDEN,
@@ -671,6 +684,16 @@ async fn rbac_gate_refuses_every_budget_op_without_its_permission() {
              must get 403 from the RBAC gate, not {status} -- the gate is unwired or the map \
              is wrong: {}",
             String::from_utf8_lossy(&body)
+        );
+        let (control_status, control_body) =
+            rpc_call(router_permitted, op_id, &json!({}), Some("caller")).await;
+        assert_ne!(
+            control_status,
+            StatusCode::FORBIDDEN,
+            "budget op-id `{op_id}` (requires {permission:?}): a caller holding EVERY permission \
+             must not be refused by the RBAC gate, but got {control_status} -- the refusal \
+             half's 403 is not attributable to the missing permission: {}",
+            String::from_utf8_lossy(&control_body)
         );
     }
 }
