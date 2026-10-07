@@ -16,6 +16,12 @@
 //! `ON CONFLICT (idempotency_key) DO NOTHING` path — because ADR-0009 makes the ledger
 //! append-only and a double grant has no undo.
 //!
+//! ## The same grant, booked again when a month begins
+//!
+//! The key carries the period, so the grant is per (account, **month**), yet only creation booked
+//! one. [`StartingGrantService::book_period_start`] (driven by [`crate::period_start`]) books the
+//! same amount under the same key: a grant already under that key is a replay, never a second one.
+//!
 //! ## Why it is not in the account insert's own transaction
 //!
 //! `accounts` is written by `lightbridge-authz-api-key`'s `StoreRepo::create_account`, a crate
@@ -35,10 +41,9 @@ use crate::period::Period;
 use crate::policy_store::PolicyStore;
 use crate::repo::{BudgetGrant, BudgetRepo, GrantRequest};
 use crate::reset_schedule::ResetScheduleRepo;
-use crate::snapshot::BudgetSnapshotReader;
 use crate::snapshot_store::SnapshotStore;
 use crate::source::GrantSource;
-use crate::starting_grant_amount::{StartingAmount, starting_grant_idempotency_key};
+use crate::starting_grant_amount::{Occasion, StartingAmount, starting_grant_idempotency_key};
 
 /// Books the starting grant. Built from the pool alone so every construction site of the account
 /// handler gets one — there is no "server without starting grants" configuration, and an optional
@@ -115,9 +120,42 @@ impl StartingGrantService {
         budget_account_id: &str,
         now: DateTime<Utc>,
     ) -> Result<BudgetGrant, BudgetError> {
+        self.book_for(budget_account_id, now, Occasion::AccountCreation)
+            .await
+    }
+
+    /// The month-start grant: [`Self::book`]'s amount and idempotency key, so an account that
+    /// already holds this period's grant resolves to it. Only the ledger `reason` differs.
+    pub async fn book_period_start(
+        &self,
+        budget_account_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<BudgetGrant, BudgetError> {
+        self.book_for(budget_account_id, now, Occasion::PeriodStart)
+            .await
+    }
+
+    /// [`Self::book_period_start`] for the period beginning at `period_start`, booked BEFORE it.
+    /// Same key as the post-boundary pass, which finds it present; moves only that period.
+    pub async fn book_period_start_ahead(
+        &self,
+        budget_account_id: &str,
+        period_start: DateTime<Utc>,
+    ) -> Result<BudgetGrant, BudgetError> {
+        self.book_for(budget_account_id, period_start, Occasion::PeriodStartAhead)
+            .await
+    }
+
+    async fn book_for(
+        &self,
+        budget_account_id: &str,
+        now: DateTime<Utc>,
+        occasion: Occasion,
+    ) -> Result<BudgetGrant, BudgetError> {
         let period = Period::current(now);
         let amount = self.resolve_amount(budget_account_id).await?;
         let idempotency_key = starting_grant_idempotency_key(&period, budget_account_id);
+        let reason = amount.reason_for(occasion, &period);
 
         let grant = self
             .budget_repo
@@ -132,7 +170,7 @@ impl StartingGrantService {
                 // that run would have (`docs/budget-cli.md`, "The $8-vs-$15 rule").
                 source: GrantSource::Automatic,
                 actor_id: None,
-                reason: Some(amount.reason()),
+                reason: Some(reason),
                 policy_revision: None,
                 matched_rule_ids: None,
                 idempotency_key: Some(idempotency_key),
@@ -141,19 +179,21 @@ impl StartingGrantService {
             })
             .await?;
 
-        self.snapshots.touch(budget_account_id).await?;
+        self.snapshots.touch_after_commit(budget_account_id).await;
 
-        tracing::info!(
-            budget_account_id = %budget_account_id,
-            grant_id = %grant.id,
-            period = %grant.period,
-            amount_micros = grant.amount_micros,
-            rule = match amount {
-                StartingAmount::Schedule { .. } => "effective_schedule",
-                StartingAmount::PolicyDefault { .. } => "policy_starting_amount",
-            },
-            "booked the starting grant for a new account"
-        );
+        if let Occasion::AccountCreation = occasion {
+            tracing::info!(
+                budget_account_id = %budget_account_id,
+                grant_id = %grant.id,
+                period = %grant.period,
+                amount_micros = grant.amount_micros,
+                rule = match amount {
+                    StartingAmount::Schedule { .. } => "effective_schedule",
+                    StartingAmount::PolicyDefault { .. } => "policy_starting_amount",
+                },
+                "booked the starting grant for a new account"
+            );
+        }
         Ok(grant)
     }
 }
