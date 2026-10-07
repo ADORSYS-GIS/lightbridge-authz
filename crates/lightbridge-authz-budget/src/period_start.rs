@@ -1,4 +1,5 @@
-//! The month-start pass: every real account holds its starting grant for the CURRENT period.
+//! The month-start pass: every real account holds its starting grant for the CURRENT period, and
+//! during the last [`PREBOOK_WINDOW`] of a month, for the NEXT one too (#765).
 //!
 //! ## The defect this closes
 //!
@@ -13,12 +14,23 @@
 //!
 //! One `SELECT` finds the accounts that do not yet hold `budget-start-<period>-<account_id>`
 //! (an anti-join on [`crate::starting_grant_amount::starting_grant_key_prefix`]); each is booked
-//! through [`StartingGrantService::book_period_start`], never a raw `INSERT` — the ledger has one
-//! writer (ADR-0009). In steady state the `SELECT` returns nothing, so a tick takes no row lock.
+//! through [`StartingGrantService`], never a raw `INSERT` — the ledger has one writer (ADR-0009).
+//! In steady state the `SELECT` returns nothing, so a tick takes no row lock.
 //!
-//! The key is the whole contract. A grant already under it — an account created this month, or
-//! funded by an operator's Job under the same key — drops out of the `SELECT`, and if it were
-//! booked anyway [`crate::repo::BudgetRepo::grant`]'s `ON CONFLICT` replay returns the existing row.
+//! Booking only after midnight would still leave every active account at `0` until the first tick
+//! after it: the snapshot refresher rolls a reading into the new period within seconds, so that is
+//! up to one tick interval of `402` at every boundary. So in the last [`PREBOOK_WINDOW`] the same
+//! pass also runs for the next period, current period first. Outside the window it is exactly one
+//! `SELECT`. An account created between the pre-book and midnight has only its creation grant and
+//! is funded by the first pass after midnight, like any other missing one.
+//!
+//! **A grant into the next period cannot move this one.** `effective_balance` filters by
+//! `period`, and the snapshot delta [`crate::repo::BudgetRepo::grant`] applies is guarded on
+//! `period = $2`, so a stored reading for the current month is untouched until it rolls over.
+//!
+//! The key is the whole contract. A grant already under it — an account created this month, funded
+//! ahead of the boundary, or funded by an operator's Job under the same key — drops out of the
+//! `SELECT`, and if it were booked anyway the `ON CONFLICT` replay returns the existing row.
 //! Presence of the key is what counts, not whether the row is revoked: a revocation is a decision
 //! this pass must not undo.
 //!
@@ -33,24 +45,39 @@
 //!
 //! ## Failure handling
 //!
-//! One account failing (say its schedule read errors) is counted and the pass moves on: stopping at
-//! the first failure would let one bad account leave every account behind it at a ceiling of `0`.
-//! Only a failure to enumerate the missing accounts is an `Err`. Nothing here ever grants more on
-//! failure — an account that could not be funded stays at `0` and is retried on the next tick.
+//! One account failing is counted and the pass moves on: stopping at the first failure would let
+//! one bad account leave every account behind it at a ceiling of `0`. Failing to enumerate the
+//! CURRENT period's missing accounts is an `Err`; failing to enumerate the next one is recorded in
+//! its [`PeriodReport`] instead, so it cannot discard what the current pass already did. Nothing
+//! here grants more on failure — an unfunded account stays at `0` and is retried on the next tick.
 //!
 //! The amount is [`StartingGrantService::resolve_amount`]'s, so after this pass the reset schedule
 //! that produced it is a `delta = 0` no-op (the `$8`-vs-`$15` rule, [`crate::starting_grant_amount`]).
-//! Resetting an account whose spend is unavailable is still deferred by the scheduler, unchanged.
+//! The scheduler's own deferral of an account whose spend is unavailable is unchanged; whether a
+//! reset window should read an empty spend as zero is an open owner ruling (#765, "Out of Scope").
 
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use lightbridge_authz_core::db::DbPoolTrait;
 
 use crate::error::BudgetError;
 use crate::period::Period;
+pub use crate::period_start_report::{PeriodReport, PeriodStartReport};
+use crate::remaining::next_period_start_utc;
 use crate::starting_grant::StartingGrantService;
 use crate::starting_grant_amount::starting_grant_key_prefix;
+
+/// How long before a month ends the next month's grants are booked.
+///
+/// Wide enough to be robust, narrow enough to stay honest. The loop wakes every 60 s and the pass is
+/// idempotent, so an hour is about sixty independent chances to land the pre-book before midnight —
+/// a database blip, a slow pass over a large estate, or a replica restart cannot make it miss. It
+/// is not a day because the amount is resolved when the grant is booked, and the ledger is
+/// append-only (a wrong amount can only be corrected by a `correction` row): the longer the window,
+/// the longer an operator's last edit to a schedule or the policy's `starting_amount_micros` is
+/// locked out of the coming month. Outside it a wake is exactly one `SELECT`.
+const PREBOOK_WINDOW: Duration = Duration::hours(1);
 
 /// Same predicate as `known_account` and the `global` schedule scope: an `accounts` row whose
 /// owner resolves to a `users` row. `$1` is the key prefix, so the key's shape stays defined once.
@@ -60,19 +87,6 @@ const MISSING_START_GRANTS_SQL: &str = "SELECT a.id FROM accounts a \
          SELECT 1 FROM budget_grants g WHERE g.idempotency_key = $1::text || a.id \
      ) \
      ORDER BY a.created_at ASC";
-
-/// What one pass did.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct PeriodStartReport {
-    /// Accounts without this period's grant when the pass looked.
-    pub missing: usize,
-    /// Accounts that now hold it — including any a concurrent replica funded first.
-    pub funded: usize,
-    /// Accounts that could not be funded; the next tick retries them.
-    pub failed: usize,
-    /// The first failure's message, so a summary log line can name a cause without N lines.
-    pub first_error: Option<String>,
-}
 
 /// Books the month-start grant for every account that lacks one. Stateless over the pool, so every
 /// replica builds its own.
@@ -96,24 +110,54 @@ impl PeriodStartGrants {
             .map_err(|err| BudgetError::StorageFailed(err.to_string()))
     }
 
-    /// One pass for the period `now` falls in. `now` is a parameter, not a clock read, and is the
-    /// same instant [`StartingGrantService::book_period_start`] derives its period and key from,
-    /// so the `SELECT` and the writes can never disagree about which month is meant.
+    /// One pass at `now`. `now` is a parameter, not a clock read; the current period's grants are
+    /// booked at `now`, the next period's at its first instant, so each derives its own key.
     pub async fn run(&self, now: DateTime<Utc>) -> Result<PeriodStartReport, BudgetError> {
-        let missing = self.missing_accounts(&Period::current(now)).await?;
-        let mut report = PeriodStartReport {
-            missing: missing.len(),
-            ..PeriodStartReport::default()
+        let period = Period::current(now);
+        let current = self.book_missing(&period, now, false).await?;
+
+        let boundary = next_period_start_utc(&period);
+        let ahead = if now >= boundary - PREBOOK_WINDOW {
+            let next = Period::current(boundary);
+            Some(match self.book_missing(&next, boundary, true).await {
+                Ok(report) => report,
+                Err(err) => {
+                    tracing::warn!(period = %next, error = %err, "could not list accounts to pre-book");
+                    PeriodReport {
+                        first_error: Some(err.to_string()),
+                        ..PeriodReport::new(next, 0)
+                    }
+                }
+            })
+        } else {
+            None
         };
+        Ok(PeriodStartReport { current, ahead })
+    }
+
+    async fn book_missing(
+        &self,
+        period: &Period,
+        at: DateTime<Utc>,
+        ahead: bool,
+    ) -> Result<PeriodReport, BudgetError> {
+        let missing = self.missing_accounts(period).await?;
+        let mut report = PeriodReport::new(period.clone(), missing.len());
 
         for account_id in &missing {
-            match self.starting.book_period_start(account_id, now).await {
+            let booked = if ahead {
+                self.starting.book_period_start_ahead(account_id, at).await
+            } else {
+                self.starting.book_period_start(account_id, at).await
+            };
+            match booked {
                 Ok(_) => report.funded += 1,
                 Err(err) => {
                     report.failed += 1;
                     if report.first_error.is_none() {
                         tracing::warn!(
                             budget_account_id = %account_id,
+                            period = %period,
                             error = %err,
                             "could not book the month-start grant; retrying on the next tick"
                         );

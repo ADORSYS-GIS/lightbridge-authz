@@ -21,6 +21,8 @@ use lightbridge_authz_budget::remaining::{Remaining, RemainingReader, RemainingS
 use lightbridge_authz_budget::repo::{BudgetRepo, GrantRequest};
 use lightbridge_authz_budget::reset_schedule::{ResetMode, ScheduleScopeKind};
 use lightbridge_authz_budget::reset_scheduler::ResetScheduler;
+use lightbridge_authz_budget::snapshot::BudgetSnapshotReader;
+use lightbridge_authz_budget::snapshot_store::SnapshotStore;
 use lightbridge_authz_budget::source::GrantSource;
 use lightbridge_authz_budget::spend::{Spend, SpendObservation, SpendReader};
 use lightbridge_authz_budget::starting_grant::StartingGrantService;
@@ -198,7 +200,14 @@ async fn the_first_pass_of_a_month_funds_every_account_at_the_schedule_target(po
 
     let report = g.pass.run(utc(2026, 10, 1, 0, 0, 15)).await.expect("pass");
 
-    assert_eq!((report.missing, report.funded, report.failed), (2, 2, 0));
+    assert_eq!(
+        (
+            report.current.missing,
+            report.current.funded,
+            report.current.failed
+        ),
+        (2, 2, 0)
+    );
     for account_id in [&funded_in_september, &never_funded] {
         assert_eq!(
             ceiling(&g, account_id, "2026-10", midnight).await,
@@ -246,9 +255,16 @@ async fn a_second_pass_books_nothing(pool: PgPool) {
     let first_pass = g.pass.run(utc(2026, 10, 1, 0, 0, 15)).await.expect("pass");
     let second_pass = g.pass.run(utc(2026, 10, 1, 0, 1, 15)).await.expect("pass");
 
-    assert_eq!((first_pass.missing, first_pass.funded), (2, 2));
     assert_eq!(
-        (second_pass.missing, second_pass.funded, second_pass.failed),
+        (first_pass.current.missing, first_pass.current.funded),
+        (2, 2)
+    );
+    assert_eq!(
+        (
+            second_pass.current.missing,
+            second_pass.current.funded,
+            second_pass.current.failed
+        ),
         (0, 0, 0),
         "steady state: nothing is missing, so nothing is booked"
     );
@@ -296,7 +312,7 @@ async fn a_grant_an_operator_booked_under_the_key_is_not_repeated(pool: PgPool) 
     let report = g.pass.run(utc(2026, 10, 1, 0, 0, 15)).await.expect("pass");
 
     assert_eq!(
-        (report.missing, report.funded),
+        (report.current.missing, report.current.funded),
         (1, 1),
         "only the unbridged"
     );
@@ -331,7 +347,7 @@ async fn an_account_created_mid_month_is_not_granted_twice(pool: PgPool) {
         .expect("the creation-time grant must book");
     let report = g.pass.run(utc(2026, 10, 14, 9, 1, 0)).await.expect("pass");
 
-    assert_eq!(report.missing, 0);
+    assert_eq!(report.current.missing, 0);
     let rows = ledger(&pool, &account_id, "2026-10").await;
     assert_eq!(rows.len(), 1);
     assert_eq!(
@@ -486,7 +502,7 @@ async fn a_reset_window_that_opens_with_the_month_finds_a_funded_ceiling(pool: P
 
     let pass = report.period_start.expect("the pass must succeed");
     let reset = report.reset.expect("the reset tick must succeed");
-    assert_eq!(pass.funded, 1);
+    assert_eq!(pass.current.funded, 1);
     assert_eq!(reset.claimed_schedule_ids, vec![schedule_id]);
     assert_eq!(
         reset.grants_written, 0,
@@ -564,8 +580,15 @@ async fn one_account_failing_does_not_stop_the_others_and_never_over_grants(pool
     let now = utc(2026, 10, 1, 0, 0, 15);
     let report = g.pass.run(now).await.expect("enumeration still succeeds");
 
-    assert_eq!((report.missing, report.funded, report.failed), (2, 1, 1));
-    assert!(report.first_error.is_some());
+    assert_eq!(
+        (
+            report.current.missing,
+            report.current.funded,
+            report.current.failed
+        ),
+        (2, 1, 1)
+    );
+    assert!(report.current.first_error.is_some());
     assert_eq!(ceiling(&g, &covered, "2026-10", now).await, 5_000_000);
     assert_eq!(
         ceiling(&g, &uncovered, "2026-10", now).await,
@@ -604,11 +627,291 @@ async fn concurrent_passes_book_each_account_exactly_once(pool: PgPool) {
             .await
             .expect("task")
             .expect("a race must not surface as an error");
-        assert_eq!(report.failed, 0);
-        assert_eq!(report.funded, report.missing);
+        assert_eq!(report.current.failed, 0);
+        assert_eq!(report.current.funded, report.current.missing);
     }
 
     for account_id in &accounts {
         assert_eq!(ledger(&pool, account_id, "2026-10").await.len(), 1);
     }
+}
+
+/// Two accounts funded for 2026-10 by the first pass of that month, under a global $8 schedule
+/// whose next window is far from every instant below.
+async fn october_estate(pool: &PgPool) -> (Graph, String, String) {
+    let first = insert_account(pool).await;
+    let second = insert_account(pool).await;
+    seed_weekly_monday(
+        pool,
+        "Everyone $8",
+        ScheduleScopeKind::Global,
+        None,
+        TARGET_MICROS,
+        utc(2026, 11, 2, 0, 0, 0),
+    )
+    .await;
+    let g = graph(pool);
+    g.pass.run(utc(2026, 10, 1, 0, 0, 15)).await.expect("pass");
+    (g, first, second)
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_last_hour_pre_books_the_next_month_and_leaves_this_one_alone(pool: PgPool) {
+    let (g, first, second) = october_estate(&pool).await;
+    let store = SnapshotStore::new(g.core.clone());
+    store.touch(&first).await.expect("touch");
+    store
+        .store_reading(
+            &first,
+            &period("2026-10"),
+            TARGET_MICROS,
+            3_000_000,
+            utc(2026, 11, 2, 0, 0, 0),
+        )
+        .await
+        .expect("storing a reading must succeed");
+    let before = store.read(&first).await.expect("read").expect("row");
+    assert_eq!(before.remaining_micros, Some(5_000_000));
+
+    let now = utc(2026, 10, 31, 23, 30, 0);
+    let report = g.pass.run(now).await.expect("pass");
+
+    assert_eq!(
+        (report.current.missing, report.current.funded),
+        (0, 0),
+        "october is already funded"
+    );
+    let ahead = report
+        .ahead
+        .expect("inside the window the next month is run too");
+    assert_eq!(ahead.period, period("2026-11"));
+    assert_eq!((ahead.missing, ahead.funded, ahead.failed), (2, 2, 0));
+    for account_id in [&first, &second] {
+        assert_eq!(ceiling(&g, account_id, "2026-11", now).await, TARGET_MICROS);
+        assert_eq!(
+            ceiling(&g, account_id, "2026-10", now).await,
+            TARGET_MICROS,
+            "a grant into november must not move october's ceiling"
+        );
+        assert_eq!(ledger(&pool, account_id, "2026-10").await.len(), 1);
+    }
+    let after = store.read(&first).await.expect("read").expect("row");
+    assert_eq!(after.period, Some(period("2026-10")));
+    assert_eq!(after.ceiling_micros, before.ceiling_micros);
+    assert_eq!(after.remaining_micros, before.remaining_micros);
+    assert_eq!(
+        after.refreshed_at, before.refreshed_at,
+        "the snapshot delta is guarded on period, so a november grant must not touch it"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn outside_the_window_nothing_is_booked_for_the_next_month(pool: PgPool) {
+    let (g, first, second) = october_estate(&pool).await;
+
+    let report = g
+        .pass
+        .run(utc(2026, 10, 31, 22, 59, 0))
+        .await
+        .expect("pass");
+
+    assert!(report.ahead.is_none());
+    for account_id in [&first, &second] {
+        assert!(ledger(&pool, account_id, "2026-11").await.is_empty());
+    }
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_window_opens_exactly_one_hour_before_the_boundary(pool: PgPool) {
+    let (g, _first, _second) = october_estate(&pool).await;
+
+    let just_before = g
+        .pass
+        .run(utc(2026, 10, 31, 22, 59, 59))
+        .await
+        .expect("pass");
+    let at_the_edge = g.pass.run(utc(2026, 10, 31, 23, 0, 0)).await.expect("pass");
+
+    assert!(just_before.ahead.is_none());
+    assert_eq!(at_the_edge.ahead.expect("window open").funded, 2);
+}
+
+/// The reason this exists: with nothing run after midnight, the ceiling for the new month is
+/// already there when the snapshot refresher rolls into it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_boundary_gap_is_closed_before_any_post_midnight_pass_runs(pool: PgPool) {
+    let (g, first, _second) = october_estate(&pool).await;
+    g.pass
+        .run(utc(2026, 10, 31, 23, 30, 0))
+        .await
+        .expect("pass");
+
+    let just_after = utc(2026, 11, 1, 0, 0, 1);
+    let spend: Arc<dyn SpendReader> = Arc::new(MapSpendReader::default());
+    let repo = Arc::new(BudgetRepo::new(g.core.clone()));
+    let scheduler = Arc::new(ResetScheduler::new(
+        g.core.clone(),
+        repo.clone(),
+        spend.clone(),
+    ));
+    let remaining = RemainingService::new(repo, spend, scheduler)
+        .remaining_for_account(&first, &period("2026-11"), just_after)
+        .await
+        .expect("the ledger is readable");
+
+    let Remaining::Known(known) = remaining else {
+        panic!("expected a known remaining balance, got {remaining:?}");
+    };
+    assert_eq!(known.ceiling_micros, TARGET_MICROS);
+    assert!(
+        known.remaining_micros > 0,
+        "the gateway must see budget at 00:00:01, got {}",
+        known.remaining_micros
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_first_post_midnight_pass_books_nothing_for_pre_booked_accounts(pool: PgPool) {
+    let (g, first, second) = october_estate(&pool).await;
+    g.pass
+        .run(utc(2026, 10, 31, 23, 30, 0))
+        .await
+        .expect("pass");
+
+    let report = g.pass.run(utc(2026, 11, 1, 0, 0, 15)).await.expect("pass");
+
+    assert_eq!(
+        (
+            report.current.missing,
+            report.current.funded,
+            report.current.failed
+        ),
+        (0, 0, 0)
+    );
+    assert!(report.ahead.is_none());
+    for account_id in [&first, &second] {
+        let rows = ledger(&pool, account_id, "2026-11").await;
+        assert_eq!(rows.len(), 1, "same key, so a replay and no new row");
+        assert_eq!(
+            rows[0].2.as_deref(),
+            Some(starting_grant_idempotency_key(&period("2026-11"), account_id).as_str())
+        );
+    }
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn repeated_wakes_inside_the_window_book_the_next_month_once(pool: PgPool) {
+    let (g, first, second) = october_estate(&pool).await;
+
+    let one = g
+        .pass
+        .run(utc(2026, 10, 31, 23, 30, 0))
+        .await
+        .expect("pass");
+    let two = g
+        .pass
+        .run(utc(2026, 10, 31, 23, 31, 0))
+        .await
+        .expect("pass");
+
+    assert_eq!(one.ahead.expect("window open").funded, 2);
+    let two = two.ahead.expect("window open");
+    assert_eq!((two.missing, two.funded), (0, 0));
+    for account_id in [&first, &second] {
+        assert_eq!(ledger(&pool, account_id, "2026-11").await.len(), 1);
+    }
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_account_created_after_the_pre_book_is_funded_by_the_first_post_midnight_pass(
+    pool: PgPool,
+) {
+    let (g, first, _second) = october_estate(&pool).await;
+    g.pass
+        .run(utc(2026, 10, 31, 23, 30, 0))
+        .await
+        .expect("pass");
+    let late = insert_account(&pool).await;
+    g.starting
+        .book(&late, utc(2026, 10, 31, 23, 45, 0))
+        .await
+        .expect("the creation-time grant must book");
+    assert_eq!(
+        ceiling(&g, &late, "2026-11", utc(2026, 11, 1, 0, 0, 1)).await,
+        0,
+        "precondition: the late account has only its october grant"
+    );
+
+    let now = utc(2026, 11, 1, 0, 0, 15);
+    let report = g.pass.run(now).await.expect("pass");
+
+    assert_eq!(
+        (
+            report.current.missing,
+            report.current.funded,
+            report.current.failed
+        ),
+        (1, 1, 0)
+    );
+    assert_eq!(ceiling(&g, &late, "2026-11", now).await, TARGET_MICROS);
+    assert_eq!(ledger(&pool, &first, "2026-11").await.len(), 1);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn december_pre_books_january_of_the_next_year(pool: PgPool) {
+    let first = insert_account(&pool).await;
+    let second = insert_account(&pool).await;
+    seed_weekly_monday(
+        &pool,
+        "Everyone $8",
+        ScheduleScopeKind::Global,
+        None,
+        TARGET_MICROS,
+        utc(2027, 1, 4, 0, 0, 0),
+    )
+    .await;
+    let g = graph(&pool);
+
+    let now = utc(2026, 12, 31, 23, 30, 0);
+    let report = g.pass.run(now).await.expect("pass");
+
+    let ahead = report.ahead.expect("inside the window");
+    assert_eq!(ahead.period, period("2027-01"));
+    assert_eq!((ahead.missing, ahead.funded, ahead.failed), (2, 2, 0));
+    for account_id in [&first, &second] {
+        let rows = ledger(&pool, account_id, "2027-01").await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].2.as_deref(),
+            Some(starting_grant_idempotency_key(&period("2027-01"), account_id).as_str())
+        );
+        assert_eq!(ceiling(&g, account_id, "2027-01", now).await, TARGET_MICROS);
+    }
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_pre_booked_grant_says_it_was_booked_ahead_of_the_boundary(pool: PgPool) {
+    let (g, first, _second) = october_estate(&pool).await;
+    let schedule_id: String = sqlx::query_scalar("SELECT id FROM budget_reset_schedules")
+        .fetch_one(&pool)
+        .await
+        .expect("the seeded schedule");
+
+    g.pass
+        .run(utc(2026, 10, 31, 23, 30, 0))
+        .await
+        .expect("pass");
+
+    let rows = ledger(&pool, &first, "2026-11").await;
+    assert_eq!(rows[0].1, "automatic");
+    assert_eq!(
+        rows[0].3.as_deref(),
+        Some(
+            format!(
+                "month-start grant for 2026-11, booked ahead of the period boundary, matching \
+                 reset schedule 'Everyone $8' ({schedule_id})"
+            )
+            .as_str()
+        )
+    );
 }

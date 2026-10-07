@@ -19,6 +19,7 @@ pub mod facts;
 mod known_account;
 pub mod period;
 pub mod period_start;
+mod period_start_report;
 pub mod policy_store;
 mod policy_store_sql;
 pub mod refill;
@@ -61,7 +62,7 @@ pub use effective_schedule::EffectiveSchedule;
 pub use error::BudgetError;
 pub use facts::Facts;
 pub use period::Period;
-pub use period_start::{PeriodStartGrants, PeriodStartReport};
+pub use period_start::{PeriodReport, PeriodStartGrants, PeriodStartReport};
 pub use policy_store::PolicyStore;
 pub use refill::{RefillRequest, RefillService, RefillStatus};
 pub use remaining::{

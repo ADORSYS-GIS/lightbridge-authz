@@ -10,7 +10,10 @@
 //! target twice. Both steps are handed the SAME `now`, so they cannot disagree about the month.
 //!
 //! The pass is a separate step, not a schedule: a schedule fires on its own cadence and cannot be
-//! "the first tick of every month" for every account, which is exactly the gap being closed.
+//! "the first tick of every month" for every account, which is exactly the gap being closed. In the
+//! last hour of a month the pass also books the NEXT month ([`crate::period_start`]), so a funded
+//! ceiling is already there when the snapshot refresher rolls into it at 00:00 UTC; the reset tick
+//! then finds it funded on the Monday-the-1st just the same.
 //!
 //! ## A failed pass does not stop the reset tick
 //!
@@ -32,7 +35,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 
 use crate::error::BudgetError;
-use crate::period_start::{PeriodStartGrants, PeriodStartReport};
+use crate::period_start::{PeriodReport, PeriodStartGrants, PeriodStartReport};
 use crate::reset_scheduler::{ResetScheduler, TickReport};
 
 /// What one wake did: both steps' outcomes, so neither hides the other's failure.
@@ -90,20 +93,12 @@ impl BudgetTicker {
 /// Silent in steady state: a wake that found nothing to fund and nothing due writes no line.
 fn log_tick(report: &BudgetTickReport) {
     match &report.period_start {
-        Ok(pass) if pass.missing == 0 => {}
-        Ok(pass) if pass.failed == 0 => tracing::info!(
-            missing = pass.missing,
-            funded = pass.funded,
-            "booked month-start grants"
-        ),
-        Ok(pass) => tracing::error!(
-            missing = pass.missing,
-            funded = pass.funded,
-            failed = pass.failed,
-            first_error = pass.first_error.as_deref().unwrap_or_default(),
-            "month-start grants incomplete; the unfunded accounts stay at a zero ceiling until the \
-             next tick retries them"
-        ),
+        Ok(pass) => {
+            log_period(&pass.current);
+            if let Some(ahead) = &pass.ahead {
+                log_period(ahead);
+            }
+        }
         Err(err) => tracing::error!(
             error = %err,
             "month-start pass failed; retrying on the next interval"
@@ -120,5 +115,26 @@ fn log_tick(report: &BudgetTickReport) {
             error = %err,
             "budget reset scheduler tick failed; retrying on the next interval"
         ),
+    }
+}
+
+fn log_period(pass: &PeriodReport) {
+    if pass.is_incomplete() {
+        tracing::error!(
+            period = %pass.period,
+            missing = pass.missing,
+            funded = pass.funded,
+            failed = pass.failed,
+            first_error = pass.first_error.as_deref().unwrap_or_default(),
+            "month-start grants incomplete; the unfunded accounts stay at a zero ceiling until the \
+             next tick retries them"
+        );
+    } else if pass.missing > 0 {
+        tracing::info!(
+            period = %pass.period,
+            missing = pass.missing,
+            funded = pass.funded,
+            "booked month-start grants"
+        );
     }
 }

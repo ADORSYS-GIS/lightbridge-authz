@@ -307,8 +307,9 @@ tier lookup, independent of the refill path.
 
 ## Month-start grants: why the 1st of the month is not a `402` for everyone
 
-The gateway's ceiling is `SUM(budget_grants WHERE period = <current UTC month>)`
-(`crates/lightbridge-authz-budget/src/repo.rs` `EFFECTIVE_BALANCE_SQL`, read by
+Tracked in [#765](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/765). The gateway's
+ceiling is `SUM(budget_grants WHERE period = <current UTC month>)`
+(`crates/lightbridge-authz-budget/src/repo.rs:124` `EFFECTIVE_BALANCE_SQL`, read by
 `remaining_service.rs` and `snapshot_refresh_one.rs`), and a grant belongs to exactly one month.
 Before the month-start pass nothing booked the next month's grant: `StartingGrantService::book` ran
 only at account creation, and a reset schedule fires on its own cadence (production's is weekly,
@@ -316,37 +317,51 @@ Monday). So at 00:00 UTC on the 1st every account's ceiling was `0` and the gate
 to everyone until the next window — observed in production on 2026-09-30, bridged for 2026-10 by a
 hand-run Job that booked the same rows under the same key.
 
-`BudgetTicker` (`budget_ticker.rs:61`) is now the one wake `start_budget_server` spawns
+`BudgetTicker` (`budget_ticker.rs:64`) is the one wake `start_budget_server` spawns
 (`server_budget.rs:238`). It runs the month-start pass, **then** the reset tick, both at the same
-`now`:
+`now`. In the last hour of a month (`PREBOOK_WINDOW`, `period_start.rs:80`) the pass runs twice,
+current period first, then the next one — **booked before midnight**, because the snapshot
+refresher's hot lane rolls readings into the new period within seconds of 00:00 UTC, and a pass that
+only ran after it would leave every active account at `0` for up to one tick interval at every
+boundary:
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Loop as BudgetTicker.spawn (budget_ticker.rs:77)
-    participant Pass as PeriodStartGrants.run (period_start.rs:102)
-    participant SG as StartingGrantService.book_period_start (starting_grant.rs:130)
+    participant Loop as BudgetTicker.spawn (budget_ticker.rs:81)
+    participant Pass as PeriodStartGrants.run (period_start.rs:115)
+    participant SG as StartingGrantService (starting_grant.rs:130, :141)
     participant Repo as BudgetRepo.grant (repo.rs:348)
     participant Reset as ResetScheduler.tick (reset_scheduler.rs:164)
 
     Loop->>Pass: run(now)
-    Pass->>Pass: SELECT accounts WHERE NOT EXISTS key budget-start-period-id (period_start.rs:57)
-    loop each missing account
+    Pass->>Pass: SELECT accounts WHERE NOT EXISTS key budget-start-period-id (period_start.rs:84)
+    loop each account missing the CURRENT period
         Pass->>SG: book_period_start(account, now)
         SG->>Repo: grant(automatic, idempotency_key)
         Note over Repo: balance row FOR UPDATE (repo.rs:368), then ON CONFLICT DO NOTHING (repo_grant_sql.rs:13)
         Repo-->>SG: the new row, or the existing one on a replay
-        SG->>SG: SnapshotStore.touch (starting_grant.rs:175)
+        SG->>SG: SnapshotStore.touch (starting_grant.rs:183)
     end
-    Pass-->>Loop: PeriodStartReport (missing, funded, failed)
+    opt now is within PREBOOK_WINDOW of the next period (period_start.rs:120)
+        Pass->>Pass: the same SELECT for the NEXT period
+        loop each account missing the NEXT period
+            Pass->>SG: book_period_start_ahead(account, next period start)
+            SG->>Repo: grant(automatic, key for the NEXT period)
+            Note over Repo: effective_balance filters by period and APPLY_GRANT_DELTA_SQL is guarded on period = $2 (snapshot_store.rs:60), so the current month does not move
+        end
+    end
+    Pass-->>Loop: PeriodStartReport (current, ahead), one PeriodReport per period
     Loop->>Reset: tick(now), delta = target - remaining against the funded ceiling
     Reset-->>Loop: TickReport
 ```
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Unfunded: 00:00 UTC on the 1st, ceiling = 0
-    Unfunded --> Funded: pass books budget-start-period-id
+    [*] --> Unfunded: the month begins and nothing is booked for it
+    Unfunded --> PreBooked: last hour of the previous month, pass books budget-start-period-id
+    PreBooked --> Funded: 00:00 UTC, the ceiling is already there
+    Unfunded --> Funded: first pass after midnight (account created too late to be pre-booked)
     Unfunded --> Unfunded: booking failed, counted, retried next wake
     Funded --> Funded: later wake, key present, not selected
     Funded --> Funded: reset window, delta = 0, no row
@@ -356,16 +371,34 @@ stateDiagram-v2
 
 **The key is the contract.** `budget-start-<period>-<account_id>` (`starting_grant_amount.rs`,
 `starting_grant_idempotency_key`; the pass derives its `SELECT` from `starting_grant_key_prefix`, so
-the shape is written once). An account created mid-month, or funded by an operator under that key,
-is never selected, and if booked anyway `BudgetRepo::grant`'s `ON CONFLICT` path returns the
-existing row. Presence of the key is what counts: a revoked grant is not re-booked, because
-revocation is a decision the pass must not undo.
+the shape is written once). An account created mid-month, pre-booked, or funded by an operator
+under that key is never selected, and if booked anyway `BudgetRepo::grant`'s `ON CONFLICT` path
+returns the existing row. A pre-booked grant is the very row the first post-midnight pass would have
+booked, so that pass finds the key present and books nothing. Presence of the key is what counts: a
+revoked grant is not re-booked, because revocation is a decision the pass must not undo.
 
-**Why the pass runs first.** On a Monday-the-1st the schedule window and the new period begin
-together. Funded first, the reset's `delta = target − remaining` is `0`; run in the other order the
-reset funds the account from `0` and the pass adds the starting grant on top, holding the target
-twice. `a_reset_window_that_opens_with_the_month_finds_a_funded_ceiling` fails for exactly that
-reason when the two calls are swapped.
+**A grant into the next month cannot move this one.** `effective_balance` filters by `period`, and
+the snapshot delta `BudgetRepo::grant` applies is guarded on `period = $2`
+(`snapshot_store.rs:60`), so a stored reading for the current month is untouched until it rolls
+over (`the_last_hour_pre_books_the_next_month_and_leaves_this_one_alone` goes red when that guard is
+removed). Its ledger `reason` says so: "month-start grant for 2026-11, booked ahead of the period
+boundary, …" (`starting_grant_amount.rs`). A pre-booked grant carries its own month's key, so it
+never counts toward the current month's balance.
+
+**Why a one-hour window.** The loop wakes every 60 s and the pass is idempotent, so an hour is about
+sixty chances to land before midnight — a database blip or a slow pass cannot make it miss. It is
+not a day because the amount is resolved when the grant is booked and the ledger is append-only (a
+wrong amount can only be corrected by a `correction`): the longer the window, the longer an
+operator's last edit to a schedule or to `starting_amount_micros` is locked out of the coming month.
+Outside the window a wake is exactly one `SELECT`. An account created between its last pre-booking
+wake and midnight has only its creation grant and is funded by the first pass after midnight, so the
+only accounts that can still see a `402` are the ones created in the last wake interval before the 1st.
+
+**Why the pass runs before the reset.** On a Monday-the-1st the schedule window and the new period
+begin together. Funded first, the reset's `delta = target − remaining` is `0`; run in the other
+order the reset funds the account from `0` and the pass adds the starting grant on top, holding the
+target twice. `a_reset_window_that_opens_with_the_month_finds_a_funded_ceiling` fails for exactly
+that reason when the two calls are swapped.
 
 **Replicas.** Every replica runs the pass. Two can pick the same account, and that is safe without
 a lock: `grant` takes the `(account, period)` balance row `FOR UPDATE` before inserting, so the
@@ -375,19 +408,24 @@ the committed grant is read back — a unique violation never surfaces as an err
 row, so two replicas walking the same list cannot deadlock.
 
 **Failure.** One account failing is counted and the pass moves on, so one bad account cannot leave
-every account behind it at `0`; only failing to enumerate is an `Err`. A failed pass is logged at
-`error` and does **not** stop the reset tick from running. Nothing here ever grants more on failure:
-an account that could not be funded stays at `0` until the next wake.
+every account behind it at `0`. Failing to enumerate the CURRENT period's missing accounts is an
+`Err`; failing to enumerate the next one is recorded in its `PeriodReport`, so it cannot discard
+what the current pass already did. A failed pass is logged at `error` and does **not** stop the
+reset tick from running. Nothing here ever grants more on failure: an account that could not be
+funded stays at `0` until the next wake.
 
 **Cost.** In steady state the `SELECT` matches nothing, books nothing and takes no row lock. Against
 5 000 accounts and a 205 000-row ledger it ran in 48 ms (hash anti-join, one scan of
 `budget_grants`) and 25 ms with the planner forced onto `budget_grants_idempotency_key_uidx`; the
-planner picks by its statistics, and both are per-minute, per-replica.
+planner picks by its statistics, and both are per-minute, per-replica. Inside the pre-book window a
+wake runs that `SELECT` twice.
 
 **Unchanged on purpose.** The reset scheduler's `Spend::Unavailable` deferral is untouched: an
 account whose spend cannot be read is still skipped by its reset. At the start of a month that is
 every account (no usage rows yet), which is exactly why the reset alone cannot fund them —
-`the_pass_funds_an_account_whose_reset_is_deferred_for_unavailable_spend`.
+`the_pass_funds_an_account_whose_reset_is_deferred_for_unavailable_spend`. Whether a reset window
+should treat `SpendObservation::Empty` as zero spend is a separate, still-open owner ruling: see
+[#765, "Out of Scope"](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/765).
 
 ## What is actually live versus merely implemented
 

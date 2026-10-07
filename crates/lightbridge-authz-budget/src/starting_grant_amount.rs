@@ -46,6 +46,17 @@ pub fn starting_grant_idempotency_key(period: &Period, budget_account_id: &str) 
     format!("{}{budget_account_id}", starting_grant_key_prefix(period))
 }
 
+/// Why a starting grant is booked: picks the ledger `reason` and whether to log, never the amount
+/// or the key — those must be identical for all three, which is the whole point. Only creation logs
+/// per account; [`crate::period_start`] logs one summary for the whole estate.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Occasion {
+    AccountCreation,
+    PeriodStart,
+    /// The next period's grant, booked before the boundary so the ceiling is never 0 after it.
+    PeriodStartAhead,
+}
+
 /// Where a starting grant's amount came from — recorded on the booked grant's `reason` and
 /// logged, so an operator reading the ledger can tell a schedule-matched grant from the policy
 /// fallback without re-deriving the precedence rule by hand.
@@ -87,6 +98,25 @@ impl StartingAmount {
     /// years old, and a ledger that says otherwise is wrong in the one column meant to be trusted.
     pub(crate) fn month_start_reason(&self, period: &Period) -> String {
         format!("month-start grant for {period}, {}", self.source_clause())
+    }
+
+    /// The reason for a grant booked ahead of `period`'s first instant (see
+    /// [`Occasion::PeriodStartAhead`]): the same source clause, plus the fact that it was booked
+    /// before the boundary, so the ledger never makes the grant look late or the account look new.
+    pub(crate) fn month_start_ahead_reason(&self, period: &Period) -> String {
+        format!(
+            "month-start grant for {period}, booked ahead of the period boundary, {}",
+            self.source_clause()
+        )
+    }
+
+    /// The `budget_grants.reason` for `occasion`.
+    pub(crate) fn reason_for(&self, occasion: Occasion, period: &Period) -> String {
+        match occasion {
+            Occasion::AccountCreation => self.reason(),
+            Occasion::PeriodStart => self.month_start_reason(period),
+            Occasion::PeriodStartAhead => self.month_start_ahead_reason(period),
+        }
     }
 
     fn source_clause(&self) -> String {

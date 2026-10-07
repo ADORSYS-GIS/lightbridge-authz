@@ -44,7 +44,7 @@ use crate::reset_schedule::ResetScheduleRepo;
 use crate::snapshot::BudgetSnapshotReader;
 use crate::snapshot_store::SnapshotStore;
 use crate::source::GrantSource;
-use crate::starting_grant_amount::{StartingAmount, starting_grant_idempotency_key};
+use crate::starting_grant_amount::{Occasion, StartingAmount, starting_grant_idempotency_key};
 
 /// Books the starting grant. Built from the pool alone so every construction site of the account
 /// handler gets one — there is no "server without starting grants" configuration, and an optional
@@ -136,6 +136,17 @@ impl StartingGrantService {
             .await
     }
 
+    /// [`Self::book_period_start`] for the period beginning at `period_start`, booked BEFORE it.
+    /// Same key as the post-boundary pass, which finds it present; moves only that period.
+    pub async fn book_period_start_ahead(
+        &self,
+        budget_account_id: &str,
+        period_start: DateTime<Utc>,
+    ) -> Result<BudgetGrant, BudgetError> {
+        self.book_for(budget_account_id, period_start, Occasion::PeriodStartAhead)
+            .await
+    }
+
     async fn book_for(
         &self,
         budget_account_id: &str,
@@ -145,10 +156,7 @@ impl StartingGrantService {
         let period = Period::current(now);
         let amount = self.resolve_amount(budget_account_id).await?;
         let idempotency_key = starting_grant_idempotency_key(&period, budget_account_id);
-        let reason = match occasion {
-            Occasion::AccountCreation => amount.reason(),
-            Occasion::PeriodStart => amount.month_start_reason(&period),
-        };
+        let reason = amount.reason_for(occasion, &period);
 
         let grant = self
             .budget_repo
@@ -189,12 +197,4 @@ impl StartingGrantService {
         }
         Ok(grant)
     }
-}
-
-/// Why a grant is booked: picks the ledger `reason` and the log, never the amount or the key. Only
-/// creation logs per account; `crate::period_start` logs one summary for the whole estate.
-#[derive(Debug, Clone, Copy)]
-enum Occasion {
-    AccountCreation,
-    PeriodStart,
 }

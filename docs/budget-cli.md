@@ -20,7 +20,8 @@ same evening to backfill seven production accounts — see
 > The same key is booked again at the start of every month by the `authz-budget` month-start pass
 > ([`docs/architecture/budget.md`](./architecture/budget.md#month-start-grants-why-the-1st-of-the-month-is-not-a-402-for-everyone)),
 > so a month no longer needs a hand-run Job — and a Job that already ran under that key is read as
-> booked, never repeated.
+> booked, never repeated ([#765](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/765)). The
+> next month's grant is pre-booked in the last hour of the current one.
 
 Two commands live here:
 
