@@ -103,6 +103,23 @@ impl SnapshotStore {
         Ok(())
     }
 
+    /// [`BudgetSnapshotReader::touch`] for a caller whose real work has ALREADY committed: the
+    /// month-start pass and account creation, right after `BudgetRepo::grant`. A failure here
+    /// must not turn a booked grant into an error. Callers would report it as unbooked
+    /// ("retrying on the next tick", "could not be booked") although the row is durable and its
+    /// idempotency key stops the next pass from revisiting the account. Dropping it is safe:
+    /// [`Self::seed`] re-arms every account holding a grant inside its lookback window, so the
+    /// reading still arrives, one seed tick later instead of at once.
+    pub async fn touch_after_commit(&self, budget_account_id: &str) {
+        if let Err(err) = self.touch(budget_account_id).await {
+            tracing::warn!(
+                budget_account_id = %budget_account_id,
+                error = %err,
+                "grant booked, but the snapshot touch failed; the refresher's seed re-arms it"
+            );
+        }
+    }
+
     /// Stamps the start of a spend-source outage, keeping the previous reading. See
     /// [`MARK_STALE_SQL`].
     pub async fn mark_stale(&self, budget_account_id: &str) -> Result<(), BudgetError> {

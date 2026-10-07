@@ -41,7 +41,6 @@ use crate::period::Period;
 use crate::policy_store::PolicyStore;
 use crate::repo::{BudgetGrant, BudgetRepo, GrantRequest};
 use crate::reset_schedule::ResetScheduleRepo;
-use crate::snapshot::BudgetSnapshotReader;
 use crate::snapshot_store::SnapshotStore;
 use crate::source::GrantSource;
 use crate::starting_grant_amount::{Occasion, StartingAmount, starting_grant_idempotency_key};
@@ -180,7 +179,7 @@ impl StartingGrantService {
             })
             .await?;
 
-        self.snapshots.touch(budget_account_id).await?;
+        self.snapshots.touch_after_commit(budget_account_id).await;
 
         if let Occasion::AccountCreation = occasion {
             tracing::info!(
