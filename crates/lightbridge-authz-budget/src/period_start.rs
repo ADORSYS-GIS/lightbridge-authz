@@ -53,8 +53,9 @@
 //!
 //! The amount is [`StartingGrantService::resolve_amount`]'s, so after this pass the reset schedule
 //! that produced it is a `delta = 0` no-op (the `$8`-vs-`$15` rule, [`crate::starting_grant_amount`]).
-//! The scheduler's own deferral of an account whose spend is unavailable is unchanged; whether a
-//! reset window should read an empty spend as zero is an open owner ruling (#765, "Out of Scope").
+//! The scheduler's own deferral of an account whose spend is unavailable is unchanged, by owner
+//! ruling (2026-10-07, #765): a reset window keeps treating an empty spend as "unknown", never as
+//! zero. That is harmless now, because this pass funds the account whatever the reset decides.
 
 use std::sync::Arc;
 

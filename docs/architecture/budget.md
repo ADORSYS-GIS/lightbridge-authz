@@ -424,8 +424,10 @@ wake runs that `SELECT` twice.
 account whose spend cannot be read is still skipped by its reset. At the start of a month that is
 every account (no usage rows yet), which is exactly why the reset alone cannot fund them —
 `the_pass_funds_an_account_whose_reset_is_deferred_for_unavailable_spend`. Whether a reset window
-should treat `SpendObservation::Empty` as zero spend is a separate, still-open owner ruling: see
-[#765, "Out of Scope"](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/765).
+should treat `SpendObservation::Empty` as zero spend was **ruled on 2026-10-07: no, keep deferring**
+([#765](https://github.com/ADORSYS-GIS/lightbridge-authz/issues/765)). The deferral is fail-closed
+and, with the month-start grant in place, it no longer locks anyone out. A zero-usage account keeps
+its month-start grant and is simply skipped by the weekly reset.
 
 ## What is actually live versus merely implemented
 
