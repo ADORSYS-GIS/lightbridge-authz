@@ -426,9 +426,13 @@ async fn captured_span(app: Router, uri: &str) -> CapturedSpan {
 /// p99 panel goes silently empty rather than red.
 #[tokio::test]
 async fn the_span_carries_the_route_the_exit_criterion_selects_on() {
+    // The period is passed explicitly. With no `period` the handler stamps `Period::current(now)`
+    // (budget_remaining.rs), so the old param-less request made the assertion below a calendar
+    // fact: it held only in 2026-09 and failed on every PR from 2026-10-01. The span must carry
+    // the period that was actually READ, so read a fixed one.
     let span = captured_span(
         app(StubReader::Known(known())),
-        "/budget/v1/remaining?account_id=acct_1",
+        "/budget/v1/remaining?account_id=acct_1&period=2026-09",
     )
     .await;
 
