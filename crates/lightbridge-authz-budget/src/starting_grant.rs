@@ -16,6 +16,12 @@
 //! `ON CONFLICT (idempotency_key) DO NOTHING` path — because ADR-0009 makes the ledger
 //! append-only and a double grant has no undo.
 //!
+//! ## The same grant, booked again when a month begins
+//!
+//! The key carries the period, so the grant is per (account, **month**), yet only creation booked
+//! one. [`StartingGrantService::book_period_start`] (driven by [`crate::period_start`]) books the
+//! same amount under the same key: a grant already under that key is a replay, never a second one.
+//!
 //! ## Why it is not in the account insert's own transaction
 //!
 //! `accounts` is written by `lightbridge-authz-api-key`'s `StoreRepo::create_account`, a crate
@@ -115,9 +121,34 @@ impl StartingGrantService {
         budget_account_id: &str,
         now: DateTime<Utc>,
     ) -> Result<BudgetGrant, BudgetError> {
+        self.book_for(budget_account_id, now, Occasion::AccountCreation)
+            .await
+    }
+
+    /// The month-start grant: [`Self::book`]'s amount and idempotency key, so an account that
+    /// already holds this period's grant resolves to it. Only the ledger `reason` differs.
+    pub async fn book_period_start(
+        &self,
+        budget_account_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<BudgetGrant, BudgetError> {
+        self.book_for(budget_account_id, now, Occasion::PeriodStart)
+            .await
+    }
+
+    async fn book_for(
+        &self,
+        budget_account_id: &str,
+        now: DateTime<Utc>,
+        occasion: Occasion,
+    ) -> Result<BudgetGrant, BudgetError> {
         let period = Period::current(now);
         let amount = self.resolve_amount(budget_account_id).await?;
         let idempotency_key = starting_grant_idempotency_key(&period, budget_account_id);
+        let reason = match occasion {
+            Occasion::AccountCreation => amount.reason(),
+            Occasion::PeriodStart => amount.month_start_reason(&period),
+        };
 
         let grant = self
             .budget_repo
@@ -132,7 +163,7 @@ impl StartingGrantService {
                 // that run would have (`docs/budget-cli.md`, "The $8-vs-$15 rule").
                 source: GrantSource::Automatic,
                 actor_id: None,
-                reason: Some(amount.reason()),
+                reason: Some(reason),
                 policy_revision: None,
                 matched_rule_ids: None,
                 idempotency_key: Some(idempotency_key),
@@ -143,17 +174,27 @@ impl StartingGrantService {
 
         self.snapshots.touch(budget_account_id).await?;
 
-        tracing::info!(
-            budget_account_id = %budget_account_id,
-            grant_id = %grant.id,
-            period = %grant.period,
-            amount_micros = grant.amount_micros,
-            rule = match amount {
-                StartingAmount::Schedule { .. } => "effective_schedule",
-                StartingAmount::PolicyDefault { .. } => "policy_starting_amount",
-            },
-            "booked the starting grant for a new account"
-        );
+        if let Occasion::AccountCreation = occasion {
+            tracing::info!(
+                budget_account_id = %budget_account_id,
+                grant_id = %grant.id,
+                period = %grant.period,
+                amount_micros = grant.amount_micros,
+                rule = match amount {
+                    StartingAmount::Schedule { .. } => "effective_schedule",
+                    StartingAmount::PolicyDefault { .. } => "policy_starting_amount",
+                },
+                "booked the starting grant for a new account"
+            );
+        }
         Ok(grant)
     }
+}
+
+/// Why a grant is booked: picks the ledger `reason` and the log, never the amount or the key. Only
+/// creation logs per account; `crate::period_start` logs one summary for the whole estate.
+#[derive(Debug, Clone, Copy)]
+enum Occasion {
+    AccountCreation,
+    PeriodStart,
 }

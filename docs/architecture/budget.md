@@ -305,6 +305,90 @@ $6 floor) — a labeling convenience only, never a source of truth for what amou
 [`BudgetRepo::current_tier`] is also still live, but only as the ADR-0014 token-mint claim's own
 tier lookup, independent of the refill path.
 
+## Month-start grants: why the 1st of the month is not a `402` for everyone
+
+The gateway's ceiling is `SUM(budget_grants WHERE period = <current UTC month>)`
+(`crates/lightbridge-authz-budget/src/repo.rs` `EFFECTIVE_BALANCE_SQL`, read by
+`remaining_service.rs` and `snapshot_refresh_one.rs`), and a grant belongs to exactly one month.
+Before the month-start pass nothing booked the next month's grant: `StartingGrantService::book` ran
+only at account creation, and a reset schedule fires on its own cadence (production's is weekly,
+Monday). So at 00:00 UTC on the 1st every account's ceiling was `0` and the gateway answered `402`
+to everyone until the next window — observed in production on 2026-09-30, bridged for 2026-10 by a
+hand-run Job that booked the same rows under the same key.
+
+`BudgetTicker` (`budget_ticker.rs:61`) is now the one wake `start_budget_server` spawns
+(`server_budget.rs:238`). It runs the month-start pass, **then** the reset tick, both at the same
+`now`:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Loop as BudgetTicker.spawn (budget_ticker.rs:77)
+    participant Pass as PeriodStartGrants.run (period_start.rs:102)
+    participant SG as StartingGrantService.book_period_start (starting_grant.rs:130)
+    participant Repo as BudgetRepo.grant (repo.rs:348)
+    participant Reset as ResetScheduler.tick (reset_scheduler.rs:164)
+
+    Loop->>Pass: run(now)
+    Pass->>Pass: SELECT accounts WHERE NOT EXISTS key budget-start-period-id (period_start.rs:57)
+    loop each missing account
+        Pass->>SG: book_period_start(account, now)
+        SG->>Repo: grant(automatic, idempotency_key)
+        Note over Repo: balance row FOR UPDATE (repo.rs:368), then ON CONFLICT DO NOTHING (repo_grant_sql.rs:13)
+        Repo-->>SG: the new row, or the existing one on a replay
+        SG->>SG: SnapshotStore.touch (starting_grant.rs:175)
+    end
+    Pass-->>Loop: PeriodStartReport (missing, funded, failed)
+    Loop->>Reset: tick(now), delta = target - remaining against the funded ceiling
+    Reset-->>Loop: TickReport
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> Unfunded: 00:00 UTC on the 1st, ceiling = 0
+    Unfunded --> Funded: pass books budget-start-period-id
+    Unfunded --> Unfunded: booking failed, counted, retried next wake
+    Funded --> Funded: later wake, key present, not selected
+    Funded --> Funded: reset window, delta = 0, no row
+    Funded --> Funded: an operator Job already booked the key, replay
+    Unfunded --> Funded: concurrent replica booked it first, replay
+```
+
+**The key is the contract.** `budget-start-<period>-<account_id>` (`starting_grant_amount.rs`,
+`starting_grant_idempotency_key`; the pass derives its `SELECT` from `starting_grant_key_prefix`, so
+the shape is written once). An account created mid-month, or funded by an operator under that key,
+is never selected, and if booked anyway `BudgetRepo::grant`'s `ON CONFLICT` path returns the
+existing row. Presence of the key is what counts: a revoked grant is not re-booked, because
+revocation is a decision the pass must not undo.
+
+**Why the pass runs first.** On a Monday-the-1st the schedule window and the new period begin
+together. Funded first, the reset's `delta = target − remaining` is `0`; run in the other order the
+reset funds the account from `0` and the pass adds the starting grant on top, holding the target
+twice. `a_reset_window_that_opens_with_the_month_finds_a_funded_ceiling` fails for exactly that
+reason when the two calls are swapped.
+
+**Replicas.** Every replica runs the pass. Two can pick the same account, and that is safe without
+a lock: `grant` takes the `(account, period)` balance row `FOR UPDATE` before inserting, so the
+loser waits, its insert hits the unique index on `idempotency_key`, `DO NOTHING` returns no row, and
+the committed grant is read back — a unique violation never surfaces as an error
+(`concurrent_passes_book_each_account_exactly_once`). Each grant is one transaction on one balance
+row, so two replicas walking the same list cannot deadlock.
+
+**Failure.** One account failing is counted and the pass moves on, so one bad account cannot leave
+every account behind it at `0`; only failing to enumerate is an `Err`. A failed pass is logged at
+`error` and does **not** stop the reset tick from running. Nothing here ever grants more on failure:
+an account that could not be funded stays at `0` until the next wake.
+
+**Cost.** In steady state the `SELECT` matches nothing, books nothing and takes no row lock. Against
+5 000 accounts and a 205 000-row ledger it ran in 48 ms (hash anti-join, one scan of
+`budget_grants`) and 25 ms with the planner forced onto `budget_grants_idempotency_key_uidx`; the
+planner picks by its statistics, and both are per-minute, per-replica.
+
+**Unchanged on purpose.** The reset scheduler's `Spend::Unavailable` deferral is untouched: an
+account whose spend cannot be read is still skipped by its reset. At the start of a month that is
+every account (no usage rows yet), which is exactly why the reset alone cannot fund them —
+`the_pass_funds_an_account_whose_reset_is_deferred_for_unavailable_spend`.
+
 ## What is actually live versus merely implemented
 
 This section exists so nobody assumes a designed feature is a working one — confirmed by reading
@@ -370,8 +454,8 @@ see "Service boundary" above.
   `budget:schedule-manage`), plus `getEffectiveResetSchedule` (`budget:read`, deliberately NOT the
   manage permission — it is what a per-account budget card reads). These are the RPC face of the
   one background job this process runs: `start_budget_server` spawns a 60-second
-  `tokio::time::interval` task driving `ResetScheduler::tick`, which claims due
-  `budget_reset_schedules` rows with `FOR UPDATE SKIP LOCKED` (replica-safe) and writes one grant
+  `tokio::time::interval` task driving `BudgetTicker::tick` — the month-start pass, then
+  `ResetScheduler::tick`, which claims due `budget_reset_schedules` rows with `FOR UPDATE SKIP LOCKED` (replica-safe) and writes one grant
   per matching account per window. A `reset` clamps remaining BOTH ways: a negative delta is booked
   as the `source = 'correction'` compensating row, never a mutation. See
   [`docs/adr/0032-budget-reset-schedules.md`](../adr/0032-budget-reset-schedules.md).

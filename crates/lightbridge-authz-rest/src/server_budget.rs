@@ -11,6 +11,7 @@ use cratestack::{
 use lightbridge_authz_api::schema;
 use lightbridge_authz_api_key::repo::StoreRepo;
 use lightbridge_authz_bearer::BearerTokenServiceTrait;
+use lightbridge_authz_budget::{BudgetTicker, PeriodStartGrants};
 use lightbridge_authz_core::{
     config::{
         ApiKeyExpiry, Billing, BudgetInternalServer, BudgetServer, ModelCatalog, Oauth2,
@@ -30,7 +31,7 @@ use crate::{
     budget_remaining::{self, BUDGET_REMAINING_PATH},
     budget_remaining_auth, budget_services, budget_snapshot_refresher,
     codec::LenientCborCodec,
-    handlers::AuthzStoreImpl,
+    handlers::{AuthzStoreImpl, build_starting_grant_service},
     probe_router,
     procedures::Procedures,
     ratelimit_redis::build_redis_rate_limit_store,
@@ -229,38 +230,16 @@ pub async fn start_budget_server(
     let rate_limit_store =
         build_redis_rate_limit_store(&redis.url, redis.ca_bundle_path.as_deref(), "authz-budget")?;
 
-    // ADR-0032: the budget reset scheduler's own tick loop, started HERE and only here -- one
-    // `tokio::interval` alongside the three existing listener tasks, on the process that owns the
-    // budget domain. Running several `authz-budget` replicas is safe by construction: each tick
-    // claims due rows with `FOR UPDATE SKIP LOCKED`, so a schedule another replica already holds
-    // is skipped rather than fired twice.
-    //
-    // `spawn`ed, not awaited: a scheduler failure must never stop the RPC surface from serving. A
-    // failing tick is logged and the next one retries 60 seconds later -- and because the tick's
-    // claim transaction only commits the `next_run_at` advance on success, a failed window stays
-    // due rather than being silently skipped.
-    let scheduler_task = reset_scheduler.clone();
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(RESET_SCHEDULER_TICK_INTERVAL);
-        // `Delay`, not the default `Burst`: a tick that overruns 60 seconds (a global schedule
-        // over a large estate) must not queue up a backlog of immediate catch-up ticks behind it.
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            ticker.tick().await;
-            match scheduler_task.tick(chrono::Utc::now()).await {
-                Ok(report) if report.claimed_schedule_ids.is_empty() => {}
-                Ok(report) => tracing::info!(
-                    claimed = report.claimed_schedule_ids.len(),
-                    grants_written = report.grants_written,
-                    "budget reset scheduler tick"
-                ),
-                Err(err) => tracing::error!(
-                    error = %err,
-                    "budget reset scheduler tick failed; retrying on the next interval"
-                ),
-            }
-        }
-    });
+    // ADR-0032 + the month-start pass (`BudgetTicker`): the background loop of the budget domain,
+    // started HERE and only here -- one `tokio::interval` alongside the listener tasks. Replicas
+    // are safe by construction: the reset claims with `FOR UPDATE SKIP LOCKED`, the month-start
+    // grants are idempotent on their key. `spawn`ed, never awaited: a failing wake must not stop
+    // the RPC surface from serving.
+    Arc::new(BudgetTicker::new(
+        PeriodStartGrants::new(pool.clone(), build_starting_grant_service(pool.clone())),
+        reset_scheduler.clone(),
+    ))
+    .spawn(RESET_SCHEDULER_TICK_INTERVAL);
 
     let dev_cors = dev_cors_enabled();
     // Cloned before `build_budget_router` consumes them: ADR-0034's reader must be the SAME repo

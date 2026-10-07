@@ -16,6 +16,11 @@ same evening to backfill seven production accounts — see
 > booking failed (the handler logs `error!` and returns the account rather than orphaning a second
 > one — reuse the SAME `budget-start-<period>-<id>` key to repair it exactly once), and any
 > deliberate operator grant.
+>
+> The same key is booked again at the start of every month by the `authz-budget` month-start pass
+> ([`docs/architecture/budget.md`](./architecture/budget.md#month-start-grants-why-the-1st-of-the-month-is-not-a-402-for-everyone)),
+> so a month no longer needs a hand-run Job — and a Job that already ran under that key is read as
+> booked, never repeated.
 
 Two commands live here:
 

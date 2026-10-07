@@ -32,10 +32,18 @@
 
 use crate::period::Period;
 
+/// `budget-start-<period>-` — the part of every starting grant's idempotency key that is the same
+/// for all accounts. Exposed so [`crate::period_start`]'s anti-join can match "this period's
+/// starting grants" in SQL while the key's shape stays written in exactly one place: the key is
+/// this prefix followed by the account id, nothing else.
+pub fn starting_grant_key_prefix(period: &Period) -> String {
+    format!("budget-start-{period}-")
+}
+
 /// `budget-start-<period>-<account_id>` — the one idempotency key a starting grant is ever booked
 /// under. Deliberately carries the period: a new period is a new grant, not a replay of the last.
 pub fn starting_grant_idempotency_key(period: &Period, budget_account_id: &str) -> String {
-    format!("budget-start-{period}-{budget_account_id}")
+    format!("{}{budget_account_id}", starting_grant_key_prefix(period))
 }
 
 /// Where a starting grant's amount came from — recorded on the booked grant's `reason` and
@@ -63,24 +71,34 @@ impl StartingAmount {
         }
     }
 
-    /// The `budget_grants.reason` this amount is booked with. ADR-0009 makes the ledger
-    /// append-only and the reason column most of what it is for, so it names the rule that
-    /// produced the number rather than restating the number.
+    /// The `budget_grants.reason` this amount is booked with at account creation. ADR-0009 makes
+    /// the ledger append-only and the reason column most of what it is for, so it names the rule
+    /// that produced the number rather than restating the number.
     pub(crate) fn reason(&self) -> String {
+        format!(
+            "starting grant at account creation, {}",
+            self.source_clause()
+        )
+    }
+
+    /// The reason for the grant [`crate::period_start`] books when a calendar month begins. Same
+    /// source clause as [`Self::reason`] — an operator can tell the schedule-matched grant from the
+    /// policy fallback either way — but it must not say "at account creation": the account may be
+    /// years old, and a ledger that says otherwise is wrong in the one column meant to be trusted.
+    pub(crate) fn month_start_reason(&self, period: &Period) -> String {
+        format!("month-start grant for {period}, {}", self.source_clause())
+    }
+
+    fn source_clause(&self) -> String {
         match self {
             Self::Schedule {
                 schedule_id,
                 schedule_name,
                 ..
-            } => format!(
-                "starting grant at account creation, matching reset schedule '{schedule_name}' \
-                 ({schedule_id})"
-            ),
-            Self::PolicyDefault { .. } => {
-                "starting grant at account creation, from the active policy's \
-                 starting_amount_micros (no reset schedule covers this account)"
-                    .to_string()
-            }
+            } => format!("matching reset schedule '{schedule_name}' ({schedule_id})"),
+            Self::PolicyDefault { .. } => "from the active policy's starting_amount_micros \
+                 (no reset schedule covers this account)"
+                .to_string(),
         }
     }
 }
