@@ -79,12 +79,18 @@ them is ADR-0031's Class 1 — `kubectl delete job <name>`, then re-sync.
 Only ever the **replica**, only ever read-only, and both at once:
 
 ```bash
-zsh -i -c 'kubectl --context hetzner-prod -n converse port-forward pod/lightbridge-main-db-2 55434:5432'
+# 0. Find the replica NOW. CNPG fails over and the pod NAME is not the role: on 2026-10-08
+#    lightbridge-main-db-2 -- long documented here as "the replica" -- was the PRIMARY.
+zsh -i -c 'kubectl --context hetzner-prod -n converse get pods -l cnpg.io/instanceRole=replica -o name' | grep main-db
+REPLICA=lightbridge-main-db-<n>   # the pod the line above printed, without the pod/ prefix
+zsh -i -c "kubectl --context hetzner-prod -n converse port-forward pod/$REPLICA 55434:5432"
+# Before the first EXPLAIN, prove it from inside Postgres -- must print `t`; stop otherwise.
+psql "$DSN" -X -At -c "SELECT pg_is_in_recovery();"
 psql "$DSN" -X -q -v ON_ERROR_STOP=1 -c \
   "BEGIN; SET LOCAL default_transaction_read_only = on; EXPLAIN (ANALYZE, BUFFERS) <stmt>; COMMIT;"
 ```
 
-`lightbridge-main-db-2` is the physical replica; `SET LOCAL default_transaction_read_only` is the
-second belt so a mistyped statement fails instead of landing. For query-plan work specifically, use
+The replica is whichever pod carries `cnpg.io/instanceRole=replica` **right now** — never a name
+remembered from an earlier session; `SET LOCAL default_transaction_read_only` is the second belt so a mistyped statement fails instead of landing. For query-plan work specifically, use
 the `usage-query-perf` skill — it has the shapes, the baselines to compare against, and what the
 numbers mean.
