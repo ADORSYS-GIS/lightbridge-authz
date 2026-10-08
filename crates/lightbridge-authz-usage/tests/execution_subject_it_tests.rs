@@ -69,7 +69,10 @@ async fn insert_execution(
     .expect("insert execution");
 }
 
-fn request(group_by: Vec<ExecutionGroupBy>, filters: ExecutionQueryFilters) -> ExecutionQueryRequest {
+fn request(
+    group_by: Vec<ExecutionGroupBy>,
+    filters: ExecutionQueryFilters,
+) -> ExecutionQueryRequest {
     ExecutionQueryRequest {
         scope: UsageScope::All,
         scope_id: String::new(),
@@ -85,7 +88,10 @@ fn request(group_by: Vec<ExecutionGroupBy>, filters: ExecutionQueryFilters) -> E
 
 async fn query(pool: &PgPool, request: &ExecutionQueryRequest) -> Vec<ExecutionSeriesPoint> {
     let repo = StoreRepo::new(Arc::new(DbPool::from_pool(pool.clone())));
-    let (points, truncated) = repo.query_executions(request).await.expect("query executions");
+    let (points, truncated) = repo
+        .query_executions(request)
+        .await
+        .expect("query executions");
     assert!(!truncated);
     points
 }
@@ -116,7 +122,10 @@ async fn groups_by_subject_and_keeps_the_unattributed_bucket(pool: PgPool) {
 
     let points = query(
         &pool,
-        &request(vec![ExecutionGroupBy::SubjectId], ExecutionQueryFilters::default()),
+        &request(
+            vec![ExecutionGroupBy::SubjectId],
+            ExecutionQueryFilters::default(),
+        ),
     )
     .await;
 
@@ -138,7 +147,10 @@ async fn subject_groups_sum_to_the_ungrouped_total(pool: PgPool) {
 
     let grouped = query(
         &pool,
-        &request(vec![ExecutionGroupBy::SubjectId], ExecutionQueryFilters::default()),
+        &request(
+            vec![ExecutionGroupBy::SubjectId],
+            ExecutionQueryFilters::default(),
+        ),
     )
     .await;
     let total = query(&pool, &request(vec![], ExecutionQueryFilters::default())).await;
@@ -150,7 +162,9 @@ async fn subject_groups_sum_to_the_ungrouped_total(pool: PgPool) {
     );
     assert_eq!(
         grouped.iter().filter_map(|p| p.total_cost).sum::<i64>(),
-        total[0].total_cost.expect("every seeded execution is priced")
+        total[0]
+            .total_cost
+            .expect("every seeded execution is priced")
     );
 }
 
@@ -166,7 +180,10 @@ async fn an_erased_subject_groups_as_its_literal_value(pool: PgPool) {
 
     let points = query(
         &pool,
-        &request(vec![ExecutionGroupBy::SubjectId], ExecutionQueryFilters::default()),
+        &request(
+            vec![ExecutionGroupBy::SubjectId],
+            ExecutionQueryFilters::default(),
+        ),
     )
     .await;
     let subjects: Vec<_> = points.iter().map(|p| p.subject_id.clone()).collect();
@@ -193,7 +210,10 @@ async fn one_subject_across_two_sources_is_one_engineer(pool: PgPool) {
 
     let per_engineer = query(
         &pool,
-        &request(vec![ExecutionGroupBy::SubjectId], ExecutionQueryFilters::default()),
+        &request(
+            vec![ExecutionGroupBy::SubjectId],
+            ExecutionQueryFilters::default(),
+        ),
     )
     .await;
     assert_eq!(
