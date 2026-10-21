@@ -455,3 +455,42 @@ async fn the_pool_aware_snapshot_equals_todays_number_then_adds_a_purchase(pool:
     .unwrap();
     assert_eq!(paid, Some(20 * USD));
 }
+
+/// ADR-0035 D9 for the live `/budget/v1/remaining` read: with settlement on it must count paid
+/// credit exactly as the snapshot does. The ADR-0034 formula (allowance minus this month's spend)
+/// would answer 10 − 3 = 7 here and silently drop the $20 purchase.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_live_remaining_read_counts_purchased_credit_under_settlement(pool: PgPool) {
+    use lightbridge_authz_budget::{Remaining, RemainingReader, RemainingService};
+
+    let f = fixture(&pool, WindowSpend::answering(&[3 * USD])).await;
+    f.allowance(10 * USD).await;
+    f.credit
+        .fund(f.fund_request(GrantSource::Purchase, 20 * USD, "ord-1"))
+        .await
+        .unwrap();
+    let scheduler = Arc::new(
+        ResetScheduler::new(
+            f.core.clone(),
+            f.repo.clone(),
+            Arc::new(WindowSpend::default()),
+        )
+        .with_settlement(f.settlement.clone()),
+    );
+    let service =
+        RemainingService::new(f.repo.clone(), Arc::new(WindowSpend::default()), scheduler);
+    let Remaining::Known(remaining) = service
+        .remaining_for_account(&f.account, &Period::current(f.now), f.now)
+        .await
+        .unwrap()
+    else {
+        panic!("a known account with a readable spend source must answer Known");
+    };
+    assert_eq!(
+        remaining.ceiling_micros,
+        30 * USD,
+        "allowance + the purchase"
+    );
+    assert_eq!(remaining.spent_micros, 3 * USD, "the unsettled tail");
+    assert_eq!(remaining.remaining_micros, 27 * USD);
+}

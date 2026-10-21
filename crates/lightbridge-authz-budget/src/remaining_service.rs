@@ -105,17 +105,33 @@ impl RemainingReader for RemainingService {
             return Ok(Remaining::UnknownAccount);
         }
 
-        let ceiling_micros = self
-            .repo
-            .effective_balance(budget_account_id, period, now)
-            .await?;
+        // ADR-0035 D9: with settlement on, answer what the pool-aware snapshot answers -- settled
+        // credit in every pool, minus debt and the spend ingested since the watermark -- or this
+        // read would miss every purchased credit. Off, ADR-0034's formula is unchanged.
+        let (ceiling_micros, debt_micros, observation) = match self.reset_scheduler.settlement() {
+            Some(settlement) => {
+                let settled = settlement
+                    .settled_balances(budget_account_id, period, now)
+                    .await?;
+                let tail = settlement
+                    .spend_reader()
+                    .observe_spend_ingested(budget_account_id, settled.settled_through, now)
+                    .await?;
+                (settled.settled_total(), settled.debt_micros, tail)
+            }
+            None => (
+                self.repo
+                    .effective_balance(budget_account_id, period, now)
+                    .await?,
+                0,
+                self.spend_reader
+                    .observe_spend_for_account(budget_account_id, period)
+                    .await?,
+            ),
+        };
 
         let cache_key = (budget_account_id.to_string(), period.clone());
-        let (spent_micros, source_lag_seconds) = match self
-            .spend_reader
-            .observe_spend_for_account(budget_account_id, period)
-            .await?
-        {
+        let (tail_micros, source_lag_seconds) = match observation {
             SpendObservation::Answered(micros) => {
                 self.spend_cache.remember(cache_key, micros, now);
                 (micros, None)
@@ -156,6 +172,7 @@ impl RemainingReader for RemainingService {
             None => next_period_start_utc(period),
         };
 
+        let spent_micros = debt_micros.saturating_add(tail_micros);
         Ok(Remaining::Known(Box::new(BudgetRemaining {
             budget_account_id: budget_account_id.to_string(),
             period: period.clone(),
