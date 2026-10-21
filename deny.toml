@@ -18,6 +18,19 @@ allow = [
 ignore = [
     "RUSTSEC-2023-0071",
     "RUSTSEC-2026-0214",
+    # zip 3.0.0 (RUSTSEC-2026-0367/0368/0369, all fixed in zip >= 9): a BUILD-dependency only, of
+    # utoipa-swagger-ui 9's build script, which unpacks one fixed Swagger UI release archive at
+    # compile time. All three are about extracting an attacker-controlled archive (SUID bits,
+    # symlink targets, permissions through symlinks); nothing here ever extracts one at runtime.
+    # The fix is utoipa-swagger-ui 10 (zip ^9), which requires utoipa 6 -- an OpenAPI-derive
+    # migration across every handler, tracked separately. Remove these three with that upgrade.
+    "RUSTSEC-2026-0367",
+    "RUSTSEC-2026-0368",
+    "RUSTSEC-2026-0369",
+    # unsafe-libyaml is UNMAINTAINED (not a vulnerability; no patched release exists), pulled in by
+    # the deprecated serde_yaml that parses operator-supplied config files. Replacing serde_yaml is
+    # its own change, tracked separately. Remove this with it.
+    "RUSTSEC-2024-0449",
 ]
 
 # The temporary marcjazz/authkestra git-pin exemption this section used to carry is gone: root
