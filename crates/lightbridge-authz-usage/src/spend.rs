@@ -81,3 +81,29 @@ pub async fn spend_for_account(
 
     Ok(total_cost)
 }
+
+/// lightbridge-authz ADR-0035 D6: the account's spend INGESTED in `(after, until]`, by
+/// `created_at`, so an event that arrives late can never fall behind the settlement watermark.
+/// Raw rows only: a settlement window is minutes old, far inside raw retention, so the daily
+/// rollup is never needed. The `observed_at` bound only lets a partitioned table skip chunks.
+pub async fn spend_ingested_for_account(
+    pool: &PgPool,
+    account_id: &str,
+    observed: (DateTime<Utc>, DateTime<Utc>),
+    ingested: (DateTime<Utc>, DateTime<Utc>),
+) -> Result<Option<f64>> {
+    let total_cost: Option<f64> = sqlx::query_scalar::<_, Option<f64>>(
+        "SELECT SUM(total_cost)::double precision FROM usage_events \
+         WHERE account_id = $1 AND created_at > $2 AND created_at <= $3 \
+             AND observed_at >= $4 AND observed_at < $5 \
+             AND (source IS NULL OR source = 'eaig')",
+    )
+    .bind(account_id)
+    .bind(ingested.0)
+    .bind(ingested.1)
+    .bind(observed.0)
+    .bind(observed.1)
+    .fetch_one(pool)
+    .await?;
+    Ok(total_cost)
+}

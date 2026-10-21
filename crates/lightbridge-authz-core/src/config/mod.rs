@@ -16,7 +16,7 @@ mod unknown_keys_data;
 
 pub use api_key_expiry::ApiKeyExpiry;
 pub use billing::{Billing, BillingLimits, BillingPlan};
-pub use budget_internal::BudgetInternalServer;
+pub use budget_internal::{BudgetInternalServer, FundingConfig};
 pub use budget_server::BudgetServer;
 pub use claim_mapper::{ClaimMapper, ClaimSource};
 pub use infrastructure::{Database, Logging, Otel, Redis, SecretClaim, UsageServiceClient};

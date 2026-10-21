@@ -71,10 +71,27 @@ pub async fn query_spend(
         return Err(Error::BadRequest("start must be before end".to_string()));
     }
 
-    let total_cost = state
-        .repo
-        .spend_for_account(&input.account_id, input.start, input.end)
-        .await?;
+    let total_cost = match (input.ingested_after, input.ingested_until) {
+        (None, None) => {
+            state
+                .repo
+                .spend_for_account(&input.account_id, input.start, input.end)
+                .await?
+        }
+        (Some(after), Some(until)) if after < until => {
+            let observed = (input.start, input.end);
+            state
+                .repo
+                .spend_ingested_for_account(&input.account_id, observed, (after, until))
+                .await?
+        }
+        _ => {
+            return Err(Error::BadRequest(
+                "ingested_after and ingested_until must both be set, with after < until"
+                    .to_string(),
+            ));
+        }
+    };
 
     Ok((StatusCode::OK, Json(SpendQueryResponse { total_cost })))
 }

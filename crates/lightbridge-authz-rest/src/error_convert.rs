@@ -41,10 +41,13 @@ pub(crate) fn budget_error_to_cratestack_error(
         | BudgetError::MissingRejectionReason
         | BudgetError::AmountNotOffered(_)
         | BudgetError::InvalidSchedule(_) => CratestackError::BadRequest(err.to_string()),
-        BudgetError::AlreadyGranted | BudgetError::AlreadyReviewed(_) => {
-            CratestackError::Conflict(err.to_string())
+        BudgetError::AlreadyGranted
+        | BudgetError::AlreadyReviewed(_)
+        | BudgetError::ReversalExceedsLot { .. }
+        | BudgetError::IdempotencyConflict(_) => CratestackError::Conflict(err.to_string()),
+        BudgetError::PolicyDenied(_) | BudgetError::FundingRefused(_) => {
+            CratestackError::Forbidden(err.to_string())
         }
-        BudgetError::PolicyDenied(_) => CratestackError::Forbidden(err.to_string()),
         BudgetError::NotFound(m) => CratestackError::NotFound(m),
         BudgetError::StorageFailed(m) => CratestackError::Internal(m),
     }

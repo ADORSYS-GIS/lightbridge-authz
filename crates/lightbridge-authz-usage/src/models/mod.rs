@@ -319,26 +319,25 @@ fn default_bucket() -> String {
 fn default_limit() -> u32 {
     1_000
 }
-/// Request body for the internal, mTLS-protected `/usage/v1/spend/query` endpoint (the query
-/// listener requires and verifies a client certificate -- see `UsageServerGroup::query`'s doc
-/// comment; this route carries no Basic-auth or bearer check of its own). Answers
-/// exactly the question `lightbridge-authz-budget`'s `SpendReader` asks: the summed
-/// `usage_events.total_cost` for one account over a half-open `[start, end)` interval. Deliberately
-/// takes explicit `start`/`end` bounds rather than a `Period` -- period-to-bounds conversion
-/// (`period_bounds_utc`) stays a budget-domain concern; this endpoint only ever runs the SQL.
+/// Request body for the internal, mTLS-protected `/usage/v1/spend/query` endpoint (see
+/// `UsageServerGroup::query`; no Basic-auth or bearer check of its own): the summed
+/// `usage_events.total_cost` for one account over a half-open `observed_at` interval
+/// `[start, end)`. With `ingested_after`/`ingested_until` set it instead sums the raw rows
+/// INGESTED in `(after, until]` (`created_at`) -- lightbridge-authz ADR-0035 D6 settlement.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SpendQueryRequest {
     pub account_id: String,
     pub start: DateTime<Utc>,
     pub end: DateTime<Utc>,
+    #[serde(default)]
+    pub ingested_after: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub ingested_until: Option<DateTime<Utc>>,
 }
 
-/// Response body for `/usage/v1/spend/query`. `total_cost` is the raw, nullable
-/// `SUM(total_cost)::double precision` result -- `None` when no `usage_events` rows matched
-/// (account_id + half-open interval), `Some` (including `Some(0.0)`) when at least one row
-/// matched. Deliberately preserved as `Option<f64>` rather than collapsed to `0.0`: the caller
-/// (`lightbridge-authz-budget`'s `UsageServiceSpendReader`) depends on this exact SQL-NULL-vs-zero
-/// distinction to keep `Spend::Unavailable` distinct from `Spend::Known(0)`.
+/// Response body for `/usage/v1/spend/query`: the raw, nullable `SUM(total_cost)` -- `None` when
+/// no row matched, `Some` (including `Some(0.0)`) when one did. Never collapsed to `0.0`: the
+/// budget side keeps SQL NULL ("unknown") distinct from a known zero (`Spend::Unavailable`).
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct SpendQueryResponse {
     pub total_cost: Option<f64>,
