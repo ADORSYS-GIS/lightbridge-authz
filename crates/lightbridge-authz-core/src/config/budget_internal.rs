@@ -73,6 +73,20 @@ pub struct BudgetInternalServer {
     /// window, not against how long the usage service typically takes to come back.
     #[serde(default = "default_remaining_grace_seconds")]
     pub remaining_grace_seconds: u64,
+    /// ADR-0035 D11: the funding port. Absent = not mounted; nothing can fund.
+    #[serde(default)]
+    pub funding: Option<FundingConfig>,
+}
+
+/// Who may fund which sources. Callers present an authz-idp `client_credentials` access token;
+/// its `aud` must contain `audience`, and its `sub` must be a key of `principals`, mapping to the
+/// `budget_grants.source` values it may write (e.g. `svc:commerce: [purchase, purchase_reversal]`).
+/// The shared secret is never accepted here: it names no principal.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct FundingConfig {
+    pub audience: String,
+    #[serde(default)]
+    pub principals: std::collections::HashMap<String, Vec<String>>,
 }
 
 /// Two minutes. See [`BudgetInternalServer::remaining_grace_seconds`].

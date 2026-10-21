@@ -1,9 +1,8 @@
 # ADR-0035: Credit lives in three pools; paid and granted credit are lots, and spend is settled into the ledger
 
-- Status: **Proposed**
+- Status: Accepted
 - Date: 2026-10-21
-- Decision owners: @stephane-segning
-- Drafted by: @Koufan-De-King
+- Decision owners: @Koufan-De-King
 - Story: _to be filed_ — source of truth: *Lightbridge commercial architecture* (2026-10-07),
   sections "Credits: three pools in one ledger", "Promotions and bookkeeping" and "Top-up with
   mobile money"

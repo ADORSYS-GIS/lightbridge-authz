@@ -59,7 +59,7 @@ const MARK_STALE_SQL: &str = "UPDATE budget_remaining_snapshots \
 /// must not be already-expired (`effective_balance` would not count it, so neither may this).
 const APPLY_GRANT_DELTA_SQL: &str = "UPDATE budget_remaining_snapshots SET \
      ceiling_micros = ceiling_micros + $3, remaining_micros = remaining_micros + $3, \
-     refreshed_at = now() \
+     allowance_remaining_micros = allowance_remaining_micros + $3, refreshed_at = now() \
      WHERE budget_account_id = $1 AND period = $2 AND remaining_micros IS NOT NULL";
 
 /// Pool-backed store for `budget_remaining_snapshots`.

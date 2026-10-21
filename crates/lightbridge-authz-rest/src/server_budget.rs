@@ -1,5 +1,9 @@
 //! LoC rationale: `build_budget_router` and `start_budget_server` form the budget-domain server router & startup entrypoint (including the internal listener and reset scheduler loop).
 
+#[path = "budget_funding.rs"]
+pub mod budget_funding;
+#[path = "budget_settlement.rs"]
+mod budget_settlement;
 use std::sync::Arc;
 
 use axum::Router;
@@ -164,7 +168,8 @@ pub async fn start_budget_server(
     // The same shared `budget_services` graph `start_api_server` builds -- this server owns the
     // half of it that is actually reachable (`RpcScope::Budget`) and is the only one that spawns
     // the reset scheduler's interval task, below.
-    let services = budget_services::build_budget_services(pool.clone(), usage_service).await?;
+    let mut services = budget_services::build_budget_services(pool.clone(), usage_service).await?;
+    let settlement = budget_settlement::enable_settlement(&mut services, pool.clone(), budget);
     // ADR-0034 §15, started HERE and only here: the loop that precomputes every active account's
     // remaining balance, so `authz-opa`'s introspection can answer the gateway's budget question
     // from one indexed read instead of a second metadata call.
@@ -325,8 +330,20 @@ pub async fn start_budget_server(
         shared_secret: internal.shared_secret.clone(),
         shared_secret_header,
     });
-    let internal_app = budget_remaining::budget_remaining_router(internal_state.clone())
+    let mut internal_app = budget_remaining::budget_remaining_router(internal_state.clone())
         .with_state(internal_state);
+    if let Some(funding) = &internal.funding {
+        let principals = budget_funding::principals_from_config(funding).map_err(Error::Server)?;
+        internal_app = internal_app.merge(budget_funding::funding_router(Arc::new(
+            budget_funding::FundingState {
+                credit: Arc::new(lightbridge_authz_budget::CreditRepo::new(pool.clone())),
+                bearer: build_bearer_service(oauth2)?,
+                audience: funding.audience.clone(),
+                principals,
+                settlement_on: settlement.is_some(),
+            },
+        )));
+    }
 
     lightbridge_authz_core::log_build_info(SERVICE_BUDGET_INTERNAL);
     tracing::info!(

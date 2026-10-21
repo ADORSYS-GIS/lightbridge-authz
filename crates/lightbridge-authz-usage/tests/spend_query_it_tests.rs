@@ -401,3 +401,69 @@ async fn spend_query_refuses_a_request_carrying_an_authorization_header(pool: Pg
         "a spend query carrying an Authorization header must be refused, not answered"
     );
 }
+
+/// lightbridge-authz ADR-0035 D6: with `ingested_after`/`ingested_until` the endpoint sums by
+/// INGESTION time (`created_at`), so an event observed long ago but ingested inside the window is
+/// counted -- exactly the late event a watermark on `observed_at` would lose forever.
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn spend_query_ingested_window_counts_late_events_by_created_at(pool: PgPool) {
+    let account = cuid2();
+    let row = |observed: &str, ingested: &str, cost: i64| {
+        sqlx::query(
+            "INSERT INTO usage_events (observed_at, created_at, signal_type, account_id, source, \
+             total_cost) VALUES ($1, $2, 'logs', $3, 'eaig', $4)",
+        )
+        .bind(parse_timestamp(observed))
+        .bind(parse_timestamp(ingested))
+        .bind(account.clone())
+        .bind(cost)
+    };
+    // observed before the window, ingested inside it: counted
+    row("2026-10-20T09:00:00Z", "2026-10-21T10:05:00Z", 300)
+        .execute(&pool)
+        .await
+        .unwrap();
+    // observed and ingested inside: counted
+    row("2026-10-21T10:01:00Z", "2026-10-21T10:02:00Z", 200)
+        .execute(&pool)
+        .await
+        .unwrap();
+    // ingested exactly at `after`: excluded (half-open `(after, until]`)
+    row("2026-10-21T09:59:00Z", "2026-10-21T10:00:00Z", 7)
+        .execute(&pool)
+        .await
+        .unwrap();
+    // ingested after `until`: excluded
+    row("2026-10-21T10:09:00Z", "2026-10-21T10:11:00Z", 9)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let body = json!({
+        "account_id": account,
+        "start": "2026-10-14T10:00:00Z",
+        "end": "2026-10-22T10:10:00Z",
+        "ingested_after": "2026-10-21T10:00:00Z",
+        "ingested_until": "2026-10-21T10:10:00Z",
+    });
+    let request = Request::builder()
+        .method("POST")
+        .uri("/usage/v1/spend/query")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let response = app(pool.clone()).await.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let parsed: SpendQueryResponse = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(parsed.total_cost, Some(500.0));
+
+    let (status, _) = query_spend(
+        app(pool).await,
+        &account,
+        parse_timestamp("2026-10-21T10:00:00Z"),
+        parse_timestamp("2026-10-21T10:10:00Z"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the observed_at form is unchanged");
+}

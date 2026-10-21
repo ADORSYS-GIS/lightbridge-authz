@@ -103,6 +103,18 @@ pub trait UsageRepoTrait: Send + Sync {
     /// Reads the last successful retention purge cutoff (P2) -- `None` when the job has never run,
     /// so no range is truncated by retention. See `StoreRepo::last_purge_cutoff`.
     async fn last_purge_cutoff(&self) -> Result<Option<DateTime<Utc>>>;
+    /// ADR-0035 D6 settlement window: spend ingested in `ingested` (`created_at`, half-open
+    /// `(after, until]`), bounded below on `observed` for partition pruning.
+    async fn spend_ingested_for_account(
+        &self,
+        _account_id: &str,
+        _observed: (DateTime<Utc>, DateTime<Utc>),
+        _ingested: (DateTime<Utc>, DateTime<Utc>),
+    ) -> Result<Option<f64>> {
+        Err(lightbridge_authz_core::Error::Server(
+            "ingested-spend query is not supported by this store".to_string(),
+        ))
+    }
 }
 
 #[async_trait]
@@ -162,5 +174,14 @@ impl UsageRepoTrait for StoreRepo {
 
     async fn last_purge_cutoff(&self) -> Result<Option<DateTime<Utc>>> {
         StoreRepo::last_purge_cutoff(self).await
+    }
+
+    async fn spend_ingested_for_account(
+        &self,
+        account_id: &str,
+        observed: (DateTime<Utc>, DateTime<Utc>),
+        ingested: (DateTime<Utc>, DateTime<Utc>),
+    ) -> Result<Option<f64>> {
+        crate::spend::spend_ingested_for_account(self.pool(), account_id, observed, ingested).await
     }
 }
