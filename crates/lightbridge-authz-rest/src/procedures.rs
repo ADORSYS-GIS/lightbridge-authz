@@ -1317,12 +1317,9 @@ impl schema::procedures::ProcedureRegistry for Procedures {
                 .map_err(budget_error_to_cratestack_error)?;
 
             let snapshot = budget_repo
-                .get_balance(&subject, &period)
+                .reported_balance(&subject, &period)
                 .await
-                .map_err(budget_error_to_cratestack_error)?
-                .unwrap_or_else(|| {
-                    lightbridge_authz_budget::repo::BalanceSnapshot::zero(&subject, &period)
-                });
+                .map_err(budget_error_to_cratestack_error)?;
 
             Ok(to_schema_budget_balance(snapshot))
         }
@@ -1353,15 +1350,9 @@ impl schema::procedures::ProcedureRegistry for Procedures {
                 .map_err(budget_error_to_cratestack_error)?;
 
             let snapshot = budget_repo
-                .get_balance(&budget_account_id, &period)
+                .reported_balance(&budget_account_id, &period)
                 .await
-                .map_err(budget_error_to_cratestack_error)?
-                .unwrap_or_else(|| {
-                    lightbridge_authz_budget::repo::BalanceSnapshot::zero(
-                        &budget_account_id,
-                        &period,
-                    )
-                });
+                .map_err(budget_error_to_cratestack_error)?;
 
             Ok(to_schema_budget_balance(snapshot))
         }
