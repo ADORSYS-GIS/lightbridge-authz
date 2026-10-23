@@ -36,9 +36,18 @@
 > Settlement ran in production before the revert, so its allowance `consumption` rows, and the
 > `budget_balances` debits booked with them, are permanent (ADR-0009). The reverted reads treat
 > them as spend, never credit: the ceiling (`/budget/v1/remaining`, the snapshot refresher, the reset
-> scheduler, refill facts) skips both settlement sources, and the balance RPCs add them back onto the
-> projection, as #776 did. `20261023000001` refuses to migrate only a database holding granted or
-> paid credit, which no period-scoped read can see.
+> scheduler, refill facts) skips `consumption`, and the balance RPCs add it back onto the projection,
+> as #776 did. An allowance `expiry` row is counted. D8's reset scheduler booked a reset-down that
+> way where the reverted scheduler books a negative `correction`, and settlement booked `expiry` only
+> against lots, which carry no period. `20261023000001` refuses to migrate only a database holding
+> granted or paid credit, which no period-scoped read can see.
+>
+> **Correction (2026-10-23).** The release that withdrew this ADR skipped allowance `expiry` rows as
+> well, and the header of `20261023000001_adr_0035_withdrawal_guard.sql` repeats that mistake: it
+> says settlement booked `expiry` only against a lot, and misses D8's reset-downs. In the October 2026
+> period, that let an account reset down while settlement ran keep its pre-reset ceiling, until the
+> follow-up release counted those rows again. The migration file is applied and frozen, so this
+> note is where its header is corrected.
 >
 > The body below is kept unedited, as the record of what was decided and built.
 
