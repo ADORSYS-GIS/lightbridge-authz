@@ -22,13 +22,21 @@ nothing.
 
 Two belts, both mandatory:
 
-1. **The replica**, never the primary. `lightbridge-main-db-2` is the physical replica.
+1. **The replica**, never the primary — and **find it at the time you run**, never from memory or
+   from this file: a failover swaps the roles, and the pod name does not change with them. The
+   label says which is which; `pg_is_in_recovery()` proves it.
 2. **`SET LOCAL default_transaction_read_only = on`** inside an explicit transaction, so a mistyped
    statement fails rather than lands.
 
 ```bash
-zsh -i -c 'kubectl --context hetzner-prod -n converse port-forward pod/lightbridge-main-db-2 55434:5432'
+# 0. Find the replica NOW. CNPG fails over and the pod NAME is not the role: on 2026-10-08
+#    lightbridge-main-db-2 -- long documented here as "the replica" -- was the PRIMARY.
+zsh -i -c 'kubectl --context hetzner-prod -n converse get pods -l cnpg.io/instanceRole=replica -o name' | grep main-db
+REPLICA=lightbridge-main-db-<n>   # the pod the line above printed, without the pod/ prefix
+zsh -i -c "kubectl --context hetzner-prod -n converse port-forward pod/$REPLICA 55434:5432"
 DSN="postgres://<user>:<pw>@localhost:55434/usage"
+# Before the first EXPLAIN, prove it from inside Postgres -- must print `t`; stop otherwise.
+psql "$DSN" -X -At -c "SELECT pg_is_in_recovery();"
 
 psql "$DSN" -X -q -v ON_ERROR_STOP=1 -c \
   "BEGIN; SET LOCAL default_transaction_read_only = on;
