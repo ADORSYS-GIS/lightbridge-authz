@@ -122,7 +122,7 @@ const REBUILD_ALL_BALANCES_SQL: &str = "SELECT \
      GROUP BY budget_account_id, period";
 
 const EFFECTIVE_BALANCE_SQL: &str = "SELECT COALESCE(SUM(amount_micros), 0)::bigint \
-     FROM budget_grants WHERE source NOT IN ('consumption','expiry') \
+     FROM budget_grants WHERE source <> 'consumption' \
        AND budget_account_id = $1 AND period = $2 \
        AND (expires_at IS NULL OR expires_at > $3) \
        AND revoked_at IS NULL";

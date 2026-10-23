@@ -3,9 +3,11 @@
 //! allowance rows with source `consumption` and `expiry`, forever (append-only, ADR-0009), and the
 //! `budget_balances` projection was debited by the same amounts. The ledger-history reads must
 //! still return those rows (before `GrantSource` learned the two read-only variants, both failed
-//! with `StorageFailed`, a 500 on the RPC), and no balance read may count them as credit: every
-//! caller subtracts the period's spend itself, so a settled row counted as credit is spend
-//! subtracted twice.
+//! with `StorageFailed`, a 500 on the RPC). No balance read may count a `consumption` row as
+//! credit: every caller subtracts the period's spend itself, so a settled row counted as credit is
+//! spend subtracted twice. An allowance `expiry` row is the reverse: the ADR-0035 reset scheduler
+//! booked a reset-down that way, so it is less credit and must lower the ceiling, exactly as the
+//! negative `correction` the reverted scheduler books does.
 
 use std::sync::Arc;
 
@@ -27,7 +29,7 @@ async fn seed_historical_settlement_rows(pool: &PgPool) {
          VALUES \
          ('h1', 'hist-a', 'hist-a', '2026-09', 5000000, 'base', NULL), \
          ('h2', 'hist-a', 'hist-a', '2026-09', -1000000, 'consumption', 'settle:h2'), \
-         ('h3', 'hist-a', 'hist-a', '2026-09', -250000, 'expiry', 'expire:h3')",
+         ('h3', 'hist-a', 'hist-a', '2026-09', -250000, 'expiry', 'reset:h3')",
     )
     .execute(pool)
     .await
@@ -65,7 +67,7 @@ async fn a_historical_settlement_row_reads_back_with_its_source(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn the_ceiling_never_counts_a_settlement_row_as_credit(pool: PgPool) {
+async fn the_ceiling_skips_settled_spend_but_counts_a_reset_down(pool: PgPool) {
     seed_historical_settlement_rows(&pool).await;
     let repo = BudgetRepo::new(Arc::new(DbPool::from_pool(pool)));
     let period = Period::parse("2026-09").expect("valid period");
@@ -75,13 +77,13 @@ async fn the_ceiling_never_counts_a_settlement_row_as_credit(pool: PgPool) {
         .await
         .expect("ceiling");
     assert_eq!(
-        ceiling, 5_000_000,
-        "the ceiling is the credit granted; the settled 1.25 is spend the caller subtracts itself"
+        ceiling, 4_750_000,
+        "5.00 granted, minus the 0.25 reset-down; the settled 1.00 is spend the caller subtracts itself"
     );
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn the_reported_balance_adds_settlement_debits_back(pool: PgPool) {
+async fn the_reported_balance_adds_settled_spend_back_but_not_a_reset_down(pool: PgPool) {
     seed_historical_settlement_rows(&pool).await;
     sqlx::query(
         "INSERT INTO budget_balances \
@@ -90,7 +92,7 @@ async fn the_reported_balance_adds_settlement_debits_back(pool: PgPool) {
     )
     .execute(&pool)
     .await
-    .expect("seed the projection as settlement left it: granted minus both debits");
+    .expect("seed the projection as ADR-0035 left it: granted minus both negative rows");
     let repo = BudgetRepo::new(Arc::new(DbPool::from_pool(pool)));
     let period = Period::parse("2026-09").expect("valid period");
 
@@ -98,5 +100,8 @@ async fn the_reported_balance_adds_settlement_debits_back(pool: PgPool) {
         .reported_balance("hist-a", &period)
         .await
         .expect("reported balance");
-    assert_eq!(reported.effective_budget_micros, 5_000_000);
+    assert_eq!(
+        reported.effective_budget_micros, 4_750_000,
+        "the settled 1.00 comes back; the 0.25 reset-down stays deducted"
+    );
 }
