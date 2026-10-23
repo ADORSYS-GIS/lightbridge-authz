@@ -1,6 +1,6 @@
 # ADR-0035: Credit lives in three pools; paid and granted credit are lots, and spend is settled into the ledger
 
-- Status: Accepted
+- Status: **Withdrawn** (2026-10-23) — reverted; see the withdrawal note below.
 - Date: 2026-10-21
 - Decision owners: @Koufan-De-King
 - Story: _to be filed_ — source of truth: *Lightbridge commercial architecture* (2026-10-07),
@@ -20,6 +20,21 @@
   - [ADR-0034](0034-dynamic-budget-limiter.md) §15 — the snapshot's ceiling becomes the sum of the
     pools, and its spend becomes debt plus the unsettled tail (D9). The gateway contract and the
     introspection fields do not change.
+
+> **Withdrawal note (2026-10-23).** The code this ADR introduced is reverted, together with its
+> follow-up #776. Purchased lots, promotions and a funding port shaped for one merchant are the
+> ledger of the deployment that sells credit, not the open core's: that deployment keeps those
+> pools itself and reads this service through its public ports. ADR-0008, ADR-0009, ADR-0032 and
+> ADR-0034 are therefore back in force as written, without the amendments listed above.
+>
+> Two things stay. The migration `20261021000001_credit_pools_lots_settlement.sql` remains applied
+> and frozen: the columns and tables it added are dead from the revert, and a contract migration
+> drops them one release later (ADR-0031). The usage spend query's ingestion-time window
+> (`ingested_after`/`ingested_until`) and its index stay too, because any settlement-style reader
+> needs them and nothing in them is specific to this ADR. `20261023000001` refuses to migrate a
+> database that already holds rows the reverted ledger would miscount.
+>
+> The body below is kept unedited, as the record of what was decided and built.
 
 ## Context
 

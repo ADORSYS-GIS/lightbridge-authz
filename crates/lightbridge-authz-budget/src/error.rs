@@ -61,17 +61,6 @@ pub enum BudgetError {
     /// this scheduler could ever execute.
     #[error("invalid budget reset schedule: {0}")]
     InvalidSchedule(String),
-    /// ADR-0035 D11: a `purchase_reversal` larger than what is left of the purchase it names.
-    /// Credit already consumed cannot be refunded as credit.
-    #[error("cannot reverse {requested} micro-USD: only {remaining} remains of that purchase")]
-    ReversalExceedsLot { requested: i64, remaining: i64 },
-    /// ADR-0035 D11: an idempotency key replayed with a different account, source or amount.
-    #[error("idempotency key already used for a different request: {0}")]
-    IdempotencyConflict(String),
-    /// ADR-0035 D11: the caller may not write this source (not in its principal map, or not a
-    /// funding source at all).
-    #[error("funding refused: {0}")]
-    FundingRefused(String),
 }
 
 pub type Result<T> = std::result::Result<T, BudgetError>;

@@ -32,17 +32,6 @@ pub(crate) async fn refresh_one_account(
     period: Period,
     now: DateTime<Utc>,
 ) -> Result<bool, BudgetError> {
-    if let Some(settlement) = reset_scheduler.settlement().cloned() {
-        return crate::snapshot_refresh_pools::refresh_pools(
-            store,
-            settlement,
-            reset_scheduler,
-            account_id,
-            period,
-            now,
-        )
-        .await;
-    }
     let spent_micros = match spend_reader
         .observe_spend_for_account(&account_id, &period)
         .await?

@@ -76,11 +76,6 @@ server:
     snapshot_seed_lookback_days: 30
     snapshot_batch: 500
     snapshot_concurrency: 8
-    # ADR-0035 D6: seconds between settlement passes, which book usage spend into the ledger in
-    # spending order (allowance, then granted, then paid credit). 0 (the default) leaves the
-    # pool-aware ledger OFF: resets and the snapshot keep their ADR-0032/0034 behaviour, and the
-    # funding port below refuses to fund. Turning it on makes resets clamp the allowance pool only.
-    settlement_seconds: 0
   # authz-budget's SECOND listener (ADR-0034 + its 2026-09-03 amendment, lightbridge-authz#658):
   # the internal read `GET /budget/v1/remaining` the gateway's Dynamic Budget Limiter calls
   # through Authorino. A separate port, not a route on `budget` above, so the console's bearer-JWT
@@ -109,14 +104,6 @@ server:
     # Seconds the last known spend reading may still be served after the usage service stops
     # answering, before the balance is reported as unknowable (503 budget_unavailable).
     remaining_grace_seconds: 120
-    # ADR-0035 D11: POST /budget/v1/fund, mounted on this listener only when this block is set.
-    # Callers present an authz-idp client_credentials token (ADR-0030, sub = svc:<client_id>) whose
-    # aud contains `audience`; `principals` maps each subject to the sources it may write. The
-    # shared secret above is never accepted there. Requires settlement_seconds > 0.
-    # funding:
-    #   audience: "lightbridge-budget-funding"
-    #   principals:
-    #     "svc:commerce": [purchase, purchase_reversal]
 logging:
   level: "info"
 database:

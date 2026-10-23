@@ -482,7 +482,6 @@ mod db {
             snapshot_seed_lookback_days: 30,
             snapshot_batch: 500,
             snapshot_concurrency: 8,
-            settlement_seconds: 0,
         }
     }
 
@@ -553,7 +552,6 @@ mod db {
             shared_secret: "   ".to_string(),
             shared_secret_header: "x-lightbridge-budget-token".to_string(),
             remaining_grace_seconds: 120,
-            funding: None,
         };
 
         let err = lightbridge_authz_rest::start_budget_server(
@@ -601,7 +599,6 @@ mod db {
             shared_secret: "a-real-secret".to_string(),
             shared_secret_header: "x-lightbridge-budget-token".to_string(),
             remaining_grace_seconds: 120,
-            funding: None,
         };
 
         let err = lightbridge_authz_rest::start_budget_server(

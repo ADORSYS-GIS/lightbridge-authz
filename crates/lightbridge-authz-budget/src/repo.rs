@@ -118,12 +118,12 @@ const REBUILD_ALL_BALANCES_SQL: &str = "SELECT \
         AS self_service_grant_count, \
      COALESCE(SUM(CASE WHEN source = 'automatic' THEN 1 ELSE 0 END), 0)::int \
         AS automatic_grant_count \
-     FROM budget_grants WHERE pool = 'allowance' \
+     FROM budget_grants \
      GROUP BY budget_account_id, period";
 
 const EFFECTIVE_BALANCE_SQL: &str = "SELECT COALESCE(SUM(amount_micros), 0)::bigint \
-     FROM budget_grants WHERE source NOT IN ('consumption','expiry') \
-       AND budget_account_id = $1 AND period = $2 \
+     FROM budget_grants \
+     WHERE budget_account_id = $1 AND period = $2 \
        AND (expires_at IS NULL OR expires_at > $3) \
        AND revoked_at IS NULL";
 
@@ -150,7 +150,7 @@ const GET_GRANT_BY_ID_SQL: &str = "SELECT \
      id, budget_account_id, account_id, project_id, period, amount_micros, source, \
      actor_id, reason, policy_revision, matched_rule_ids, idempotency_key, trigger_key, \
      created_at, expires_at, revoked_at \
-     FROM budget_grants WHERE id = $1 AND pool = 'allowance'";
+     FROM budget_grants WHERE id = $1";
 
 // `period` is `$2::text` -- an untyped `NULL` bind for an omitted period filter would otherwise
 // require sqlx to infer the parameter's Postgres type from context, which it cannot always do
@@ -164,7 +164,7 @@ const LIST_GRANTS_SQL: &str = "SELECT \
      actor_id, reason, policy_revision, matched_rule_ids, idempotency_key, trigger_key, \
      created_at, expires_at, revoked_at \
      FROM budget_grants \
-     WHERE budget_account_id = $1 AND pool = 'allowance' \
+     WHERE budget_account_id = $1 \
        AND ($2::text IS NULL OR period = $2) \
        AND ($3::timestamptz IS NULL OR created_at < $3) \
      ORDER BY created_at DESC \
@@ -319,7 +319,16 @@ fn storage_failed(err: sqlx::Error) -> BudgetError {
 }
 
 fn validate_amount_sign(source: GrantSource, amount_micros: i64) -> Result<(), BudgetError> {
-    source.validate_allowance_amount(amount_micros)
+    let sign_is_valid = match source {
+        GrantSource::Correction => amount_micros != 0,
+        _ => amount_micros > 0,
+    };
+
+    if sign_is_valid {
+        Ok(())
+    } else {
+        Err(BudgetError::InvalidAmount(amount_micros))
+    }
 }
 
 impl BudgetRepo {

@@ -128,9 +128,6 @@ pub struct ResetScheduler {
     schedules: Arc<ResetScheduleRepo>,
     budget_repo: Arc<BudgetRepo>,
     spend_reader: Arc<dyn SpendReader>,
-    /// ADR-0035: `Some` when the pool-aware ledger is on. A reset then settles first, clamps the
-    /// allowance pool only, books a reset-down as `expiry`, and forgives debt (D8).
-    settlement: Option<Arc<crate::settlement::Settlement>>,
 }
 
 impl ResetScheduler {
@@ -149,17 +146,7 @@ impl ResetScheduler {
             pool,
             budget_repo,
             spend_reader,
-            settlement: None,
         }
-    }
-
-    pub fn with_settlement(mut self, settlement: Arc<crate::settlement::Settlement>) -> Self {
-        self.settlement = Some(settlement);
-        self
-    }
-
-    pub fn settlement(&self) -> Option<&Arc<crate::settlement::Settlement>> {
-        self.settlement.as_ref()
     }
 
     /// The schedule repository, for the CRUD procedures. Exposed rather than re-wrapped: the
@@ -353,30 +340,21 @@ impl ResetScheduler {
                 continue;
             }
 
+            let effective_budget = self
+                .budget_repo
+                .effective_balance(&account_id, &period, now)
+                .await?;
+
             // Read once per account, then used for BOTH the delta and the reported remaining, so
             // a preview can never quote a different number from the one the write is derived from.
             // A transport error is mapped to `Unavailable` rather than aborting the pass: an
             // unreachable usage service is "we don't know", the same as a `NULL` sum — see
-            // `spend.rs`'s module doc. ADR-0035 D8: with settlement on, "remaining" is the SETTLED
-            // allowance -- it already carries the settled consumption, so spend is zero on top.
-            let (effective_budget, spend) = match &self.settlement {
-                Some(settlement) => match settlement
-                    .settle_for_reset(&account_id, &period, now)
-                    .await?
-                {
-                    Some(allowance) => (allowance, Spend::Known(0)),
-                    None => (0, Spend::Unavailable),
-                },
-                None => (
-                    self.budget_repo
-                        .effective_balance(&account_id, &period, now)
-                        .await?,
-                    self.spend_reader
-                        .spend_for_account(&account_id, &period)
-                        .await
-                        .unwrap_or(Spend::Unavailable),
-                ),
-            };
+            // `spend.rs`'s module doc.
+            let spend = self
+                .spend_reader
+                .spend_for_account(&account_id, &period)
+                .await
+                .unwrap_or(Spend::Unavailable);
 
             let (remaining_micros, delta_micros) = match (schedule.mode, spend) {
                 // A top-up never needs spend to decide: it adds a fixed amount whatever the
@@ -409,9 +387,6 @@ impl ResetScheduler {
                 }
             };
 
-            if let (Some(settlement), false) = (&self.settlement, dry_run) {
-                settlement.forgive_debt(&account_id).await?;
-            }
             if delta_micros == 0 {
                 // Already exactly on target. `budget_grants_amount_sign_chk` rejects a zero-amount
                 // row anyway, and a no-op ledger entry would be audit noise.
@@ -420,10 +395,7 @@ impl ResetScheduler {
 
             if !dry_run {
                 let key = trigger_key(&schedule.id, window_start, &account_id);
-                let source = if delta_micros < 0 && self.settlement.is_some() {
-                    // ADR-0035 D8: unused allowance expiring at a reset, booked as what it is.
-                    GrantSource::Expiry
-                } else if delta_micros < 0 {
+                let source = if delta_micros < 0 {
                     // ADR-0009: the ledger is append-only, and `correction` is the ONLY source its
                     // `budget_grants_amount_sign_chk` permits to be negative — the refund-type
                     // compensating row a reset-down is booked as, per the owner's binding ruling.
