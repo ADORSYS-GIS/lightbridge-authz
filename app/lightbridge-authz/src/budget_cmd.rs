@@ -135,6 +135,11 @@ async fn grant(
     let parsed_source = GrantSource::from_str(source).map_err(|err| {
         Error::BadRequest(format!("--source {source} is not a grant source: {err}"))
     })?;
+    if !parsed_source.is_writable() {
+        return Err(Error::BadRequest(format!(
+            "--source {source} is read-only: it only labels rows the withdrawn ADR-0035 booked"
+        )));
+    }
 
     let exists: Option<(i32,)> = sqlx::query_as(ACCOUNT_EXISTS_SQL)
         .bind(account)
