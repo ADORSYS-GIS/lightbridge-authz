@@ -12,8 +12,11 @@
 --    `spend_units::period_bounds_utc` defines it). The pre-ADR-0035 read sums the period's rows
 --    and then subtracts the period's live spend, so a settled `consumption` row would be
 --    subtracted twice. Rows from past periods are left alone: `budget_grants` is append-only
---    (ADR-0009), and no balance read looks at a past period. The safe order is therefore:
---    set `server.budget.settlement_seconds` to 0, let the period roll over, then deploy.
+--    (ADR-0009), and no automated balance read (the reset scheduler, the snapshot refresher, the
+--    token mint) looks at a past period. A caller can still ask for one explicitly, and gets that
+--    period's history as it was booked. The safe order is therefore: set
+--    `server.budget.settlement_seconds` to 0 on every running pod, let the period roll over, then
+--    deploy.
 --
 -- No `EXCEPTION WHEN OTHERS`; the RAISE is the point. The migration is recorded as applied only
 -- once it passes, so a refused deploy simply runs it again on the next attempt.
