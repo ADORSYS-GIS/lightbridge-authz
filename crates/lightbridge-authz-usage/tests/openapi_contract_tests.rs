@@ -507,3 +507,41 @@ fn usage_openapi_should_be_openapi_3() {
         "expected an OpenAPI 3.x document, got {version}"
     );
 }
+
+/// #767: pins the `subject_id` dimension end to end in the published contract -- a group-by
+/// member, an equality filter, and a nullable point echo. A generated client (the console's
+/// `openapi/usage.backend.yaml`) reads all three to build lightbridge-governance#36's admin view.
+#[test]
+fn usage_openapi_should_publish_execution_subject_dimension() {
+    let doc = usage_openapi();
+    let schemas = &doc["components"]["schemas"];
+
+    let group_by: Vec<&str> = schemas["ExecutionGroupBy"]["enum"]
+        .as_array()
+        .expect("ExecutionGroupBy should publish an enum")
+        .iter()
+        .filter_map(|value| value.as_str())
+        .collect();
+    assert!(
+        group_by.contains(&"subject_id"),
+        "expected subject_id in ExecutionGroupBy, got {group_by:?}"
+    );
+
+    assert!(
+        schemas["ExecutionQueryFilters"]["properties"]
+            .get("subject_id")
+            .is_some(),
+        "expected ExecutionQueryFilters.subject_id in the published schema"
+    );
+
+    let echo = &schemas["ExecutionSeriesPoint"]["properties"]["subject_id"];
+    let echo_type: Vec<&str> = echo["type"]
+        .as_array()
+        .map(|values| values.iter().filter_map(|value| value.as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        echo_type.contains(&"null"),
+        "ExecutionSeriesPoint.subject_id must publish as nullable -- null IS the unattributed \
+         bucket -- got {echo:?}"
+    );
+}

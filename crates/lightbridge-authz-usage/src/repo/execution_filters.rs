@@ -46,4 +46,8 @@ pub(super) fn push_execution_scope_filters(
         builder.push(" AND mc.model = ");
         builder.push_bind(model);
     }
+    if let Some(subject_id) = &input.filters.subject_id {
+        builder.push(" AND ui.subject_id = ");
+        builder.push_bind(subject_id);
+    }
 }
