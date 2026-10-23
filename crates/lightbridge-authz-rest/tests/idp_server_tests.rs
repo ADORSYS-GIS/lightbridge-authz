@@ -2068,7 +2068,6 @@ mod db {
             snapshot_seed_lookback_days: 30,
             snapshot_batch: 500,
             snapshot_concurrency: 8,
-            settlement_seconds: 0,
         };
         let err = start_budget_server(
             &budget,

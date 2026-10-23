@@ -9,15 +9,19 @@ pub(super) const DEPRECATED_KEYS: &[(&str, &str)] = &[(
     "use oauth2.federation.issuer instead",
 )];
 
-/// Every configuration key the serde structs in this `config` module accept, by dotted path.
+/// The complete set of configuration keys the serde structs in this `config` module accept,
+/// indexed by dotted path.
 ///
-/// A hand-maintained mirror of the struct fields in `mod.rs`, `budget_server.rs`,
-/// `budget_internal.rs` and `claim_mapper.rs`, updated whenever a key changes; the sync tests in
+/// This is a hand-maintained mirror of the struct fields in `mod.rs` (plus `budget_server.rs`,
+/// `budget_internal.rs` and `claim_mapper.rs`). It is NOT derived from the structs, so it must be
+/// updated whenever a config key is added, renamed or removed -- the sync tests in
 /// `tests/config_tests.rs` (`known_keys_flag_no_spurious_warnings_on_fully_populated_config` and
 /// `known_keys_descend_into_every_config_section`) fail loudly when it drifts.
 ///
-/// A path absent here makes `walk` early-return for that whole subtree (how free-form maps such as
-/// `funding.principals` opt out). No struct has `deny_unknown_fields`: this table is the warning.
+/// A path absent from this table makes `walk`'s `get_known_fields` early-return, silently stopping
+/// the walk for that whole subtree -- so a section missing here is precisely the misconfiguration
+/// this module exists to catch. There is no `deny_unknown_fields` on the config structs, so an
+/// unmapped key deserializes as ignored; this table is what turns that silence into a warning.
 pub(super) const KNOWN_KEYS: &[(&str, &[&str])] = &[
     (
         "",
@@ -71,7 +75,6 @@ pub(super) const KNOWN_KEYS: &[(&str, &[&str])] = &[
             "snapshot_seed_lookback_days",
             "snapshot_batch",
             "snapshot_concurrency",
-            "settlement_seconds",
         ],
     ),
     (
@@ -87,12 +90,7 @@ pub(super) const KNOWN_KEYS: &[(&str, &[&str])] = &[
             "shared_secret",
             "shared_secret_header",
             "remaining_grace_seconds",
-            "funding",
         ],
-    ),
-    (
-        "server.budget_internal.funding",
-        &["audience", "principals"],
     ),
     (
         "server.budget_internal.tls",

@@ -79,11 +79,6 @@ pub struct BudgetServer {
     /// background job or a thundering herd.
     #[serde(default = "default_snapshot_concurrency")]
     pub snapshot_concurrency: u16,
-    /// ADR-0035 D6: how often settlement books spend into the ledger, in seconds. `0` (the
-    /// default) leaves the pool-aware ledger OFF: no settlement, and resets and the snapshot keep
-    /// their ADR-0032/0034 behaviour. The funding port refuses to fund while this is off.
-    #[serde(default)]
-    pub settlement_seconds: u64,
 }
 
 /// Fifteen seconds. See [`BudgetServer::snapshot_refresh_seconds`].

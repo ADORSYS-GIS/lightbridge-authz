@@ -455,12 +455,15 @@ async fn get_my_budget_balance_reads_own_zero_then_granted_balance() {
     );
 }
 
-/// Settlement (ADR-0035 D10) debits `budget_balances.effective_budget_micros` with every allowance
-/// `consumption` row, so the stored column is the SETTLED balance. The RPC must still report the
-/// credit GRANTED: its consumers subtract this period's spend themselves, and handing them the
-/// settled figure counted every settled micro-dollar twice -- live on the console as
-/// `-$43.07` of `$1.45` for an account with $1.45 left. The debit below is booked exactly the way
-/// `settlement_debit` books it: the ledger row plus the projection debit, in one transaction.
+/// Settlement ran in production before ADR-0035 was withdrawn: for every settled micro-dollar it
+/// booked an allowance `consumption` row AND debited `budget_balances.effective_budget_micros`, so
+/// for those periods the stored column is the SETTLED balance, and it stays that way (the ledger is
+/// append-only, the projection only moves with a grant). The RPC must still report the credit
+/// GRANTED: its consumers subtract this period's spend themselves, and handing them the settled
+/// figure counted every settled micro-dollar twice -- live on the console as `-$43.07` of `$1.45`
+/// for an account with $1.45 left (#776). The debit below is booked exactly the way the withdrawn
+/// `settlement_debit` booked it: the ledger row plus the projection debit, in one transaction. It
+/// names no `pool`, so the test outlives the contract migration that drops that column.
 #[tokio::test]
 async fn budget_balance_rpcs_report_granted_credit_after_settlement_debits() {
     use lightbridge_authz_core::authz::PermissionSet;
@@ -505,8 +508,8 @@ async fn budget_balance_rpcs_report_granted_credit_after_settlement_debits() {
 
     let mut tx = ctx.verify.begin().await.expect("begin");
     sqlx::query(
-        "INSERT INTO budget_grants (id, budget_account_id, account_id, pool, period, amount_micros, \
-         source, reason, trigger_key) VALUES ($1, $2, $2, 'allowance', $3, -2000000, 'consumption', \
+        "INSERT INTO budget_grants (id, budget_account_id, account_id, period, amount_micros, \
+         source, reason, trigger_key) VALUES ($1, $2, $2, $3, -2000000, 'consumption', \
          'ADR-0035 settlement', $4)",
     )
     .bind(cuid2())

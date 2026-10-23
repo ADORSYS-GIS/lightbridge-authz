@@ -138,23 +138,7 @@ pub trait SpendReader: Send + Sync + std::fmt::Debug {
             Spend::Unavailable => SpendObservation::Unreachable,
         })
     }
-
-    /// ADR-0035 D6: spend INGESTED in `(after, until]` (`usage_events.created_at`), never by event
-    /// time -- a late event must not land behind the settlement watermark. Defaults to
-    /// `Unreachable` so a reader that cannot answer it makes settlement defer, never guess.
-    async fn observe_spend_ingested(
-        &self,
-        _account_id: &str,
-        _after: DateTime<Utc>,
-        _until: DateTime<Utc>,
-    ) -> Result<SpendObservation, BudgetError> {
-        Ok(SpendObservation::Unreachable)
-    }
 }
-
-/// How far before the watermark an ingested event's `observed_at` may lie and still be counted --
-/// a lower bound that lets a partitioned `usage_events` skip old chunks (ADR-0035 D6).
-const MAX_INGEST_LATENESS: chrono::Duration = chrono::Duration::days(7);
 
 /// Wire request body for `POST {base_url}/usage/v1/spend/query`, matching
 /// `lightbridge_authz_usage_rest::models::SpendQueryRequest` field-for-field. No shared crate
@@ -166,10 +150,6 @@ struct SpendQueryRequest {
     account_id: String,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    ingested_after: Option<DateTime<Utc>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    ingested_until: Option<DateTime<Utc>>,
 }
 
 /// Wire response body for `/usage/v1/spend/query`, matching
@@ -373,21 +353,13 @@ impl UsageServiceSpendReader {
         period: &Period,
     ) -> Result<SpendObservation, BudgetError> {
         let (start, end) = period_bounds_utc(period);
-        self.post_spend_query(SpendQueryRequest {
+        let url = format!("{}/usage/v1/spend/query", self.base_url);
+        let request = SpendQueryRequest {
             account_id: account_id.to_string(),
             start,
             end,
-            ingested_after: None,
-            ingested_until: None,
-        })
-        .await
-    }
+        };
 
-    async fn post_spend_query(
-        &self,
-        request: SpendQueryRequest,
-    ) -> Result<SpendObservation, BudgetError> {
-        let url = format!("{}/usage/v1/spend/query", self.base_url);
         let response = match self.client.post(&url).json(&request).send().await {
             Ok(response) => response,
             Err(err) => {
@@ -462,22 +434,6 @@ impl SpendReader for UsageServiceSpendReader {
         period: &Period,
     ) -> Result<SpendObservation, BudgetError> {
         self.observe(account_id, period).await
-    }
-
-    async fn observe_spend_ingested(
-        &self,
-        account_id: &str,
-        after: DateTime<Utc>,
-        until: DateTime<Utc>,
-    ) -> Result<SpendObservation, BudgetError> {
-        self.post_spend_query(SpendQueryRequest {
-            account_id: account_id.to_string(),
-            start: after - MAX_INGEST_LATENESS,
-            end: until + chrono::Duration::days(1),
-            ingested_after: Some(after),
-            ingested_until: Some(until),
-        })
-        .await
     }
 }
 

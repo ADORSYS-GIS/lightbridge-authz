@@ -13,10 +13,6 @@ pub mod amount;
 pub mod augmentation;
 mod balance_read;
 pub mod budget_ticker;
-pub mod credit_balance;
-pub mod credit_repo;
-mod credit_reversal;
-mod credit_sql;
 pub mod decision;
 pub mod effective_schedule;
 pub mod error;
@@ -27,7 +23,6 @@ pub mod period_start;
 mod period_start_report;
 pub mod policy_store;
 mod policy_store_sql;
-pub mod pool;
 pub mod refill;
 pub mod remaining;
 mod remaining_cache;
@@ -41,21 +36,15 @@ pub mod reset_schedule_validate;
 pub mod reset_scheduler;
 pub mod review;
 pub mod rule_data;
-pub mod settlement;
-pub mod settlement_alloc;
-mod settlement_book;
-mod settlement_debit;
 pub mod snapshot;
 pub mod snapshot_config;
 mod snapshot_coverage;
 mod snapshot_lanes;
 mod snapshot_refresh_loop;
 mod snapshot_refresh_one;
-mod snapshot_refresh_pools;
 pub mod snapshot_refresher;
 mod snapshot_seed;
 pub mod snapshot_store;
-mod snapshot_store_pools;
 pub mod source;
 pub mod spend;
 mod spend_units;
@@ -69,8 +58,6 @@ pub use augmentation::{
     NewAugmentationRequest, RecordedDecision, UnapprovedDecision,
 };
 pub use budget_ticker::{BudgetTickReport, BudgetTicker};
-pub use credit_balance::SettledBalances;
-pub use credit_repo::{CreditRepo, FundOutcome, FundRequest};
 pub use decision::{Decision, Effect, Obligations, PolicyEngine};
 pub use effective_schedule::EffectiveSchedule;
 pub use error::BudgetError;
@@ -78,7 +65,6 @@ pub use facts::Facts;
 pub use period::Period;
 pub use period_start::{PeriodReport, PeriodStartGrants, PeriodStartReport};
 pub use policy_store::PolicyStore;
-pub use pool::CreditPool;
 pub use refill::{RefillRequest, RefillService, RefillStatus};
 pub use remaining::{
     BudgetRemaining, Remaining, RemainingReader, RemainingService, SnapshotRemainingService,
@@ -95,8 +81,6 @@ pub use rule_data::{
     Condition, Field, Operator, Rule, RuleDataEngine, RuleSet, default_rule_set_json,
     validate_rule_data,
 };
-pub use settlement::{SETTLE_LAG, SettleOutcome, Settlement};
-pub use settlement_book::Booked;
 pub use snapshot::{
     BudgetSnapshot, BudgetSnapshotReader, CoverageCounts, RefreshReport, SnapshotRefreshConfig,
 };
