@@ -455,6 +455,128 @@ async fn get_my_budget_balance_reads_own_zero_then_granted_balance() {
     );
 }
 
+/// Settlement ran in production before ADR-0035 was withdrawn: for every settled micro-dollar it
+/// booked an allowance `consumption` row AND debited `budget_balances.effective_budget_micros`, so
+/// for those periods the stored column is the SETTLED balance, and it stays that way (the ledger is
+/// append-only, the projection only moves with a grant). The RPC must still report the credit
+/// GRANTED: its consumers subtract this period's spend themselves, and handing them the settled
+/// figure counted every settled micro-dollar twice -- live on the console as `-$43.07` of `$1.45`
+/// for an account with $1.45 left (#776). The debit below is booked exactly the way the withdrawn
+/// `settlement_debit` booked it: the ledger row plus the projection debit, in one transaction. It
+/// names no `pool`, so the test outlives the contract migration that drops that column.
+#[tokio::test]
+async fn budget_balance_rpcs_report_granted_credit_after_settlement_debits() {
+    use lightbridge_authz_core::authz::PermissionSet;
+
+    let subject = format!("budget-settled-{}", cuid2());
+    let admin_subject = format!("budget-settled-admin-{}", cuid2());
+    let period = "2026-10";
+    let bearer: Arc<dyn BearerTokenServiceTrait> = Arc::new(
+        MapBearer::new()
+            .with(
+                "caller",
+                token_info(
+                    &subject,
+                    PermissionSet::from_iter([Permission::BudgetReadOwn]),
+                ),
+            )
+            .with("admin", token_info(&admin_subject, admin_perms())),
+    );
+    let ctx = setup(bearer, None).await;
+    let r = &ctx.router;
+    seed_budget_account(&ctx.verify, &subject).await;
+
+    let (status, body) = rpc_call(
+        r.clone(),
+        "procedure.grantBudget",
+        Wire::Cbor,
+        &json!({ "args": {
+            "budgetAccountId": subject,
+            "accountId": subject,
+            "period": period,
+            "amountMicros": "5000000"
+        } }),
+        Some("admin"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::OK,
+        "body: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let mut tx = ctx.verify.begin().await.expect("begin");
+    sqlx::query(
+        "INSERT INTO budget_grants (id, budget_account_id, account_id, period, amount_micros, \
+         source, reason, trigger_key) VALUES ($1, $2, $2, $3, -2000000, 'consumption', \
+         'ADR-0035 settlement', $4)",
+    )
+    .bind(cuid2())
+    .bind(&subject)
+    .bind(period)
+    .bind(format!("settle-{}", cuid2()))
+    .execute(&mut *tx)
+    .await
+    .expect("consumption row");
+    sqlx::query(
+        "UPDATE budget_balances SET effective_budget_micros = effective_budget_micros - 2000000 \
+         WHERE budget_account_id = $1 AND period = $2",
+    )
+    .bind(&subject)
+    .bind(period)
+    .execute(&mut *tx)
+    .await
+    .expect("projection debit");
+    tx.commit().await.expect("commit");
+
+    let stored: (i64,) = sqlx::query_as(
+        "SELECT effective_budget_micros FROM budget_balances WHERE budget_account_id = $1 AND period = $2",
+    )
+    .bind(&subject)
+    .bind(period)
+    .fetch_one(&ctx.verify)
+    .await
+    .expect("stored balance");
+    assert_eq!(
+        stored.0, 3_000_000,
+        "precondition: the stored column is the settled balance"
+    );
+
+    for (op, args, caller) in [
+        (
+            "procedure.getMyBudgetBalance",
+            json!({ "period": period }),
+            "caller",
+        ),
+        (
+            "procedure.getBudgetBalance",
+            json!({ "budgetAccountId": subject, "period": period }),
+            "admin",
+        ),
+    ] {
+        let (status, body) = rpc_call(
+            r.clone(),
+            op,
+            Wire::Cbor,
+            &json!({ "args": args }),
+            Some(caller),
+        )
+        .await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "{op}: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let parsed = as_json(Wire::Cbor, &body);
+        assert_eq!(
+            parsed["effectiveBudgetMicros"], "5000000",
+            "{op} must report the credit granted, not granted minus settled spend: {parsed}"
+        );
+    }
+}
+
 /// Reading ANOTHER subject's balance requires the admin `budget:read` permission --
 /// `budget:read-own` alone must not also unlock it. Proven both ways in one test: the
 /// self-scoped-only caller is refused, and an admin succeeds against the exact same input.

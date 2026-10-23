@@ -21,8 +21,8 @@
     pools, and its spend becomes debt plus the unsettled tail (D9). The gateway contract and the
     introspection fields do not change.
 
-> **Withdrawal note (2026-10-23).** The code this ADR introduced is reverted, together with its
-> follow-up #776. Purchased lots, promotions and a funding port shaped for one merchant are the
+> **Withdrawal note (2026-10-23).** The code this ADR introduced is reverted. Purchased lots,
+> promotions and a funding port shaped for one merchant are the
 > ledger of the deployment that sells credit, not the open core's: that deployment keeps those
 > pools itself and reads this service through its public ports. ADR-0008, ADR-0009, ADR-0032 and
 > ADR-0034 are therefore back in force as written, without the amendments listed above.
@@ -31,8 +31,14 @@
 > and frozen: the columns and tables it added are dead from the revert, and a contract migration
 > drops them one release later (ADR-0031). The usage spend query's ingestion-time window
 > (`ingested_after`/`ingested_until`) and its index stay too, because any settlement-style reader
-> needs them and nothing in them is specific to this ADR. `20261023000001` refuses to migrate a
-> database that already holds rows the reverted ledger would miscount.
+> needs them and nothing in them is specific to this ADR.
+>
+> Settlement ran in production before the revert, so its allowance `consumption` rows, and the
+> `budget_balances` debits booked with them, are permanent (ADR-0009). The reverted reads treat
+> them as spend, never credit: the ceiling (`/budget/v1/remaining`, the snapshot refresher, the reset
+> scheduler, refill facts) skips both settlement sources, and the balance RPCs add them back onto the
+> projection, as #776 did. `20261023000001` refuses to migrate only a database holding granted or
+> paid credit, which no period-scoped read can see.
 >
 > The body below is kept unedited, as the record of what was decided and built.
 
