@@ -4,7 +4,6 @@
 
 use std::collections::{HashMap, HashSet};
 
-use chrono::{DateTime, Utc};
 use lightbridge_authz_core::{Error, Result};
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 
@@ -12,6 +11,8 @@ use crate::handlers::payload_identity::check_identity_mismatch;
 use crate::models::execution_ingest::{
     ExecutionGrainBatch, ExecutionRecord, ModelCallRecord, ToolCallRecord, execution_id,
 };
+use crate::normalizer::execution_helpers::{nanos_to_datetime, span_duration_ms, stub_execution};
+use crate::normalizer::execution_policy::{DroppedSpans, is_verified_execution_source};
 use crate::normalizer::{REGISTRY, SpanMeta, extract_string};
 /// The sources whose OTLP traces are execution-grain (ADR-0027): the agent tools. The gateway
 /// (`eaig`) stays request-grain; `github-copilot` is day-grain (RFC-0001).
@@ -38,11 +39,24 @@ const PROVIDER_KEYS: [&str; 3] = ["provider", "gen_ai.provider.name", "gen_ai.pr
 const RAW_BACKEND_KEYS: [&str; 2] = ["raw_backend", "backend"];
 
 /// Parse an OTLP trace export into an execution-grain batch (real + stub executions, model
-/// calls, tool calls).
+/// calls, tool calls). Spans an unverified source sent that could not be placed are dropped and
+/// reported once per batch (`execution_policy`, #769).
 pub fn parse_execution_grain(
     payload: ExportTraceServiceRequest,
     source: &str,
 ) -> Result<ExecutionGrainBatch> {
+    let (batch, dropped) = parse_execution_grain_counted(payload, source)?;
+    dropped.report(source);
+    Ok(batch)
+}
+
+/// [`parse_execution_grain`], also returning what was dropped -- the seam the tests assert on.
+pub fn parse_execution_grain_counted(
+    payload: ExportTraceServiceRequest,
+    source: &str,
+) -> Result<(ExecutionGrainBatch, DroppedSpans)> {
+    let verified = is_verified_execution_source(source);
+    let mut dropped = DroppedSpans::default();
     let normalizer = REGISTRY.get(source);
     let mut executions = Vec::new();
     let mut model_calls = Vec::new();
@@ -85,6 +99,10 @@ pub fn parse_execution_grain(
                         .or(norm.latency_ms.map(|v| v as i64));
 
                 if let Some(tool_name) = norm.tool_name {
+                    if parent_span_id.is_empty() && !verified {
+                        dropped.record(&span.name);
+                        continue;
+                    }
                     if parent_span_id.is_empty() {
                         return Err(Error::BadRequest(format!(
                             "tool-call span {trace_id}/{span_id} has no parent execution"
@@ -109,6 +127,10 @@ pub fn parse_execution_grain(
                         duration_ms,
                     });
                 } else if let Some(model) = norm.model {
+                    if parent_span_id.is_empty() && !verified {
+                        dropped.record(&span.name);
+                        continue;
+                    }
                     if parent_span_id.is_empty() {
                         return Err(Error::BadRequest(format!(
                             "model-call span {trace_id}/{span_id} has no parent execution"
@@ -129,6 +151,10 @@ pub fn parse_execution_grain(
                         output_tokens: norm.completion_tokens,
                         cost_micro_usd: norm.cost_micros,
                     });
+                } else if !verified {
+                    // Not a model call, not a tool call, from a source whose execution span shape
+                    // is unverified: storing it would assert an agent run nobody has shown exists.
+                    dropped.record(&span.name);
                 } else {
                     let id = execution_id(source, &trace_id, &span_id);
                     real_execution_ids.insert(id);
@@ -155,46 +181,12 @@ pub fn parse_execution_grain(
         }
     }
 
-    Ok(ExecutionGrainBatch {
-        executions,
-        model_calls,
-        tool_calls,
-    })
-}
-
-fn stub_execution(
-    source: &str,
-    trace_id: &str,
-    span_id: &str,
-    observed_at: DateTime<Utc>,
-) -> ExecutionRecord {
-    ExecutionRecord {
-        source: source.to_string(),
-        trace_id: trace_id.to_string(),
-        span_id: span_id.to_string(),
-        observed_at,
-        provider: None,
-        provider_user_id: None,
-        duration_ms: None,
-        estimated_cost_micro_usd: None,
-        raw_backend: None,
-        raw_schema_version: None,
-    }
-}
-
-fn nanos_to_datetime(nanos: u64) -> Result<DateTime<Utc>> {
-    if nanos == 0 {
-        return Err(Error::BadRequest("span has no timestamp".into()));
-    }
-    let secs = (nanos / 1_000_000_000) as i64;
-    let sub_nanos = (nanos % 1_000_000_000) as u32;
-    DateTime::from_timestamp(secs, sub_nanos)
-        .ok_or_else(|| Error::BadRequest("span timestamp out of range".into()))
-}
-
-fn span_duration_ms(start_time_unix_nano: u64, end_time_unix_nano: u64) -> Option<i64> {
-    if start_time_unix_nano == 0 || end_time_unix_nano < start_time_unix_nano {
-        return None;
-    }
-    Some(((end_time_unix_nano - start_time_unix_nano) / 1_000_000) as i64)
+    Ok((
+        ExecutionGrainBatch {
+            executions,
+            model_calls,
+            tool_calls,
+        },
+        dropped,
+    ))
 }
