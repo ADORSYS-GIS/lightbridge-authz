@@ -70,7 +70,7 @@ services:
       - "./config/tls:/host_tls"
 
   postgresql:
-    image: docker.io/bitnamilegacy/postgresql:17
+    image: docker.io/soldevelo/postgresql:17
     ports:
       - '5432:5432'
     volumes:
