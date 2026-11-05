@@ -267,13 +267,22 @@ allow-list of skips silently starts leaking the next argument somebody adds.
 Prerequisite: read [`docs/runbooks/release-and-rollout.md`](./runbooks/release-and-rollout.md) for
 the cluster/context map. The database lives on the `hetzner-prod` context, namespace `converse`.
 
-**Always the replica, always read-only, both.** `lightbridge-main-db-2` is the physical replica;
-`SET LOCAL default_transaction_read_only = on` inside an explicit transaction is the second belt, so
+**Always the replica, always read-only, both.** The replica is whichever pod carries
+`cnpg.io/instanceRole=replica` at the time you run — the measurements below were taken on
+`lightbridge-main-db-2` when it held that role, but on 2026-10-08 it was the **primary** after a
+failover, so never reuse the name; `SET LOCAL default_transaction_read_only = on` inside an explicit transaction is the second belt, so
 a mistyped statement fails rather than lands.
 
 ```bash
+# 0. Find the replica NOW. CNPG fails over and the pod NAME is not the role: on 2026-10-08
+#    lightbridge-main-db-2 -- long documented here as "the replica" -- was the PRIMARY.
+zsh -i -c 'kubectl --context hetzner-prod -n converse get pods -l cnpg.io/instanceRole=replica -o name' | grep main-db
+REPLICA=lightbridge-main-db-<n>   # the pod the line above printed, without the pod/ prefix
+
 # 1. Forward the replica. Never the primary.
-zsh -i -c 'kubectl --context hetzner-prod -n converse port-forward pod/lightbridge-main-db-2 55434:5432'
+zsh -i -c "kubectl --context hetzner-prod -n converse port-forward pod/$REPLICA 55434:5432"
+# Before the first EXPLAIN, prove it from inside Postgres -- must print `t`; stop otherwise.
+psql "$DSN" -X -At -c "SELECT pg_is_in_recovery();"
 
 # 2. Every statement in this shape, without exception.
 psql "$DSN" -X -q -v ON_ERROR_STOP=1 -c \
