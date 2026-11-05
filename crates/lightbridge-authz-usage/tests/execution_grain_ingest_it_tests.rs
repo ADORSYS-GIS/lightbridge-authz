@@ -263,9 +263,9 @@ async fn ingest_execution_grain_traces_end_to_end(pool: PgPool) {
                         "startTimeUnixNano": "1735689600000000000",
                         "endTimeUnixNano": "1735689601000000000",
                         "attributes": [
-                            {"key":"model","value":{"stringValue":"gpt-4.1"}},
-                            {"key":"input_tokens","value":{"intValue":"10"}},
-                            {"key":"output_tokens","value":{"intValue":"5"}}
+                            {"key":"gen_ai.request.model","value":{"stringValue":"gpt-4.1"}},
+                            {"key":"gen_ai.usage.input_tokens","value":{"intValue":"10"}},
+                            {"key":"gen_ai.usage.output_tokens","value":{"intValue":"5"}}
                         ]
                     },
                     {
@@ -276,7 +276,7 @@ async fn ingest_execution_grain_traces_end_to_end(pool: PgPool) {
                         "startTimeUnixNano": "1735689600000000000",
                         "endTimeUnixNano": "1735689600200000000",
                         "attributes": [
-                            {"key":"tool_name","value":{"stringValue":"bash"}}
+                            {"key":"gen_ai.tool.name","value":{"stringValue":"bash"}}
                         ]
                     }
                 ]
@@ -289,7 +289,7 @@ async fn ingest_execution_grain_traces_end_to_end(pool: PgPool) {
             Request::builder()
                 .method("POST")
                 .uri("/v1/otel/traces")
-                .header("x-source", "claude-code")
+                .header("x-source", "opencode")
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(body.to_string()))
                 .unwrap(),
@@ -312,4 +312,66 @@ async fn ingest_execution_grain_traces_end_to_end(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!((execs, mcs, tcs), (1, 1, 1), "one of each grain must land");
+
+    // The execution is the REAL one from the root span, not a stub minted for its children --
+    // the two are indistinguishable by count alone (#769).
+    let provider: Option<String> = sqlx::query_scalar("SELECT provider FROM usage_executions")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(provider.as_deref(), Some("anthropic"));
+}
+
+/// #769, end to end: a VS Code Copilot Chat turn labelled `claude-code` (shape from a real
+/// capture, values synthetic) is ACCEPTED -- its parentless model-bearing spans no longer reject
+/// the batch -- and stores no real execution: only the stub its one parented model call needs.
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn a_copilot_turn_labelled_claude_code_is_accepted_and_stores_only_a_stub(pool: PgPool) {
+    let router = app(pool.clone());
+    let span = |id: &str, parent: &str, name: &str, attrs: serde_json::Value| {
+        json!({
+            "traceId": "000000000000000000000000000000c1", "spanId": id, "parentSpanId": parent,
+            "name": name, "startTimeUnixNano": "1735689600000000000",
+            "endTimeUnixNano": "1735689601000000000", "attributes": attrs
+        })
+    };
+    let kv = |k: &str, v: &str| json!({"key": k, "value": {"stringValue": v}});
+    let body = json!({"resourceSpans": [{"scopeSpans": [{"spans": [
+        span("00000000000000a1", "", "invoke_agent GitHub Copilot Chat",
+            json!([kv("gen_ai.operation.name", "invoke_agent"), kv("gen_ai.request.model", "model-x")])),
+        span("00000000000000a2", "00000000000000a1", "execute_tool list_dir",
+            json!([kv("gen_ai.tool.name", "list_dir")])),
+        span("00000000000000a3", "00000000000000a1", "embeddings text-embedding-x",
+            json!([kv("gen_ai.request.model", "text-embedding-x")])),
+        span("00000000000000a4", "", "chat model-y", json!([kv("gen_ai.request.model", "model-y")])),
+        span("00000000000000a5", "", "vscode.chat.user_perceived_time_to_first_progress", json!([]))
+    ]}]}]});
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/otel/traces")
+                .header("x-source", "claude-code")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let (execs, real, mcs, tcs): (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM usage_executions), \
+                (SELECT count(*) FROM usage_executions WHERE duration_ms IS NOT NULL), \
+                (SELECT count(*) FROM usage_model_calls), (SELECT count(*) FROM usage_tool_calls)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        (execs, real, mcs, tcs),
+        (1, 0, 1, 0),
+        "one stub, no real execution, no tool row"
+    );
 }
