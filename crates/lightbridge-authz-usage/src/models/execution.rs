@@ -3,7 +3,7 @@
 //!
 //! The execution grain is `usage_executions` joined with its children `usage_model_calls` and
 //! `usage_tool_calls` (#582). This endpoint aggregates executions into time buckets, optionally
-//! grouped by `source` / `model` / `provider`, with bucket-scoped truncation (the #578
+//! grouped by `source` / `model` / `provider` / `subject_id`, with bucket-scoped truncation (the #578
 //! `dense_rank()` pattern) and the shared ownership gate (Ticket A, #725).
 
 use chrono::{DateTime, Utc};
@@ -41,21 +41,31 @@ pub struct ExecutionQueryRequest {
 /// Equality filters for the execution grain. `source`/`provider` live on `usage_executions`;
 /// `model` lives on the child `usage_model_calls`, so filtering by it joins the child at row
 /// level (the Option A fan-out semantics -- see `ExecutionSeriesPoint`'s doc comment).
+/// `subject_id` is `usage_identities.subject_id`, reached through `usage_executions.identity_id`.
 #[derive(Debug, Default, Deserialize, ToSchema)]
 pub struct ExecutionQueryFilters {
     pub source: Option<String>,
     pub model: Option<String>,
     pub provider: Option<String>,
+    pub subject_id: Option<String>,
 }
 
 /// The dimensions the execution grain can be grouped by. `source` and `provider` live on
 /// `usage_executions`; `model` lives on the child `usage_model_calls`.
+///
+/// `subject_id` (#767) is the person an execution is attributed to: `usage_identities.subject_id`
+/// through the execution's `identity_id`, LEFT JOINed 1:1 on the identity's primary key. Unlike
+/// `model` it does not fan out -- each execution lands in exactly one subject group, so the groups
+/// sum to the ungrouped total. An execution with no `identity_id` groups as `subject_id: null`,
+/// the UNATTRIBUTED bucket, and is never dropped. It is a dimension, not a scope: grouping a
+/// `scope=user` query by it can only ever return that one caller's own subject.
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionGroupBy {
     Source,
     Model,
     Provider,
+    SubjectId,
 }
 
 /// One aggregated time bucket of the execution grain.
@@ -77,6 +87,11 @@ pub struct ExecutionSeriesPoint {
     pub source: Option<String>,
     pub model: Option<String>,
     pub provider: Option<String>,
+    /// The attributed person when `subject_id` is grouped; `null` both when it is not grouped AND
+    /// for the unattributed bucket when it is (executions with no `identity_id`) -- the same
+    /// convention every other dimension echo here follows. An erased identity echoes its literal
+    /// `erased:<id>` value.
+    pub subject_id: Option<String>,
     pub executions_count: i64,
     pub total_duration_ms: i64,
     /// Sum of `usage_executions.estimated_cost_micro_usd` (integer micro-USD). `None` when no

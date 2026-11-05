@@ -17,6 +17,7 @@ struct ExecutionQueryRow {
     source: Option<String>,
     model: Option<String>,
     provider: Option<String>,
+    subject_id: Option<String>,
     executions_count: Option<i64>,
     total_duration_ms: Option<i64>,
     total_cost: Option<i64>,
@@ -59,6 +60,7 @@ impl StoreRepo {
                 source: row.source,
                 model: row.model,
                 provider: row.provider,
+                subject_id: row.subject_id,
                 executions_count: row.executions_count.unwrap_or(0),
                 total_duration_ms: row.total_duration_ms.unwrap_or(0),
                 total_cost: row.total_cost,
@@ -87,14 +89,22 @@ impl StoreRepo {
 /// single row per execution; instead `usage_model_calls` is joined at row level and `mc.model`
 /// becomes a group key / filter. This is the fan-out case documented on `ExecutionSeriesPoint`.
 /// `source`/`provider` stay on `usage_executions`.
+///
+/// ## The `subject_id` dimension (#767)
+///
+/// Joins `usage_identities ui ON ui.id = e.identity_id` only when `subject_id` is grouped or
+/// filtered. A LEFT JOIN on the identity's primary key: never more than one row per execution, so
+/// no fan-out, and an execution with no identity survives as `subject_id: null`.
 fn build_execution_query(input: &ExecutionQueryRequest) -> QueryBuilder<Postgres> {
     let group_set: HashSet<ExecutionGroupBy> = input.group_by.iter().cloned().collect();
     let limit = i64::from(input.limit);
     let model_is_dimension =
         group_set.contains(&ExecutionGroupBy::Model) || input.filters.model.is_some();
+    let subject_is_dimension =
+        group_set.contains(&ExecutionGroupBy::SubjectId) || input.filters.subject_id.is_some();
 
     let mut builder = QueryBuilder::<Postgres>::new(
-        "SELECT counted.bucket_start, counted.source, counted.model, counted.provider, counted.executions_count, counted.total_duration_ms, counted.total_cost, counted.total_input_tokens, counted.total_output_tokens, counted.tool_call_count, counted.bucket_count > ",
+        "SELECT counted.bucket_start, counted.source, counted.model, counted.provider, counted.subject_id, counted.executions_count, counted.total_duration_ms, counted.total_cost, counted.total_input_tokens, counted.total_output_tokens, counted.tool_call_count, counted.bucket_count > ",
     );
     builder.push_bind(limit);
     builder.push(
@@ -119,6 +129,11 @@ fn build_execution_query(input: &ExecutionQueryRequest) -> QueryBuilder<Postgres
     } else {
         builder.push(", NULL::text AS provider");
     }
+    if group_set.contains(&ExecutionGroupBy::SubjectId) {
+        builder.push(", ui.subject_id");
+    } else {
+        builder.push(", NULL::text AS subject_id");
+    }
 
     builder.push(", COUNT(e.id)::bigint AS executions_count");
     builder.push(", SUM(e.duration_ms)::bigint AS total_duration_ms");
@@ -140,6 +155,9 @@ fn build_execution_query(input: &ExecutionQueryRequest) -> QueryBuilder<Postgres
             " LEFT JOIN (SELECT execution_id, SUM(input_tokens) AS total_input_tokens, SUM(output_tokens) AS total_output_tokens FROM usage_model_calls GROUP BY execution_id) mc ON mc.execution_id = e.id",
         );
     }
+    if subject_is_dimension {
+        builder.push(" LEFT JOIN usage_identities ui ON ui.id = e.identity_id");
+    }
     builder.push(
         " LEFT JOIN (SELECT execution_id, COUNT(*) AS tool_call_count FROM usage_tool_calls GROUP BY execution_id) tc ON tc.execution_id = e.id WHERE ",
     );
@@ -155,6 +173,9 @@ fn build_execution_query(input: &ExecutionQueryRequest) -> QueryBuilder<Postgres
     if group_set.contains(&ExecutionGroupBy::Provider) {
         builder.push(", e.provider");
     }
+    if group_set.contains(&ExecutionGroupBy::SubjectId) {
+        builder.push(", ui.subject_id");
+    }
 
     builder.push(") agg) ranked) counted WHERE counted.bucket_rank <= ");
     builder.push_bind(limit);
@@ -162,7 +183,7 @@ fn build_execution_query(input: &ExecutionQueryRequest) -> QueryBuilder<Postgres
     // Deterministic tiebreaker: every dimension column, grouped or not. An ungrouped one is a
     // constant `NULL` across every row, so ordering by it is free and changes nothing.
     builder.push(
-        " ORDER BY counted.bucket_start ASC, counted.source, counted.model, counted.provider",
+        " ORDER BY counted.bucket_start ASC, counted.source, counted.model, counted.provider, counted.subject_id",
     );
 
     builder
