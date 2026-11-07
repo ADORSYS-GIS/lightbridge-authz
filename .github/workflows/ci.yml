@@ -290,7 +290,7 @@ jobs:
       # already gates this one. `frontend` is a second, faster proof for PRs, not the image's
       # source of truth.
       - name: Install cosign
-        uses: sigstore/cosign-installer@v4.1.2
+        uses: sigstore/cosign-installer@v4.1.3
 
       - name: Sign image (keyless, GitHub OIDC)
         shell: bash
