@@ -43,8 +43,8 @@ global:
     job:
       enabled: true
       image:
-        repository: docker.io/bitnami/kubectl
-        tag: 1.29.4
+        repository: docker.io/soldevelo/kubectl
+        tag: 1.29.11
       restartPolicy: OnFailure
       backoffLimit: 3
       ttlSecondsAfterFinished: 300
