@@ -53,6 +53,8 @@ struct UsageQueryRow {
     prompt_tokens: Option<i64>,
     completion_tokens: Option<i64>,
     total_tokens: Option<i64>,
+    cached_tokens: Option<i64>,
+    reasoning_tokens: Option<i64>,
     total_cost: Option<f64>,
     latency_samples: Option<i64>,
     latency_p50_ms: Option<f64>,
@@ -93,7 +95,7 @@ impl StoreRepo {
         }
 
         let mut builder = QueryBuilder::<Postgres>::new(
-            "INSERT INTO usage_events (observed_at, signal_type, source, account_id, project_id, api_key_id, user_id, user_name, model, metric_name, azp, operation, billing_plan, usage_value, request_count, prompt_tokens, completion_tokens, total_tokens, total_cost, latency_ms, dedup_key) ",
+            "INSERT INTO usage_events (observed_at, signal_type, source, account_id, project_id, api_key_id, user_id, user_name, model, metric_name, azp, operation, billing_plan, usage_value, request_count, prompt_tokens, completion_tokens, total_tokens, total_cost, latency_ms, dedup_key, cached_tokens, reasoning_tokens) ",
         );
 
         builder.push_values(events, |mut row, event| {
@@ -117,7 +119,9 @@ impl StoreRepo {
                 .push_bind(event.total_tokens)
                 .push_bind(event.total_cost)
                 .push_bind(event.latency_ms)
-                .push_bind(&event.dedup_key);
+                .push_bind(&event.dedup_key)
+                .push_bind(event.cached_tokens)
+                .push_bind(event.reasoning_tokens);
         });
 
         builder.push(" ON CONFLICT (observed_at, source, dedup_key) DO NOTHING");
@@ -266,6 +270,8 @@ impl StoreRepo {
                 prompt_tokens: row.prompt_tokens.unwrap_or(0),
                 completion_tokens: row.completion_tokens.unwrap_or(0),
                 total_tokens: row.total_tokens.unwrap_or(0),
+                cached_tokens: row.cached_tokens,
+                reasoning_tokens: row.reasoning_tokens,
                 latency_samples: row.latency_samples.unwrap_or(0),
                 latency_p50_ms: row.latency_p50_ms,
                 latency_p95_ms: row.latency_p95_ms,
@@ -350,7 +356,7 @@ fn build_usage_query(input: &UsageQueryRequest) -> QueryBuilder<Postgres> {
 
     // Level 0: the aggregation itself -- the only thing that touches `usage_events`.
     let mut builder = QueryBuilder::<Postgres>::new(
-        "SELECT counted.bucket_start, counted.account_id, counted.project_id, counted.api_key_id, counted.user_id, counted.user_name, counted.model, counted.metric_name, counted.signal_type, counted.source, counted.azp, counted.operation, counted.billing_plan, counted.requests, counted.usage_value, counted.prompt_tokens, counted.completion_tokens, counted.total_tokens, counted.total_cost, counted.latency_samples, ",
+        "SELECT counted.bucket_start, counted.account_id, counted.project_id, counted.api_key_id, counted.user_id, counted.user_name, counted.model, counted.metric_name, counted.signal_type, counted.source, counted.azp, counted.operation, counted.billing_plan, counted.requests, counted.usage_value, counted.prompt_tokens, counted.completion_tokens, counted.total_tokens, counted.cached_tokens, counted.reasoning_tokens, counted.total_cost, counted.latency_samples, ",
     );
     if with_percentiles {
         builder.push("counted.latency_percentiles[1]::double precision AS latency_p50_ms, counted.latency_percentiles[2]::double precision AS latency_p95_ms, counted.latency_percentiles[3]::double precision AS latency_p99_ms, ");
@@ -379,6 +385,8 @@ fn build_usage_query(input: &UsageQueryRequest) -> QueryBuilder<Postgres> {
     builder.push(", SUM(prompt_tokens)::bigint AS prompt_tokens");
     builder.push(", SUM(completion_tokens)::bigint AS completion_tokens");
     builder.push(", SUM(total_tokens)::bigint AS total_tokens");
+    builder.push(", CASE WHEN COUNT(cached_tokens) = COUNT(*) THEN SUM(cached_tokens)::bigint END AS cached_tokens");
+    builder.push(", CASE WHEN COUNT(reasoning_tokens) = COUNT(*) THEN SUM(reasoning_tokens)::bigint END AS reasoning_tokens");
     builder.push(", SUM(total_cost)::double precision AS total_cost");
     builder.push(", COUNT(latency_ms)::bigint AS latency_samples");
     if with_percentiles {
