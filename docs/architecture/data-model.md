@@ -471,8 +471,12 @@ bearing and out of scope to unwind (`app/lightbridge-authz/Cargo.toml`).
 `gen_ai.usage.cache_read.input_tokens` and `gen_ai.usage.reasoning.output_tokens`
 provide the counts. They are subsets of input/output respectively and never increase
 `total_tokens`. Missing historical telemetry stays NULL; no backfill invents values.
-The query returns a detail sum only when every contributing row reports it. Retention
-preserves that rule, including late-arriving batches. A reported zero remains zero.
+The query sums a detail over the rows that report the matching total (input tokens for
+`cached_tokens`, output tokens for `reasoning_tokens`) and returns it only when every one of
+those rows reports the detail; otherwise NULL. A row with no token usage at all, such as a
+request the gateway refused (401, 402) or one that failed upstream, does not count against it,
+so a period with only refused calls reads 0. Retention preserves that rule, including
+late-arriving batches. A reported zero remains zero.
 
 Apply migration `20261117000001` before deploying the reader/writer release. Old
 writers remain compatible and produce NULL details. Gateway implementations may
