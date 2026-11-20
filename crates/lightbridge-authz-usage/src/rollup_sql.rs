@@ -31,7 +31,7 @@ rolled AS (
     INSERT INTO usage_events_daily (
         bucket_start, source, account_id, project_id, api_key_id, user_id, user_name, model, metric_name,
         signal_type, azp, operation, billing_plan, requests, usage_value, prompt_tokens,
-        completion_tokens, total_tokens, total_cost, latency_samples
+        completion_tokens, total_tokens, total_cost, latency_samples, cached_tokens, reasoning_tokens
     )
     SELECT
         date_trunc('day', observed_at) AS bucket_start,
@@ -43,13 +43,17 @@ rolled AS (
         SUM(completion_tokens)::bigint AS completion_tokens,
         SUM(total_tokens)::bigint AS total_tokens,
         SUM(total_cost)::double precision AS total_cost,
-        COUNT(latency_ms)::bigint AS latency_samples
+        COUNT(latency_ms)::bigint AS latency_samples,
+        CASE WHEN COUNT(cached_tokens) = COUNT(prompt_tokens) THEN COALESCE(SUM(cached_tokens), 0)::bigint END,
+        CASE WHEN COUNT(reasoning_tokens) = COUNT(completion_tokens) THEN COALESCE(SUM(reasoning_tokens), 0)::bigint END
     FROM deleted
     GROUP BY bucket_start, source, account_id, project_id, api_key_id, user_id, user_name, model, metric_name,
              signal_type, azp, operation, billing_plan
     ON CONFLICT (bucket_start, source, account_id, project_id, api_key_id, user_id, user_name, model, metric_name,
                  signal_type, azp, operation, billing_plan)
     DO UPDATE SET
+        cached_tokens = usage_events_daily.cached_tokens + EXCLUDED.cached_tokens,
+        reasoning_tokens = usage_events_daily.reasoning_tokens + EXCLUDED.reasoning_tokens,
         requests = COALESCE(usage_events_daily.requests, 0) + COALESCE(EXCLUDED.requests, 0),
         usage_value = COALESCE(usage_events_daily.usage_value, 0) + COALESCE(EXCLUDED.usage_value, 0),
         prompt_tokens = COALESCE(usage_events_daily.prompt_tokens, 0) + COALESCE(EXCLUDED.prompt_tokens, 0),

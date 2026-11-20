@@ -33,6 +33,8 @@ pub struct UsageEvent {
     pub prompt_tokens: Option<i64>,
     pub completion_tokens: Option<i64>,
     pub total_tokens: Option<i64>,
+    pub cached_tokens: Option<i64>,
+    pub reasoning_tokens: Option<i64>,
     pub total_cost: Option<f64>,
     /// Wall-clock duration of the single request this event describes, in milliseconds.
     ///

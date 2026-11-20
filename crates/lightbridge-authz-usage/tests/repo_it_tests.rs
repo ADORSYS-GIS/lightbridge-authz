@@ -45,6 +45,8 @@ fn sample_event(observed_at: chrono::DateTime<Utc>) -> UsageEvent {
         prompt_tokens: Some(6),
         completion_tokens: Some(4),
         total_tokens: Some(10),
+        cached_tokens: None,
+        reasoning_tokens: None,
         total_cost: Some(0.05),
         latency_ms: Some(410.0),
     }
@@ -1724,4 +1726,124 @@ async fn request_redelivery_does_not_inflate_rows_or_measures(pool: PgPool) {
     assert_eq!(repo.insert_usage_events(&[event.clone()]).await.unwrap(), 1);
     event.source = Some("claude-code".to_owned());
     assert_eq!(repo.insert_usage_events(&[event]).await.unwrap(), 1);
+}
+
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn token_details_survive_ingestion_and_preserve_unknowns(pool: PgPool) {
+    let repo = Arc::new(build_repo(pool.clone()));
+    let state = Arc::new(UsageState {
+        repo: repo.clone(),
+        bearer: support::trust_no_one_bearer(),
+        scope_authority: support::refuse_everything_scope_authority(),
+        ingest_auth: None,
+        raw_days: Some(90),
+    });
+    let app = build_ingest_router(state, Arc::new(DbPool::from_pool(pool)), false);
+    let now = Utc::now();
+    for (cached, reasoning, expected) in [
+        (Some(3), Some(2), StatusCode::ACCEPTED),
+        (Some(-1), Some(2), StatusCode::BAD_REQUEST),
+    ] {
+        let body = json!({"resourceLogs":[{"scopeLogs":[{"logRecords":[{
+            "timeUnixNano": now.timestamp_nanos_opt().unwrap().to_string(),
+            "attributes": [
+                {"key":"project_id","value":{"stringValue":"proj_1"}},
+                {"key":"gen_ai.usage.input_tokens","value":{"intValue":"6"}},
+                {"key":"gen_ai.usage.output_tokens","value":{"intValue":"4"}},
+                {"key":"gen_ai.usage.cache_read.input_tokens","value":{"intValue":cached.unwrap().to_string()}},
+                {"key":"gen_ai.usage.reasoning.output_tokens","value":{"intValue":reasoning.unwrap().to_string()}}
+            ]
+        }]}]}]});
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/otel/logs")
+                    .header("content-type", "application/json")
+                    .header("x-source", "eaig")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+    }
+    let (points, _) = repo.query_usage(&base_query(now)).await.unwrap();
+    assert_eq!(
+        (
+            points[0].cached_tokens,
+            points[0].reasoning_tokens,
+            points[0].total_tokens
+        ),
+        (Some(3), Some(2), 10)
+    );
+    let mut zero = sample_event(now);
+    zero.cached_tokens = Some(0);
+    zero.reasoning_tokens = Some(0);
+    repo.insert_usage_events(&[zero]).await.unwrap();
+    let (points, _) = repo.query_usage(&base_query(now)).await.unwrap();
+    assert_eq!(
+        (points[0].cached_tokens, points[0].reasoning_tokens),
+        (Some(3), Some(2))
+    );
+    // A legacy event makes full-period detail unavailable instead of silently undercounting.
+    repo.insert_usage_events(&[sample_event(now)])
+        .await
+        .unwrap();
+    let (points, _) = repo.query_usage(&base_query(now)).await.unwrap();
+    assert_eq!(
+        (points[0].cached_tokens, points[0].reasoning_tokens),
+        (None, None)
+    );
+    assert_eq!(points[0].total_tokens, 30);
+}
+
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn a_request_without_token_usage_leaves_token_details_known(pool: PgPool) {
+    let repo = build_repo(pool);
+    let now = Utc::now();
+    let refused = UsageEvent {
+        prompt_tokens: None,
+        completion_tokens: None,
+        total_tokens: None,
+        total_cost: None,
+        latency_ms: None,
+        ..sample_event(now)
+    };
+    repo.insert_usage_events(std::slice::from_ref(&refused))
+        .await
+        .unwrap();
+    let (points, _) = repo.query_usage(&base_query(now)).await.unwrap();
+    assert_eq!(
+        (points[0].cached_tokens, points[0].reasoning_tokens),
+        (Some(0), Some(0))
+    );
+
+    let measured = UsageEvent {
+        cached_tokens: Some(3),
+        reasoning_tokens: Some(2),
+        ..sample_event(now)
+    };
+    repo.insert_usage_events(&[measured, refused])
+        .await
+        .unwrap();
+    let (points, _) = repo.query_usage(&base_query(now)).await.unwrap();
+    assert_eq!(
+        (
+            points[0].cached_tokens,
+            points[0].reasoning_tokens,
+            points[0].requests
+        ),
+        (Some(3), Some(2), 3)
+    );
+
+    repo.insert_usage_events(&[sample_event(now)])
+        .await
+        .unwrap();
+    let (points, _) = repo.query_usage(&base_query(now)).await.unwrap();
+    assert_eq!(
+        (points[0].cached_tokens, points[0].reasoning_tokens),
+        (None, None)
+    );
 }

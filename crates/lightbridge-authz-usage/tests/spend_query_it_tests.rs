@@ -72,6 +72,8 @@ fn sample_event(account_id: &str, observed_at: DateTime<Utc>, total_cost: f64) -
         prompt_tokens: None,
         completion_tokens: None,
         total_tokens: None,
+        cached_tokens: None,
+        reasoning_tokens: None,
         total_cost: Some(total_cost),
         latency_ms: None,
     }
