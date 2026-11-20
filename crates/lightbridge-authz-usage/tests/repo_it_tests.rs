@@ -1798,3 +1798,52 @@ async fn token_details_survive_ingestion_and_preserve_unknowns(pool: PgPool) {
     );
     assert_eq!(points[0].total_tokens, 30);
 }
+
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn a_request_without_token_usage_leaves_token_details_known(pool: PgPool) {
+    let repo = build_repo(pool);
+    let now = Utc::now();
+    let refused = UsageEvent {
+        prompt_tokens: None,
+        completion_tokens: None,
+        total_tokens: None,
+        total_cost: None,
+        latency_ms: None,
+        ..sample_event(now)
+    };
+    repo.insert_usage_events(std::slice::from_ref(&refused))
+        .await
+        .unwrap();
+    let (points, _) = repo.query_usage(&base_query(now)).await.unwrap();
+    assert_eq!(
+        (points[0].cached_tokens, points[0].reasoning_tokens),
+        (Some(0), Some(0))
+    );
+
+    let measured = UsageEvent {
+        cached_tokens: Some(3),
+        reasoning_tokens: Some(2),
+        ..sample_event(now)
+    };
+    repo.insert_usage_events(&[measured, refused])
+        .await
+        .unwrap();
+    let (points, _) = repo.query_usage(&base_query(now)).await.unwrap();
+    assert_eq!(
+        (
+            points[0].cached_tokens,
+            points[0].reasoning_tokens,
+            points[0].requests
+        ),
+        (Some(3), Some(2), 3)
+    );
+
+    repo.insert_usage_events(&[sample_event(now)])
+        .await
+        .unwrap();
+    let (points, _) = repo.query_usage(&base_query(now)).await.unwrap();
+    assert_eq!(
+        (points[0].cached_tokens, points[0].reasoning_tokens),
+        (None, None)
+    );
+}

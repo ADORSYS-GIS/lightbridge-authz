@@ -44,8 +44,8 @@ rolled AS (
         SUM(total_tokens)::bigint AS total_tokens,
         SUM(total_cost)::double precision AS total_cost,
         COUNT(latency_ms)::bigint AS latency_samples,
-        CASE WHEN COUNT(cached_tokens) = COUNT(*) THEN SUM(cached_tokens)::bigint END,
-        CASE WHEN COUNT(reasoning_tokens) = COUNT(*) THEN SUM(reasoning_tokens)::bigint END
+        CASE WHEN COUNT(cached_tokens) = COUNT(prompt_tokens) THEN COALESCE(SUM(cached_tokens), 0)::bigint END,
+        CASE WHEN COUNT(reasoning_tokens) = COUNT(completion_tokens) THEN COALESCE(SUM(reasoning_tokens), 0)::bigint END
     FROM deleted
     GROUP BY bucket_start, source, account_id, project_id, api_key_id, user_id, user_name, model, metric_name,
              signal_type, azp, operation, billing_plan

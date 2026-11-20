@@ -33,7 +33,9 @@ pub struct UsageSeriesPoint {
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
     pub total_tokens: i64,
-    /// Subsets of input/output respectively; None if any contributing event lacks the count.
+    /// Subsets of input/output respectively, summed over the events that report input (cached) or
+    /// output (reasoning) tokens. None if one of those events lacks the count; an event with no
+    /// token usage at all, such as a refused request, does not count against it.
     pub cached_tokens: Option<i64>,
     pub reasoning_tokens: Option<i64>,
     /// How many rows in this bucket actually carried a latency measurement. A percentile computed

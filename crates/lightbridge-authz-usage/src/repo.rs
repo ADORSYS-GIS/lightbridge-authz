@@ -385,8 +385,8 @@ fn build_usage_query(input: &UsageQueryRequest) -> QueryBuilder<Postgres> {
     builder.push(", SUM(prompt_tokens)::bigint AS prompt_tokens");
     builder.push(", SUM(completion_tokens)::bigint AS completion_tokens");
     builder.push(", SUM(total_tokens)::bigint AS total_tokens");
-    builder.push(", CASE WHEN COUNT(cached_tokens) = COUNT(*) THEN SUM(cached_tokens)::bigint END AS cached_tokens");
-    builder.push(", CASE WHEN COUNT(reasoning_tokens) = COUNT(*) THEN SUM(reasoning_tokens)::bigint END AS reasoning_tokens");
+    builder.push(", CASE WHEN COUNT(cached_tokens) = COUNT(prompt_tokens) THEN COALESCE(SUM(cached_tokens), 0)::bigint END AS cached_tokens");
+    builder.push(", CASE WHEN COUNT(reasoning_tokens) = COUNT(completion_tokens) THEN COALESCE(SUM(reasoning_tokens), 0)::bigint END AS reasoning_tokens");
     builder.push(", SUM(total_cost)::double precision AS total_cost");
     builder.push(", COUNT(latency_ms)::bigint AS latency_samples");
     if with_percentiles {
