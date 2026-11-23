@@ -27,6 +27,25 @@ ignore = [
     "RUSTSEC-2026-0367",
     "RUSTSEC-2026-0368",
     "RUSTSEC-2026-0369",
+    # The same zip 3.0.0 build dependency, same reasoning and same removal: RUSTSEC-2026-0429
+    # (extract aborts on a large symlink entry), 0545 (AES entries returned unauthenticated) and
+    # 0548 (ZipStreamReader trusts local-header names). Each needs a hostile archive; the only one
+    # ever opened is the pinned Swagger UI release, at build time.
+    "RUSTSEC-2026-0429",
+    "RUSTSEC-2026-0545",
+    "RUSTSEC-2026-0548",
+    # crypto-bigint 0.5.5 (RUSTSEC-2026-0387, secret-dependent branches in "constant-time" ops;
+    # fixed only in 0.7.6, a major away). It arrives through elliptic-curve 0.13 -> p256/p384 ->
+    # jsonwebtoken 11, which is how authkestra VERIFIES ES256/ES384 tokens from upstream issuers.
+    # Verification works on public keys and public signatures, so there is no secret to leak.
+    # Every key this repo signs with is RSA (`signing.rs` ALGORITHM, `refresh_token.rs`), which
+    # does not use crypto-bigint 0.5. Re-check if an EC signing key is ever introduced; remove
+    # when jsonwebtoken moves to elliptic-curve 0.14.
+    "RUSTSEC-2026-0387",
+    # chrono is UNMAINTAINED (RUSTSEC-2026-0543; not a vulnerability, no successor release). It is
+    # the time type of sqlx, utoipa, authkestra and every crate here, so replacing it is its own
+    # migration, tracked separately. Remove this with it.
+    "RUSTSEC-2026-0543",
     # unsafe-libyaml is UNMAINTAINED (not a vulnerability; no patched release exists), pulled in by
     # the deprecated serde_yaml that parses operator-supplied config files. Replacing serde_yaml is
     # its own change, tracked separately. Remove this with it.
