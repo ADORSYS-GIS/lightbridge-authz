@@ -101,8 +101,8 @@ pub fn parse_execution_grain(
                     });
                     tool_calls.push(ToolCallRecord {
                         source: source.to_string(),
-                        trace_id: trace_id.clone(),
-                        span_id: span_id.clone(),
+                        trace_id,
+                        span_id,
                         execution_id: parent_id,
                         observed_at,
                         tool_name,
@@ -120,8 +120,8 @@ pub fn parse_execution_grain(
                     });
                     model_calls.push(ModelCallRecord {
                         source: source.to_string(),
-                        trace_id: trace_id.clone(),
-                        span_id: span_id.clone(),
+                        trace_id,
+                        span_id,
                         execution_id: parent_id,
                         observed_at,
                         model,
@@ -134,8 +134,8 @@ pub fn parse_execution_grain(
                     real_execution_ids.insert(id);
                     executions.push(ExecutionRecord {
                         source: source.to_string(),
-                        trace_id: trace_id.clone(),
-                        span_id: span_id.clone(),
+                        trace_id,
+                        span_id,
                         observed_at,
                         provider: extract_string(&attrs, &PROVIDER_KEYS),
                         provider_user_id: extract_string(&attrs, &PROVIDER_USER_KEYS),
