@@ -1,0 +1,7 @@
+# Trivy's copy of the zip 3.0.0 triage in deny.toml (RUSTSEC-2026-0367/0368/0369/0429/0545/0548).
+# zip 3.0.0 is a BUILD-dependency only, of utoipa-swagger-ui 9's build script, which unpacks one
+# pinned Swagger UI release archive at compile time; nothing here extracts an archive at runtime,
+# and every one of these needs a hostile archive. Remove these with the utoipa-swagger-ui 10
+# (zip ^9) upgrade, together with the deny.toml entries.
+CVE-2026-115905
+CVE-2026-115909
