@@ -51,7 +51,7 @@ use reqwest::Client;
 use rmcp::{
     ErrorData, Json, RoleServer, ServerHandler,
     handler::server::router::tool::ToolRouter,
-    model::{ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo},
+    model::{ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig},
     schemars,
     service::RequestContext,
     tool_handler,
@@ -292,8 +292,8 @@ impl LightbridgeMcpHandler {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for LightbridgeMcpHandler {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             "MCP interface for Lightbridge Authz API and OPA validation endpoints",
         )
     }
