@@ -5,3 +5,10 @@
 # (zip ^9) upgrade, together with the deny.toml entries.
 CVE-2026-115905
 CVE-2026-115909
+
+# libssl3 3.0.20 in gcr.io/distroless/base-debian12:nonroot (container-build's image scan):
+# DTLS handshake retransmission info disclosure, fixed in Debian's 3.0.22 but not yet in a
+# distroless rebuild. No binary here loads OpenSSL (no openssl-sys anywhere in the workspace;
+# TLS is rustls), and nothing speaks DTLS, so the library is present but never used. Expires so
+# the scan re-checks once distroless has had time to pick up the fix.
+CVE-2026-84782 exp:2026-12-21
