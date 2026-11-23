@@ -298,8 +298,8 @@ reqwest = { version = "0.13", features = ["json", "form"] }
 url = "2.5"
 sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "chrono", "json", "macros"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
-utoipa = { version = "5", features = ["macros", "chrono"] }
-utoipa-swagger-ui = { version = "9", features = ["axum", "reqwest"] }
+utoipa = { version = "6", features = ["macros", "chrono"] }
+utoipa-swagger-ui = { version = "10", features = ["axum", "reqwest"] }
 regex = "1.13"
 flate2 = "1.1.9"
 
