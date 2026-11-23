@@ -18,22 +18,6 @@ allow = [
 ignore = [
     "RUSTSEC-2023-0071",
     "RUSTSEC-2026-0214",
-    # zip 3.0.0 (RUSTSEC-2026-0367/0368/0369, all fixed in zip >= 9): a BUILD-dependency only, of
-    # utoipa-swagger-ui 9's build script, which unpacks one fixed Swagger UI release archive at
-    # compile time. All three are about extracting an attacker-controlled archive (SUID bits,
-    # symlink targets, permissions through symlinks); nothing here ever extracts one at runtime.
-    # The fix is utoipa-swagger-ui 10 (zip ^9), which requires utoipa 6 -- an OpenAPI-derive
-    # migration across every handler, tracked separately. Remove these three with that upgrade.
-    "RUSTSEC-2026-0367",
-    "RUSTSEC-2026-0368",
-    "RUSTSEC-2026-0369",
-    # The same zip 3.0.0 build dependency, same reasoning and same removal: RUSTSEC-2026-0429
-    # (extract aborts on a large symlink entry), 0545 (AES entries returned unauthenticated) and
-    # 0548 (ZipStreamReader trusts local-header names). Each needs a hostile archive; the only one
-    # ever opened is the pinned Swagger UI release, at build time.
-    "RUSTSEC-2026-0429",
-    "RUSTSEC-2026-0545",
-    "RUSTSEC-2026-0548",
     # crypto-bigint 0.5.5 (RUSTSEC-2026-0387, secret-dependent branches in "constant-time" ops;
     # fixed only in 0.7.6, a major away). It arrives through elliptic-curve 0.13 -> p256/p384 ->
     # jsonwebtoken 11, which is how authkestra VERIFIES ES256/ES384 tokens from upstream issuers.
