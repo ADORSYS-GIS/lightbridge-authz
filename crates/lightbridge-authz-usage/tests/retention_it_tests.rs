@@ -50,6 +50,8 @@ fn event_with_cost(
         prompt_tokens: None,
         completion_tokens: None,
         total_tokens: None,
+        cached_tokens: None,
+        reasoning_tokens: None,
         total_cost: Some(total_cost),
         latency_ms: None,
     }
@@ -84,6 +86,8 @@ fn event_with_tokens(
         prompt_tokens: Some(prompt),
         completion_tokens: Some(completion),
         total_tokens: Some(total),
+        cached_tokens: None,
+        reasoning_tokens: None,
         total_cost: Some(0.0),
         latency_ms: None,
     }
@@ -808,4 +812,69 @@ async fn record_last_purge_cutoff_round_trips_through_usage_retention_state(pool
         cutoff, expected,
         "the recorded cutoff must be the day-truncated raw-window boundary"
     );
+}
+
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn token_details_roll_up_and_late_unknowns_remain_unknown(pool: PgPool) {
+    let repo = build_repo(pool.clone());
+    let old = Utc::now() - Duration::days(100);
+    let mut event = event_with_tokens("detail-account", old, 100, 40, 140);
+    event.cached_tokens = Some(30);
+    event.reasoning_tokens = Some(12);
+    repo.insert_usage_events(&[event.clone()]).await.unwrap();
+    rollup_and_purge(&pool, 90, 365).await.unwrap();
+    let read = || async {
+        sqlx::query_as::<_, (Option<i64>, Option<i64>, Option<i64>)>(
+            "SELECT cached_tokens, reasoning_tokens, total_tokens FROM usage_events_daily WHERE account_id = 'detail-account'",
+        ).fetch_one(&pool).await.unwrap()
+    };
+    assert_eq!(read().await, (Some(30), Some(12), Some(140)));
+    event.cached_tokens = Some(0);
+    event.reasoning_tokens = Some(0);
+    repo.insert_usage_events(&[event.clone()]).await.unwrap();
+    rollup_and_purge(&pool, 90, 365).await.unwrap();
+    assert_eq!(read().await, (Some(30), Some(12), Some(280)));
+    event.cached_tokens = None;
+    repo.insert_usage_events(&[event.clone()]).await.unwrap();
+    rollup_and_purge(&pool, 90, 365).await.unwrap();
+    assert_eq!(read().await, (None, Some(12), Some(420)));
+    event.cached_tokens = Some(30);
+    event.reasoning_tokens = Some(12);
+    repo.insert_usage_events(&[event]).await.unwrap();
+    rollup_and_purge(&pool, 90, 365).await.unwrap();
+    assert_eq!(read().await, (None, Some(24), Some(560)));
+}
+
+#[sqlx::test(migrations = "../../migrations-usage")]
+async fn a_rolled_up_request_without_token_usage_leaves_token_details_known(pool: PgPool) {
+    let repo = build_repo(pool.clone());
+    let old = Utc::now() - Duration::days(100);
+    let refused = UsageEvent {
+        prompt_tokens: None,
+        completion_tokens: None,
+        total_tokens: None,
+        ..event_with_tokens("refused-account", old, 0, 0, 0)
+    };
+    let read = || async {
+        sqlx::query_as::<_, (Option<i64>, Option<i64>, Option<i64>)>(
+            "SELECT cached_tokens, reasoning_tokens, requests FROM usage_events_daily WHERE account_id = 'refused-account'",
+        ).fetch_one(&pool).await.unwrap()
+    };
+
+    repo.insert_usage_events(std::slice::from_ref(&refused))
+        .await
+        .unwrap();
+    rollup_and_purge(&pool, 90, 365).await.unwrap();
+    assert_eq!(read().await, (Some(0), Some(0), Some(1)));
+
+    let measured = UsageEvent {
+        cached_tokens: Some(30),
+        reasoning_tokens: Some(12),
+        ..event_with_tokens("refused-account", old, 100, 40, 140)
+    };
+    repo.insert_usage_events(&[measured, refused])
+        .await
+        .unwrap();
+    rollup_and_purge(&pool, 90, 365).await.unwrap();
+    assert_eq!(read().await, (Some(30), Some(12), Some(3)));
 }

@@ -74,6 +74,8 @@ fn sample_event(account_id: &str, project_id: &str, observed_at: DateTime<Utc>) 
         prompt_tokens: None,
         completion_tokens: None,
         total_tokens: None,
+        cached_tokens: None,
+        reasoning_tokens: None,
         total_cost: Some(1.0),
         latency_ms: None,
     }
@@ -468,6 +470,8 @@ fn sample_event_for_user(user_id: &str, observed_at: DateTime<Utc>) -> UsageEven
         prompt_tokens: None,
         completion_tokens: None,
         total_tokens: None,
+        cached_tokens: None,
+        reasoning_tokens: None,
         total_cost: Some(1.0),
         latency_ms: None,
     }
